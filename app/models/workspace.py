@@ -15,7 +15,7 @@ class Workspace(Base):
     # 外鍵 + 拿來查東西的欄位通常都會加索引 之後用它查詢比較快
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True) 
     # server_default=func.now() 建立時由資料庫填入當下時間 (UTC)
-    # DateTime(timezone=True) 存絕對時間點 (通常都是顯示時才由前端轉當地時區)
+    # DateTime(timezone=True) 存帶有時區資訊的絕對時間點 (通常都是顯示時才由前端轉當地時區)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),
