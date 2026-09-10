@@ -1,2 +1,6 @@
 # Alembic 目錄整個排除 lint：env.py 是官方模板、versions/ 全是自動生成的檔
 extend-exclude = ["alembic"]
+
+[lint.flake8-bugbear]
+# FastAPI 的 Depends() / Security() 放在參數預設值是官方寫法，不是 bug（B008 誤判）
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Security"]
