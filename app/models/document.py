@@ -20,3 +20,6 @@ class Document(Base):
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
     workspace = relationship("Workspace", back_populates="documents")
+    chunks = relationship(
+        "Chunk", back_populates="document", cascade="all, delete-orphan" # 刪掉一個 Document 時 它底下的 Chunk 會一起被刪
+    )
