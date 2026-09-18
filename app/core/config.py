@@ -13,6 +13,7 @@ class Settings(BaseSettings): # BaseModel的子類別 不用給他明確的資�
     secret_key: str
     access_token_expire_minutes: int = 30
     algorithm: str = "HS256"
+    openai_api_key: str
 
 
 settings = Settings()

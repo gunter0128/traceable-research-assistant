@@ -7,8 +7,9 @@ from uuid import uuid4
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
+from app.core import chunker, openai_client, pdf_parser
 from app.models.document import Document
-from app.repositories import document_repo
+from app.repositories import chunk_repo, document_repo
 from app.services import workspace_service
 
 STORAGE_DIR = Path("storage/documents")
@@ -52,7 +53,22 @@ def upload_document(
     # storage_path.write_bytes(...) 把這包 bytes 寫進硬碟的這個路徑，等於開檔、寫入、關檔一次做完
     storage_path.write_bytes(file.file.read())
 
-    return document_repo.create(db, workspace_id, file.filename, str(storage_path))
+    document = document_repo.create(db, workspace_id, file.filename, str(storage_path))
+    return process_document(db, document)
+
+
+# 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
+def process_document(db: Session, document: Document) -> Document:
+    try:
+        text = pdf_parser.extract_text(document.storage_path)
+        pieces = chunker.chunk_text(text)
+        for index, piece in enumerate(pieces):
+            embedding = openai_client.embed_text(piece)
+            chunk_repo.create(db, document.id, index, piece, embedding)
+    except Exception:
+        return document_repo.mark_failed(db, document)
+
+    return document_repo.mark_processed(db, document)
 
 
 def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document:

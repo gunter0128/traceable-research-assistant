@@ -1,5 +1,7 @@
 # documents 表的資料庫存取。只跟 DB 講話 不放商業邏輯
 
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
 from app.models.document import Document
@@ -28,3 +30,20 @@ def create(
 def delete(db: Session, document: Document) -> None:
     db.delete(document)
     db.commit()
+
+
+# 何時呼叫：document_service.process_document() 把文字都切段、轉完向量、存進 chunks 表之後
+def mark_processed(db: Session, document: Document) -> Document:
+    document.status = "processed"
+    document.processed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+# 何時呼叫：document_service.process_document() 中途出錯時（例如 PDF 解析失敗），讓 status 反映真實結果
+def mark_failed(db: Session, document: Document) -> Document:
+    document.status = "failed"
+    db.commit()
+    db.refresh(document)
+    return document
