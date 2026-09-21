@@ -2,9 +2,9 @@
 
 這個專案的起點是我的碩士論文（multi-hop / trace-aware RAG），目標是把論文裡的檢索概念做成一個真的能部署、能被別人操作的文件問答系統——不只是回答問題，還要讓使用者看見答案是怎麼一步步被找出來的。
 
-現在這個版本（V0）還沒有 AI 的部分。V0 先把後端的地基打好：使用者能註冊登入、建立自己的研究工作區（workspace）、上傳 PDF 文件，而且每個人只看得到自己的東西。RAG 問答、multi-hop 檢索、前端這些是後面版本才會加上去。
+目前完成了 V0（後端地基）跟 V1（RAG 問答）：使用者能註冊登入、建立自己的研究工作區（workspace）、上傳 PDF 文件，並且針對 workspace 裡的文件提問，系統會回傳答案，並附上答案是從哪份文件、哪一段找到的（citation）。每個人只看得到自己的東西。Multi-hop 檢索、前端這些是後面版本才會加上去。
 
-## V0 做了什麼
+## V0：後端地基
 
 系統分三塊功能，每一塊都走完整的一套：使用者驗證、資源的建立/查詢/修改/刪除，而且每個操作都會檢查「這是不是你的東西」——不存在回 404，存在但不是你的回 403。
 
@@ -16,9 +16,15 @@
 
 資料庫從一開始就用 PostgreSQL（開發環境是 [Neon](https://neon.tech)），沒有用 SQLite 過渡，因為 V1 要用到 Postgres 專屬的 pgvector 做向量檢索。
 
+## V1：RAG 問答
+
+上傳 PDF 時，系統會在同一個 request 裡同步跑完整個處理流程：解析出文字（pypdf）→ 依 token 數切成一段一段、段落間保留重疊避免關鍵字被切斷（tiktoken）→ 每段轉成向量（OpenAI `text-embedding-3-small`）→ 存進 Postgres（pgvector 存向量，一個 chunk 屬於一份 document）。
+
+問問題時（`POST /workspaces/{id}/ask`）：先確認這個 workspace 是你的 → 把問題也轉成向量 → 用 pgvector 的向量相似度搜尋，只在**這個 workspace 底下**找出最相關的幾段（不會搜到別的 workspace，即使是自己的其他 workspace 也不會）→ 把搜到的內容連同問題一起丟給 LLM（`gpt-4o-mini`），system prompt 強制「只能照給的資料回答，資料不夠就明說，不能編答案」→ 回傳答案，附上這次參考的來源（文件名 + 內容片段）。
+
 ## Tech Stack
 
-Python 3.11、FastAPI、PostgreSQL + SQLAlchemy 2.0 + Alembic、bcrypt + JWT、pytest。
+Python 3.11、FastAPI、PostgreSQL + pgvector + SQLAlchemy 2.0 + Alembic、bcrypt + JWT、OpenAI API（embedding + 生成）、pypdf、tiktoken、pytest。
 
 ## 本地啟動
 
@@ -30,7 +36,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-複製 `.env.example` 成 `.env`，填入你的 Postgres 連線字串和一組密鑰（`python -c "import secrets; print(secrets.token_urlsafe(32))"` 可以生一組），然後：
+複製 `.env.example` 成 `.env`，填入你的 Postgres 連線字串、一組密鑰（`python -c "import secrets; print(secrets.token_urlsafe(32))"` 可以生一組）、和 OpenAI API key，然後：
 
 ```bash
 alembic upgrade head
@@ -51,10 +57,11 @@ uvicorn app.main:app --reload
 | GET | `/workspaces/{id}` | 查一個 workspace | ✓ |
 | PUT | `/workspaces/{id}` | 改名 | ✓ |
 | DELETE | `/workspaces/{id}` | 刪除 | ✓ |
-| POST | `/workspaces/{id}/documents` | 上傳 PDF | ✓ |
+| POST | `/workspaces/{id}/documents` | 上傳 PDF（自動解析、切段、embedding） | ✓ |
 | GET | `/workspaces/{id}/documents` | 列出 workspace 裡的文件 | ✓ |
 | GET | `/documents/{id}` | 查一份文件 | ✓ |
 | DELETE | `/documents/{id}` | 刪除文件 | ✓ |
+| POST | `/workspaces/{id}/ask` | 針對這個 workspace 的文件提問，回傳答案 + 引用來源 | ✓ |
 
 ## 測試
 
@@ -62,8 +69,8 @@ uvicorn app.main:app --reload
 pytest tests/ -v
 ```
 
-23 個測試，涵蓋三個功能各自的正常流程、錯誤處理，和跨使用者的 ownership 檢查（一個使用者不該碰得到另一個使用者的 workspace 或文件）。測試連的是另一個獨立的 Neon 分支，不會碰到開發用的資料，設定方式見 `.env.test.example`。
+36 個測試，涵蓋 V0 三個功能的正常流程、錯誤處理、跨使用者 ownership 檢查，以及 V1 的 RAG pipeline：`/ask` 的 ownership 檢查、向量搜尋只在指定 workspace 範圍內、PDF 解析/切段的純函式測試。**測試不會真的呼叫 OpenAI**（embedding、生成都用假的固定回應取代）——不花錢、跑起來快、結果每次都一樣，不需要自己的 OpenAI key 也能跑通整個測試套件。測試連的是另一個獨立的 Neon 分支，不會碰到開發用的資料，設定方式見 `.env.test.example`。
 
 ## 接下來
 
-V1 要把 RAG 接上去：PDF 解析、chunking、embedding、pgvector 向量檢索、呼叫 LLM 生成答案並附上引用來源。再之後是部署（V2）、multi-hop trace 視覺化（V3，論文的核心差異化特色）、前端（V4）。
+V2：部署。目前只在本機跑，其中一個要先解決的問題是上傳的 PDF 存在本機硬碟（`storage/documents/`），部署到大部分雲端平台後重啟會遺失，需要換成雲端物件儲存。再之後是 multi-hop trace 視覺化（V3，論文的核心差異化特色）、前端（V4）。
