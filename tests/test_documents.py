@@ -4,7 +4,9 @@ import io
 
 import pytest
 
+from app.core import openai_client
 from app.services import document_service
+from tests.pdf_fixtures import valid_pdf_bytes
 
 # 每個測試三段（AAA）測試撰寫慣例：
 # Arrange ：把系統弄到需要的狀態(不是在測這個 可省略)。
@@ -22,6 +24,13 @@ def _use_temp_storage(tmp_path, monkeypatch):
     # setattr(物件, "屬性名字", 新值) 把 document_service 的 STORAGE_DIR 換成這次的臨時資料夾
     # 跟內建 setattr() 做的事一樣 差別是 monkeypatch.setattr 會記住舊值 測試結束自動換回去
     monkeypatch.setattr(document_service, "STORAGE_DIR", tmp_path)
+
+
+# 上傳現在會觸發 process_document()，裡面會呼叫真的 OpenAI embedding API。
+# 這裡換成固定的假向量：測試不用花錢、不用網路、結果每次都一樣
+@pytest.fixture(autouse=True)
+def _fake_embedding(monkeypatch):
+    monkeypatch.setattr(openai_client, "embed_text", lambda text: [0.1] * 1536)
 
 
 def _register_and_login(client, email):
@@ -44,10 +53,14 @@ def _create_workspace(client, token, name="研究"):
 
 
 def _upload_pdf(client, token, workspace_id, filename="IRCoT.pdf"):
+    # 要用「真的」能被解析的 PDF，不能隨便塞假 byte —— process_document() 現在會真的
+    # 去解析內容，假的 PDF 會讓 status 變成 "failed"，不是這裡要測的東西
     return client.post(
         f"/workspaces/{workspace_id}/documents",
         headers=_auth_headers(token),
-        files={"file": (filename, io.BytesIO(b"%PDF-1.4 fake"), "application/pdf")},
+        files={
+            "file": (filename, io.BytesIO(valid_pdf_bytes()), "application/pdf")
+        },
     )
 
 
@@ -69,7 +82,9 @@ def test_upload_and_list(client):
     assert upload_response.status_code == 201
     body = upload_response.json()
     assert body["filename"] == "IRCoT.pdf"
-    assert body["status"] == "uploaded"
+    # 上傳完會立刻跑完 process_document()（同步設計），所以這裡已經是 "processed"，
+    # 不是 "uploaded"（"uploaded" 只是 DB 那一瞬間的預設值，request 還沒回應完就已經被蓋掉了）
+    assert body["status"] == "processed"
 
     list_response = client.get(
         f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)
