@@ -1,6 +1,6 @@
 # 架構筆記
 
-> V0（Auth / Workspace / Document）已完成，23 個測試通過。V1（RAG）已完成，端到端手動驗證過（真的上傳 PDF、真的問問題、答案正確且附引用），還沒有自動化測試。這份文件記錄兩者的分工。
+> V0（Auth / Workspace / Document）已完成，23 個測試通過。V1（RAG）已完成，端到端手動驗證過（真的上傳 PDF、真的問問題、答案正確且附引用），之後也補上了自動化測試（共 36 個）。這份文件記錄兩者的分工。
 
 ---
 
@@ -207,7 +207,7 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
   ▼  200  { "answer": "...", "citations": [ {...}, {...} ] }
 ```
 
-**驗證方式**：手動端到端測試過一次（真的註冊、建 workspace、上傳一份含文字的 PDF、問一個內容相關的問題），答案內容跟 PDF 實際內容一致，citation 正確帶出來源。**目前沒有 pytest 自動化測試涵蓋 V1**（跟 V0 的 23 個測試不一樣），這是已知的缺口，之後可以補。
+**驗證方式**：先手動端到端測試過一次（真的註冊、建 workspace、上傳一份含文字的 PDF、問一個內容相關的問題），答案內容跟 PDF 實際內容一致、citation 正確帶出來源，確認整條 pipeline 沒問題之後，才補上自動化測試：`tests/test_core.py`（`chunker`／`pdf_parser` 純函式）、`tests/test_chunk_repo.py`（向量搜尋，含 workspace 隔離、排序、limit）、`tests/test_qa.py`（`/ask` 端點 + ownership），共 13 個，加上原本 V0 的 23 個，共 36 個。真的呼叫 OpenAI 的部分（embedding、生成）全部用 `monkeypatch` 換成固定假回應，測試不花錢、結果穩定，也不需要自己的 OpenAI key。
 
 ---
 
