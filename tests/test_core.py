@@ -12,7 +12,9 @@ def test_chunk_text_splits_long_text():
     pieces = chunker.chunk_text(long_text, chunk_size=100, overlap=10)
 
     assert len(pieces) > 1
-    assert all(isinstance(p, str) and p for p in pieces)
+    for piece in pieces:
+        assert isinstance(piece, str)
+        assert piece
 
 
 # 測試：短文字（token 數不到 chunk_size）只會切出一段
@@ -21,7 +23,7 @@ def test_chunk_text_short_text_single_chunk():
     assert len(pieces) == 1
 
 
-# 測試：overlap 越大，前進的步伐（chunk_size - overlap）越小，切出來的段數不會變少
+# 測試：overlap 越大，前進的步伐（chunk_size - overlap）越小 切出來的段數不會變少
 def test_chunk_text_larger_overlap_means_more_or_equal_chunks():
     long_text = "測試內容。" * 300
     few_pieces = chunker.chunk_text(long_text, chunk_size=100, overlap=0)
@@ -32,15 +34,15 @@ def test_chunk_text_larger_overlap_means_more_or_equal_chunks():
 
 # 測試：正常 PDF 抓得到文字
 def test_extract_text_from_valid_pdf(tmp_path):
-    pdf_path = tmp_path / "test.pdf"  # tmp_path 是 pytest 給的一個全新空資料夾，然後自己取一個檔案名字
-    pdf_path.write_bytes(valid_pdf_bytes("Hello World"))  # 呼叫 fixture 函式把字寫進去
+    pdf_path = tmp_path / "test.pdf" # tmp_path 是 pytest 給的一個全新空資料夾 然後自己取一個檔案名字
+    pdf_path.write_bytes(valid_pdf_bytes("Hello World")) # 呼叫 fixture 函式把字寫進去
 
     text = pdf_parser.extract_text(pdf_path)
 
     assert "Hello World" in text
 
 
-# 測試：壞掉的 PDF 丟出我們自己定義的 UnreadablePdf，不是讓 pypdf 的錯誤直接爆出來
+# 測試：壞掉的 PDF 丟出我們自己定義的 UnreadablePdf 不是讓 pypdf 的錯誤直接爆出來
 def test_extract_text_from_corrupt_pdf_raises(tmp_path):
     pdf_path = tmp_path / "broken.pdf"
     pdf_path.write_bytes(b"not a real pdf")

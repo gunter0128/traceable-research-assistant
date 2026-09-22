@@ -48,8 +48,7 @@ def _upload_pdf(client, token, workspace_id, text="Multi-hop retrieval is the co
         f"/workspaces/{workspace_id}/documents",
         headers=_auth_headers(token),
         files={
-            # io.BytesIO(bytes資料) 把一包 bytes 包裝成一個檔案物件
-            "file": ("thesis.pdf", io.BytesIO(valid_pdf_bytes(text)), "application/pdf")
+            "file": ("thesis.pdf", io.BytesIO(valid_pdf_bytes(text)), "application/pdf") # io.BytesIO(bytes資料) 把一包 bytes包裝成一個檔案物件
         },
     )
 

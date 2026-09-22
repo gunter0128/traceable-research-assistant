@@ -42,7 +42,8 @@ def _add_chunk(db_session, document_id, content, embedding):
     return chunk
 
 
-# 1536 維向量：QUERY 跟 CLOSE 指同一個方向（距離 0，最像），FAR 指另一個方向（距離較大）
+# 1536 維向量：QUERY 跟 CLOSE 指同一個方向（距離 0 最像）
+# FAR 指另一個方向（距離較大）
 QUERY = [1.0] + [0.0] * 1535
 CLOSE = [1.0] + [0.0] * 1535
 FAR = [0.0, 1.0] + [0.0] * 1534
@@ -77,7 +78,10 @@ def test_search_similar_orders_by_distance(client, db_session):
 
     results = chunk_repo.search_similar(db_session, ws_id, QUERY)
 
-    assert [r.content for r in results] == ["比較像", "比較不像"]
+    contents = []
+    for r in results:
+        contents.append(r.content)
+    assert contents == ["比較像", "比較不像"]
 
 
 # 測試：limit 參數真的有限制筆數

@@ -5,7 +5,7 @@
 from fpdf import FPDF
 
 
-# 內建字型（Helvetica）只支援英數字，不支援中文（要中文得額外掛 Unicode 字型檔）——測試裡要放可辨識文字請用英文
+# 內建字型（Helvetica）只支援英數字 不支援中文（要中文得額外掛 Unicode 字型檔）——測試裡要請用英文
 def valid_pdf_bytes(text: str = "test content") -> bytes:
     pdf = FPDF()
     pdf.add_page()
