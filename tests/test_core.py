@@ -32,8 +32,8 @@ def test_chunk_text_larger_overlap_means_more_or_equal_chunks():
 
 # 測試：正常 PDF 抓得到文字
 def test_extract_text_from_valid_pdf(tmp_path):
-    pdf_path = tmp_path / "test.pdf"
-    pdf_path.write_bytes(valid_pdf_bytes("Hello World"))
+    pdf_path = tmp_path / "test.pdf"  # tmp_path 是 pytest 給的一個全新空資料夾，然後自己取一個檔案名字
+    pdf_path.write_bytes(valid_pdf_bytes("Hello World"))  # 呼叫 fixture 函式把字寫進去
 
     text = pdf_parser.extract_text(pdf_path)
 

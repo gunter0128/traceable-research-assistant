@@ -8,9 +8,13 @@ from app.core import openai_client
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
 
-
+# autouse=True 的意思是：「不用等有人在參數列表裡點名要你，這個檔案裡每一個測試開始前，自動先跑我」
+# 所以這個 fixture 不會看到有人呼叫他
 @pytest.fixture(autouse=True)
 def _use_temp_storage(tmp_path, monkeypatch):
+    # tmp_path / monkeypatch 都是 pytest 內建的 fixture 不用自己寫或 import
+    # tmp_path：每次用都給一個全新、專屬這次測試的空資料夾路徑，測完 pytest 自己清
+    # monkeypatch：臨時改掉某個東西，測試結束自動改回原值，不用自己寫收尾
     monkeypatch.setattr(document_service, "STORAGE_DIR", tmp_path)
 
 
@@ -44,6 +48,7 @@ def _upload_pdf(client, token, workspace_id, text="Multi-hop retrieval is the co
         f"/workspaces/{workspace_id}/documents",
         headers=_auth_headers(token),
         files={
+            # io.BytesIO(bytes資料) 把一包 bytes 包裝成一個檔案物件
             "file": ("thesis.pdf", io.BytesIO(valid_pdf_bytes(text)), "application/pdf")
         },
     )
