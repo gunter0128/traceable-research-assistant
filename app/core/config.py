@@ -14,6 +14,10 @@ class Settings(BaseSettings): # BaseModel的子類別 不用給他明確的資�
     access_token_expire_minutes: int = 30
     algorithm: str = "HS256"
     openai_api_key: str
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_region: str
+    s3_bucket_name: str
 
 
 settings = Settings()

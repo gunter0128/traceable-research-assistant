@@ -1,18 +1,16 @@
 # document 的規則：存檔案、透過 workspace 判斷 ownership、CRUD 流程
 # 不寫 SQL 不碰 HTTP
 
-from pathlib import Path
+import io
 from uuid import uuid4
 
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
-from app.core import chunker, openai_client, pdf_parser
+from app.core import chunker, openai_client, pdf_parser, s3_client
 from app.models.document import Document
 from app.repositories import chunk_repo, document_repo
 from app.services import workspace_service
-
-STORAGE_DIR = Path("storage/documents")
 
 
 class DocumentNotFound(Exception):
@@ -41,26 +39,26 @@ def upload_document(
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise InvalidFileType
 
-    # 連上層缺的資料夾也一起建（storage/ 沒有的話 先建 storage/ 再建裡面的 documents/）
-    # 資料夾如果已經存在不要報錯
-    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     # uuid4()： 產生一個隨機的、幾乎不可能重複的識別碼
     # .hex： 把它變成一串十六進位字串
-    # 加上隨機前綴 避免同名檔案被覆蓋掉
-    stored_name = f"{uuid4().hex}_{file.filename}"
-    storage_path = STORAGE_DIR / stored_name
+    # 加上隨機前綴 避免同名檔案在 S3 裡互相覆蓋掉
+    # "documents/" 這個前綴只是 S3 key 裡的字串，不是真的資料夾，純粹方便之後找東西
+    key = f"documents/{uuid4().hex}_{file.filename}"
     # file.file.read() 把上傳內容讀出來變成一包 bytes (file 是 UploadFile 這個物件 .file 是它裡面裝真正內容的屬性)
-    # storage_path.write_bytes(...) 把這包 bytes 寫進硬碟的這個路徑，等於開檔、寫入、關檔一次做完
-    storage_path.write_bytes(file.file.read())
+    s3_client.upload_file(key, file.file.read())
 
-    document = document_repo.create(db, workspace_id, file.filename, str(storage_path))
+    document = document_repo.create(db, workspace_id, file.filename, key)
     return process_document(db, document)
 
 
 # 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
 def process_document(db: Session, document: Document) -> Document:
     try:
-        text = pdf_parser.extract_text(document.storage_path)
+        # document.storage_path 現在存的是 S3 key，不是本機路徑，要先把內容抓下來
+        content = s3_client.download_file(document.storage_path)
+        # pdf_parser.extract_text 要的是一個「檔案物件」，io.BytesIO 把一包 bytes 包裝成檔案物件，
+        # 跟上傳那邊 file.file（UploadFile 的底層）是同一種東西
+        text = pdf_parser.extract_text(io.BytesIO(content))
         pieces = chunker.chunk_text(text)
         for index, piece in enumerate(pieces):
             embedding = openai_client.embed_text(piece)
@@ -83,5 +81,5 @@ def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document
 
 def delete_document(db: Session, document_id: int, owner_id: int) -> None:
     document = get_owned_document(db, document_id, owner_id)
-    Path(document.storage_path).unlink(missing_ok=True)  # 順便刪硬碟上的檔案
+    s3_client.delete_file(document.storage_path)  # 順便刪 S3 上的檔案
     document_repo.delete(db, document)

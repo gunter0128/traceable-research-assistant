@@ -4,8 +4,7 @@ import io
 
 import pytest
 
-from app.core import openai_client
-from app.services import document_service
+from app.core import openai_client, s3_client
 from tests.pdf_fixtures import valid_pdf_bytes
 
 # 每個測試三段（AAA）測試撰寫慣例：
@@ -14,16 +13,14 @@ from tests.pdf_fixtures import valid_pdf_bytes
 # Assert  ：檢查 response 對不對
 
 
-# 上傳會真的把檔案寫到硬碟。這個 fixture 把存檔位置換成 pytest 給的臨時資料夾，
-# 跟隔離測試資料庫是同一個道理：測試不該碰到 storage/documents/ 這個正式資料夾。
+# 上傳現在會呼叫真的 S3 API。這裡用一個記憶體裡的 dict 假裝 S3（upload 存進去、
+# download 讀出來、delete 拿掉），跟隔離測試資料庫是同一個道理：測試不該碰到正式的 S3 bucket
 @pytest.fixture(autouse=True) # autouse=True 這個檔裡每個測試都自動套用，不用每個測試自己寫進參數列表
-# tmp_path / monkeypatch 都是 pytest 內建的 fixture 不用自己寫或 import
-# tmp_path：每次用都給一個全新、專屬這次測試的空資料夾路徑，測完 pytest 自己清
-# monkeypatch：臨時改掉某個東西，測試結束自動改回原值，不用自己寫收尾
-def _use_temp_storage(tmp_path, monkeypatch):
-    # setattr(物件, "屬性名字", 新值) 把 document_service 的 STORAGE_DIR 換成這次的臨時資料夾
-    # 跟內建 setattr() 做的事一樣 差別是 monkeypatch.setattr 會記住舊值 測試結束自動換回去
-    monkeypatch.setattr(document_service, "STORAGE_DIR", tmp_path)
+def _fake_s3(monkeypatch):
+    fake_bucket = {}
+    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
+    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
+    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
 
 
 # 上傳現在會觸發 process_document()，裡面會呼叫真的 OpenAI embedding API。
