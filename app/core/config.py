@@ -14,8 +14,10 @@ class Settings(BaseSettings): # BaseModel的子類別 不用給他明確的資�
     access_token_expire_minutes: int = 30
     algorithm: str = "HS256"
     openai_api_key: str
-    aws_access_key_id: str
-    aws_secret_access_key: str
+    # 這兩個改成選填：本機開發用 trace-app-s3 的金鑰（.env 裡有值）；
+    # 部署在 Fargate 上時不會有這兩個環境變數，改靠 Task Role 自動取得憑證
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
     aws_region: str
     s3_bucket_name: str
 

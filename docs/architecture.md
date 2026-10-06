@@ -211,19 +211,28 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
 
 ---
 
-## 接下來（V2）
+## V2（部署到 AWS）—— 進行中
 
-部署。目前只在本機跑。
+**方向**（2026-09-22 決定，考量點是求職含金量，不是最快能動）：雲端只選 AWS 一家，不跨雲混用。物件儲存用 S3、跑程式碼用 ECS + Fargate（容器化、免管伺服器）。詳細的指令跟每個資源的用途，記在 [`docs/deployment-commands.md`](deployment-commands.md)，這裡只記整體進度跟架構決定。
 
-**已定的方向**（2026-09-22 決定，考量點是求職含金量，不是最快能動）：
+**目前狀態（2026-10-06）**：
 
-- **雲端只選 AWS 一家**，不跨雲混用。物件儲存（PDF 檔案）用 S3、跑程式碼用 ECS + Fargate（容器化、免管伺服器），不用 EC2（太手動）也不用 EKS／Kubernetes（現階段太重）。理由：AWS 在履歷/面試裡的辨識度跟出現頻率最高，單一雲端也才有一個連貫的部署故事可以講。
-- **部署前的硬性前提**：`storage/documents/`（本機硬碟存 PDF）必須先換成 S3，不然部署到 Fargate 之後、容器重啟，使用者上傳的檔案會直接消失。
+```
+✓ 1. 存檔改用 S3（app/core/s3_client.py）
+✓ 2. Dockerfile + .dockerignore，本機 build/run 驗證過
+✓ 3. AWS 帳號、IAM（chun-admin 管理員 / trace-app-s3 本機開發用）、ECR（image 已推送）
+✓ 4. Secrets Manager（DATABASE_URL / SECRET_KEY / OPENAI_API_KEY）
+✓ 5. 兩個 IAM Role：
+     - trace-app-execution-role（啟動容器用：抓 image、讀密鑰、送 log）
+     - trace-app-task-role（app 執行期間用：碰 S3，取代 trace-app-s3 金鑰）
+✓ 6. Task Definition（deploy/task-definition.json，family: trace-app）
+✓ 7. Security Group（trace-app-sg，開放 inbound 8000）
+✓ 8. ECS Cluster（trace-app-cluster）+ Service（trace-app-service）建立完成
+  9.（可選）GitHub Actions CI/CD
+```
 
-**大致順序**（還沒開始動手，之後每步做完再回來補細節，跟 V0→V1 的做法一致）：
+**已知問題，已修正**：第一次建 Service 時容器一直啟動失敗（`ExitCode: 1`）。從 CloudWatch Logs 查到原因：`config.py` 的 `Settings` 把 `aws_access_key_id` / `aws_secret_access_key` 設成必填，但 Task Definition 故意沒有提供這兩個環境變數（部署版本要靠 `trace-app-task-role` 自動取得憑證，不需要金鑰）——容器一啟動，`Settings()` 驗證就失敗崩潰。修正：這兩個欄位改成選填（`str | None = None`），`s3_client.py` 改成「有金鑰就明確傳給 boto3（本機開發），沒有就讓 boto3 自動去問 Task Role 要臨時憑證（部署環境）」。改完要重新 build → push → `aws ecs update-service --force-new-deployment` 才會生效，不會自動套用到已經在跑的容器。
 
-1. 把 `document_service.py` 存檔那段從本機路徑換成 S3
-2. 寫 `Dockerfile`，本機把 image build 起來、跑得動
-3. AWS 帳號、IAM、ECR 這些雲端基礎設定
-4. 真的部署到 ECS/Fargate，串上 Neon（資料庫不用搬）
-5.（可選，加分項）GitHub Actions 做 CI/CD，push 到 main 自動 build + 部署
+**部署的公有 IP 是浮動的**：每次任務重啟，IP 會換，不是固定網址。之後若要固定網址，需要加 Load Balancer，先不做（不是這階段的必要項目）。
+
+**運作期間持續在計費**：Fargate 是只要任務在跑就按秒計費，不是按請求計費，跟 OpenAI 那種用量計費不一樣。不用的時候記得把 Service 的 Desired tasks 調成 0，不然會持續燒 AWS 的 $200 額度。

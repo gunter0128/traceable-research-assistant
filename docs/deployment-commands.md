@@ -106,3 +106,105 @@ ECR 位址的結構(跟 GitHub 網址是同一種邏輯):
 aws ecr describe-images --repository-name traceable-research-assistant --region ap-southeast-2
 ```
 列出這個倉庫裡現有的 image，`imageStatus: "ACTIVE"` 代表確實存在且可用。
+
+---
+
+## Secrets Manager：密鑰放哪
+
+```bash
+aws secretsmanager create-secret --name trace-app/database-url --secret-string "值" --region ap-southeast-2
+aws secretsmanager update-secret --secret-id trace-app/database-url --secret-string "新值" --region ap-southeast-2
+```
+`create-secret` 第一次建立；改內容用 `update-secret`，不用整個刪掉重建（刪除預設有 30 天緩衝期，要立刻重建同名的會卡住，加 `--force-delete-without-recovery` 才會真的馬上刪）。
+
+已建立的三個：`trace-app/database-url`、`trace-app/secret-key`、`trace-app/openai-api-key`（都在 `ap-southeast-2`）。
+
+---
+
+## 兩個 IAM Role（透過主控台建立，不是 CLI）
+
+**`trace-app-execution-role`**——`arn:aws:iam::416113247224:role/trace-app-execution-role`
+負責「啟動容器前」的事：抓 image、讀密鑰、送 log。掛了兩份政策：
+- `AmazonECSTaskExecutionRolePolicy`（AWS 現成的，抓 image + 送 log）
+- `SecretsAccessForTraceApp`（內嵌政策，讀上面那三個密鑰）
+
+**`trace-app-task-role`**——`arn:aws:iam::416113247224:role/trace-app-task-role`
+負責「容器真正跑起來之後」程式碼能做的事：碰 S3（取代本機開發用的 `trace-app-s3` 金鑰）。掛了一份政策：
+- `S3AccessForTraceAppTaskRole`（內嵌政策，內容跟 `trace-app-s3` 一樣，限定只能碰這一個 bucket）
+
+兩個 Role 的信任政策都一樣：只有 ECS 的任務服務（`ecs-tasks.amazonaws.com`）可以借用。這兩個 ARN，寫 Task Definition 時會用到。
+
+---
+
+## Task Definition：容器的「食譜」
+
+寫在 [`deploy/task-definition.json`](../deploy/task-definition.json)，記錄「這個任務要用哪個 image、吃多少 CPU/記憶體、兩個 Role 分別是誰、環境變數跟密鑰從哪裡來、log 往哪裡送」。這份 JSON 可以直接在主控台的空白範本上填，也可以存成檔案用 CLI 註冊：
+
+```bash
+aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json --region ap-southeast-2
+```
+
+每次註冊都會產生新的 revision（`trace-app:1`、`trace-app:2`...），舊的 revision 不會被覆蓋或刪除，只是不再是「最新」。**改了 Task Definition（比方說要用新 image、改環境變數）之後，要重新註冊產生新 revision，Service 才有新版本可以切換過去**——光改這份 JSON 檔案本身，不會自動影響正在跑的 Service。
+
+```bash
+aws ecs describe-task-definition --task-definition trace-app --region ap-southeast-2
+```
+只讀，確認目前最新 revision 的內容。
+
+---
+
+## Security Group：防火牆規則
+
+透過主控台建立，叫 `trace-app-sg`。開放 inbound（外面連進來）TCP 8000 port，來源設成 `0.0.0.0/0`（任何地方都能連，因為這是公開 API，沒有另外架 VPN/內網）。outbound（容器對外連，比方說連 Neon 資料庫、呼叫 OpenAI API）預設全部放行，不用額外設定。
+
+---
+
+## ECS Cluster：組織容器的「資料夾」
+
+透過主控台建立，叫 `trace-app-cluster`，選 Fargate（無伺服器，不用自己管底層機器）。Cluster 本身不跑任何東西，只是把相關的 Service/Task 歸在一起管理，方便之後在主控台找。
+
+```bash
+aws ecs describe-clusters --clusters trace-app-cluster --region ap-southeast-2
+```
+
+---
+
+## ECS Service：讓任務「跑起來並保持活著」
+
+透過主控台建立，叫 `trace-app-service`。指向 `trace-app-cluster`、用最新的 `trace-app` Task Definition、Desired tasks 設 1、網路選預設 VPC 的三個子網路 + `trace-app-sg`、**公有 IP 設成啟用**（不然外面連不進去）。
+
+### 確認目前狀態(只讀)
+
+```bash
+aws ecs describe-services --cluster trace-app-cluster --services trace-app-service --region ap-southeast-2
+```
+看 `runningCount`（目前真的在跑幾個）、`desiredCount`（希望跑幾個）、`deployments`（部署歷史跟狀態）。
+
+```bash
+aws ecs describe-tasks --cluster trace-app-cluster --tasks <task-id> --region ap-southeast-2
+```
+看單一任務的詳細狀態，包括失敗時的 `stoppedReason`、`exitCode`——診斷崩潰問題的第一步。
+
+### 查 log(容器印出來的東西，等同雲端版的 `docker logs`)
+
+```bash
+export MSYS_NO_PATHCONV=1   # Git Bash 專用：避免把 /ecs/trace-app 這種字串誤判成本機路徑
+aws logs describe-log-streams --log-group-name /ecs/trace-app --region ap-southeast-2
+aws logs get-log-events --log-group-name /ecs/trace-app --log-stream-name <stream-name> --region ap-southeast-2
+```
+
+### 套用新版本(改了程式碼、重新 build+push+register 之後)
+
+```bash
+aws ecs update-service --cluster trace-app-cluster --service trace-app-service --force-new-deployment --region ap-southeast-2
+```
+**`--force-new-deployment` 的用途**：就算 Task Definition 的 revision 號碼沒變（比方說只是用了同一個 `:latest` image tag、但 image 內容其實換新了），這個指令會強制 Service 不管快取，直接拉一份新的任務起來、健康後把舊的關掉。沒有這個指令，Service 會覺得「設定沒變啊」而繼續用舊的容器跑。
+
+跑完之後，用 `describe-services`/`describe-tasks` 確認新任務的 `runningCount` 變成 1、沒有立刻崩潰退出，再去 ECS 主控台的任務頁面抓新的公有 IP 測試(**每次任務重啟，公有 IP 會換**，不是固定網址)。
+
+### 不用的時候記得關掉(避免持續計費)
+
+```bash
+aws ecs update-service --cluster trace-app-cluster --service trace-app-service --desired-count 0 --region ap-southeast-2
+```
+Fargate 是「任務在跑就按秒計費」，跟 OpenAI 那種按用量計費不一樣。測試完一段時間，把 `desired-count` 調成 0，之後要測再調回 1 即可，不用整個刪掉 Service。

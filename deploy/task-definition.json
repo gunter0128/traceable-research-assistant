@@ -1,0 +1,38 @@
+{
+  "family": "trace-app",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::416113247224:role/trace-app-execution-role",
+  "taskRoleArn": "arn:aws:iam::416113247224:role/trace-app-task-role",
+  "containerDefinitions": [
+    {
+      "name": "trace-app",
+      "image": "416113247224.dkr.ecr.ap-southeast-2.amazonaws.com/traceable-research-assistant:latest",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "AWS_REGION", "value": "ap-southeast-2" },
+        { "name": "S3_BUCKET_NAME", "value": "traceable-research-assistant-416113247224-ap-southeast-2-an" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:416113247224:secret:trace-app/database-url" },
+        { "name": "SECRET_KEY", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:416113247224:secret:trace-app/secret-key" },
+        { "name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:416113247224:secret:trace-app/openai-api-key" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/trace-app",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "trace-app"
+        }
+      }
+    }
+  ]
+}
