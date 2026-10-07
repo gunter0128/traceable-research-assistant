@@ -235,4 +235,35 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
 
 **部署的公有 IP 是浮動的**：每次任務重啟，IP 會換，不是固定網址。之後若要固定網址，需要加 Load Balancer，先不做（不是這階段的必要項目）。
 
-**運作期間持續在計費**：Fargate 是只要任務在跑就按秒計費，不是按請求計費，跟 OpenAI 那種用量計費不一樣。不用的時候記得把 Service 的 Desired tasks 調成 0，不然會持續燒 AWS 的 $200 額度。
+**運作期間持續在計費**：Fargate 是只要任務在跑就按秒計費，不是按請求計費，跟 OpenAI 那種用量計費不一樣。不用的時候記得把 Service 的 Desired tasks 調成 0，不然會持續燒 AWS 的 $200 額度。**目前 Desired tasks 是 0**（端到端測試過一輪、確認部署的版本能正常跑完 register → login → 建 workspace → 上傳 PDF → 問答全流程之後，手動關掉省錢）。要重新測試，照 `docs/deployment-commands.md` 的「套用新版本」那段把 Desired tasks 調回 1 即可，不用重建任何東西。
+
+---
+
+## 前端 —— 提前動工中（原計畫 V4，為了求職 demo 需求提前插進 V2）
+
+**背景**：V2 跑起來之後，發現用 Swagger UI 打 JSON 測試太醜、不好展示，決定在部署完成之餘先插入一個極簡前端，讓這個系統看起來像「真的產品」，而不是改動 V2 本身的部署範圍。
+
+**技術選擇**：React + Vite + TypeScript + Tailwind CSS v4，元件風格照 shadcn/ui 的標準寫法（Radix UI 當底層、CSS variable 控制主題色）。選 React 是因為業界最多人用、履歷辨識度最高；不用 Streamlit/Gradio 是因為那些是獨立 process，會多一塊部署用的基礎設施；用純 HTML 又太陽春。前端程式碼本身不是這個人求職方向要練的重點，所以這塊是直接讓 Claude 寫（跟部署那段「自己打指令」的原則不同，這段是刻意的例外）。
+
+**目錄結構**：`frontend/` 是獨立的 Node.js 專案，跟 `app/`（Python）完全分開，自己的 `package.json`。本機開發指令、環境建置細節在 [`docs/deployment-commands.md`](deployment-commands.md) 的「前端：本機開發環境建置」那節。
+
+**目前狀態（2026-10-07）**：
+
+```
+✓ 專案骨架（Vite + React + TypeScript + Tailwind v4）
+✓ 手動撰寫 10 個 shadcn 風格元件（button/card/input/label/tabs/badge/
+  scroll-area/separator/textarea/sonner）—— 原因見下方「已知問題」
+✓ API 串接層（src/lib/api.ts，對應後端所有路徑）
+✓ 三個畫面：登入/註冊、工作區列表（建立/刪除）、工作區詳情
+  （文件上傳/列表/刪除 + QA 問答聊天視窗，附來源 citation）
+✓ 開發用 proxy（vite.config.ts）：5173 的請求自動轉給本機 8000，
+  不用設定 CORS
+✓ 本機以「兩個開發伺服器」(5173 前端 + 8000 後端) 的方式端到端測試過，
+  確認整個流程能動
+  尚未整合進 Dockerfile（目前的 Dockerfile 只 build 後端）、
+  尚未部署到 AWS —— 這是下一步
+```
+
+**已知問題**：官方的 `npx shadcn@latest init` 在這個專案的設定組合下會壞（寫完 `components.json` 讀不回來；`add` 指令不加 `--path` 的話,元件會被寫到一個叫 `@` 的錯誤資料夾，而不是 `src/components/ui/`）。研判是 shadcn CLI 最近把預設樣式換成「base-nova」(底層改用 Base UI、`cn` 改成一個獨立套件)，這個新版本在 Windows 上還不穩。解法跟之後加新元件的正確用法，寫在 `docs/deployment-commands.md` 裡，不在這裡重複。
+
+**下一步要討論的方向**：目前的 citation 顯示方式太陽春——答案文字跟下面列出的來源片段之間沒有任何對應關係（LLM 沒有被要求標註「這句話根據第幾段資料」），而且來源清單是「這次搜尋到的全部內容」，不是「答案真的引用到的部分」；`chunk_repo.py` 裡其實算了向量相似度分數，但目前完全沒有透過 API 往外傳，前端沒有任何「可信度」可以顯示。這其實正是論文主題（trace-aware RAG）要處理的問題，討論中，還沒決定要不要動手做、先做哪一塊。

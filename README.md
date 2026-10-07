@@ -2,7 +2,7 @@
 
 這個專案的起點是我的碩士論文（multi-hop / trace-aware RAG），目標是把論文裡的檢索概念做成一個真的能部署、能被別人操作的文件問答系統——不只是回答問題，還要讓使用者看見答案是怎麼一步步被找出來的。
 
-目前完成了 V0（後端地基）跟 V1（RAG 問答）：使用者能註冊登入、建立自己的研究工作區（workspace）、上傳 PDF 文件，並且針對 workspace 裡的文件提問，系統會回傳答案，並附上答案是從哪份文件、哪一段找到的（citation）。每個人只看得到自己的東西。Multi-hop 檢索、前端這些是後面版本才會加上去。
+目前完成了 V0（後端地基）、V1（RAG 問答），V2（部署到 AWS）進行中：使用者能註冊登入、建立自己的研究工作區（workspace）、上傳 PDF 文件，並且針對 workspace 裡的文件提問，系統會回傳答案，並附上答案是從哪份文件、哪一段找到的（citation）。每個人只看得到自己的東西。Multi-hop 檢索視覺化是後面版本才會加上去；極簡前端已經提前動工，細節見 [`docs/architecture.md`](docs/architecture.md)。
 
 ## V0：後端地基
 
@@ -10,7 +10,7 @@
 
 - **Auth**：註冊、登入（bcrypt 雜湊密碼、JWT 簽發）、查自己的資料
 - **Workspace**：使用者可以建立多個工作區，CRUD 齊全，只看得到自己名下的
-- **Document**：在 workspace 底下上傳 PDF（存在本機硬碟），列表、查詢、刪除。文件本身沒有自己的擁有者欄位——擁有權是透過它所屬的 workspace 判斷的，這是刻意的設計：擁有者只有一個來源，不會兩邊資料不一致
+- **Document**：在 workspace 底下上傳 PDF（存在 AWS S3），列表、查詢、刪除。文件本身沒有自己的擁有者欄位——擁有權是透過它所屬的 workspace 判斷的，這是刻意的設計：擁有者只有一個來源，不會兩邊資料不一致
 
 後端分四層：`api`（收發 HTTP）→ `services`（業務規則，包括上面講的 ownership 檢查）→ `repositories`（唯一碰資料庫查詢的地方）→ `models`（資料表定義）。這樣分是因為每一層會因為不同的原因被修改——換資料庫只動 `repositories`，改規則只動 `services`，不會互相波及。細節看 [`docs/architecture.md`](docs/architecture.md)。
 
@@ -24,7 +24,7 @@
 
 ## Tech Stack
 
-Python 3.11、FastAPI、PostgreSQL + pgvector + SQLAlchemy 2.0 + Alembic、bcrypt + JWT、OpenAI API（embedding + 生成）、pypdf、tiktoken、pytest。
+Python 3.11、FastAPI、PostgreSQL + pgvector + SQLAlchemy 2.0 + Alembic、bcrypt + JWT、OpenAI API（embedding + 生成）、pypdf、tiktoken、pytest、Docker、AWS（S3 + ECR + ECS/Fargate + Secrets Manager + IAM）。前端：React + Vite + TypeScript + Tailwind CSS。
 
 ## 本地啟動
 
@@ -43,7 +43,7 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-打開 `http://localhost:8000/docs` 用 Swagger UI 直接試。
+打開 `http://localhost:8000/docs` 用 Swagger UI 直接試，或是啟動前端（見下方「前端」一節）用網頁介面操作。
 
 ## API
 
@@ -63,6 +63,18 @@ uvicorn app.main:app --reload
 | DELETE | `/documents/{id}` | 刪除文件 | ✓ |
 | POST | `/workspaces/{id}/ask` | 針對這個 workspace 的文件提問，回傳答案 + 引用來源 | ✓ |
 
+## 前端
+
+`frontend/` 是獨立的 React + Vite + TypeScript 專案（極簡介面，不是這個專案要練習的重點，細節見 `docs/architecture.md`）。需要先裝 [Node.js](https://nodejs.org)（LTS 版本），裝完要開一個新的終端機：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+打開 `http://localhost:5173`。開發時後端要另外用 `uvicorn app.main:app --reload` 開著（8000），前端會自動把 API 請求轉過去，不用額外設定。
+
 ## 測試
 
 ```bash
@@ -73,4 +85,4 @@ pytest tests/ -v
 
 ## 接下來
 
-V2：部署。目前只在本機跑，其中一個要先解決的問題是上傳的 PDF 存在本機硬碟（`storage/documents/`），部署到大部分雲端平台後重啟會遺失，需要換成雲端物件儲存。再之後是 multi-hop trace 視覺化（V3，論文的核心差異化特色）、前端（V4）。
+V2（部署到 AWS）進行中，進度跟每個決定的理由記在 [`docs/architecture.md`](docs/architecture.md)。極簡前端已經提前動工（原計畫 V4），還沒整合進部署流程。再之後是 multi-hop trace 視覺化（V3，論文的核心差異化特色）。

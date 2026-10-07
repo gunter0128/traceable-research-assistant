@@ -2,6 +2,19 @@
 
 V2(部署到 AWS)過程中用到的指令,整理起來備查。指令不像程式碼,下過之後不會留在專案裡,容易忘記在幹嘛、哪些要重複做、哪些只做一次。
 
+## 開始之前:這台電腦需要先裝好的工具
+
+換一台新電腦接手這個專案,git clone 下來之後,光有程式碼還不夠,這幾個工具都要另外裝,而且**都是裝給作業系統用的,不會跟著 git 走**:
+
+| 工具 | 用途 | 下載 |
+|---|---|---|
+| Python 3.11 + venv | 跑後端(`requirements.txt`) | 通常電腦已有,沒有就去 [python.org](https://www.python.org/) |
+| Docker Desktop | build/跑容器、之後部署用的 image | [docker.com](https://www.docker.com/products/docker-desktop/) |
+| AWS CLI v2 | 操作 AWS(ECR、ECS、Secrets Manager...) | [AWS 官方安裝頁](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),裝完要 `aws configure` 用 `chun-admin` 的金鑰登入 |
+| Node.js(LTS) | 跑前端(`frontend/`),裝的時候會順便裝好 `npm` | [nodejs.org](https://nodejs.org),選 **Windows 安裝程式(.msi)**,目前用的是 v24.21.0 |
+
+**每裝完一個,一定要關掉目前開著的終端機、重新開一個,再去跑對應的 `--version` 指令確認。** 這專案已經中過好幾次招:裝好之後沒換新終端機,`docker`/`aws`/`node` 全部都抓不到,因為 PATH(系統去哪裡找這些指令)是終端機一開始啟動時就讀好的,裝新軟體不會讓已經開著的終端機重新讀一次。
+
 ## 先搞懂語法結構
 
 這份裡大部分指令都是同一種結構:
@@ -208,3 +221,34 @@ aws ecs update-service --cluster trace-app-cluster --service trace-app-service -
 aws ecs update-service --cluster trace-app-cluster --service trace-app-service --desired-count 0 --region ap-southeast-2
 ```
 Fargate 是「任務在跑就按秒計費」，跟 OpenAI 那種按用量計費不一樣。測試完一段時間，把 `desired-count` 調成 0，之後要測再調回 1 即可，不用整個刪掉 Service。
+
+---
+
+## 前端：本機開發環境建置
+
+`frontend/` 是獨立的 React 專案（Vite + TypeScript + Tailwind CSS v4 + shadcn/ui 風格的元件），跟 `app/` 的 Python 環境完全分開。新電腦要接手，裝好 Node.js 之後（見本文件最上面的前置工具表），跑：
+
+```bash
+cd frontend
+npm install
+```
+
+裝好套件之後，日常開發用：
+
+```bash
+npm run dev
+```
+
+會在 `http://localhost:5173` 開一個開發用的伺服器，存檔會自動刷新畫面。**同時要把後端開著**（另一個終端機、另一個視窗，`uvicorn app.main:app --reload`，跑在 8000）——前端的 [`vite.config.ts`](../frontend/vite.config.ts) 裡設定了 proxy，會把 `/auth`、`/workspaces`、`/documents` 這幾個路徑的請求自動轉給 `localhost:8000`，所以瀏覽器那邊看起來像是同一個來源，不用另外設定 CORS。
+
+### `shadcn` CLI 在這個環境的已知問題
+
+官方的元件安裝工具 `npx shadcn@latest init` 在目前這個版本（4.x）、這個專案的設定組合下會出錯（寫完 `components.json` 之後讀不回來、或是把元件寫到一個叫 `@` 的錯誤資料夾，而不是 `src/components/ui/`）。研判是這個 CLI 版本本身的 bug（它最近改成預設用 Base UI 而不是 Radix 當底層，样式也換了一套「base-nova」，還不夠穩）。
+
+**之後如果要加新元件**，不要用 `init`（會壞），`add` 要**明確指定 `--path`** 才不會寫到錯的資料夾：
+
+```bash
+npx shadcn@latest add <元件名稱> --yes --path src/components/ui
+```
+
+裝完之後**一定要打開檔案檢查 import 那幾行**——確認是 `import { cn } from "@/lib/utils"`，不是 `import { cn } from "cn"`；用到 Radix 元件的話是 `@radix-ui/react-xxx`，不是 `@base-ui/react/xxx`。如果是後者，代表又抓到新的「base-nova」樣式，要手動改成 Radix 版本（現有的 `src/components/ui/*.tsx` 都是照這個標準寫的，可以直接參考）。
