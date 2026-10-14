@@ -118,6 +118,9 @@ export const api = {
     })
   },
 
+  retryDocument: (documentId: number) =>
+    request<Document>(`/documents/${documentId}/retry`, { method: "POST" }),
+
   deleteDocument: (documentId: number) =>
     request<void>(`/documents/${documentId}`, { method: "DELETE" }),
 

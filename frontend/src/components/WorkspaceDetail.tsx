@@ -1,5 +1,5 @@
 import { type ChangeEvent, type FormEvent, useEffect, useRef, useState } from "react"
-import { ArrowLeft, FileText, Send, Trash2, Upload } from "lucide-react"
+import { ArrowLeft, FileText, RotateCw, Send, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -20,6 +20,16 @@ import {
   type Document,
   type Workspace,
 } from "@/lib/api"
+
+// 後端的 status 是給程式看的英文，畫面上換成使用者看得懂的字
+const STATUS_LABELS: Record<string, string> = {
+  uploaded: "處理中",
+  processed: "完成",
+  failed: "失敗",
+}
+
+// 有文件還在處理中時，每隔多久（毫秒）重新問一次後端狀態
+const POLL_INTERVAL_MS = 3000
 
 type ChatMessage = {
   role: "user" | "assistant"
@@ -72,6 +82,19 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
     }
   }
 
+  // 背景處理：上傳完文件還是「處理中」，由 worker 在背景做完後改資料庫，
+  // 前端沒辦法被通知，只能自己定期問。只有在真的有處理中的文件時才問，全部處理完就停
+  const hasPending = documents.some((d) => d.status === "uploaded")
+  useEffect(() => {
+    if (!hasPending) return
+    const timer = setInterval(() => {
+      // 靜默更新：不顯示「讀取中」、失敗也不跳錯誤，下一輪再問就好
+      api.listDocuments(workspaceId).then(setDocuments).catch(() => {})
+    }, POLL_INTERVAL_MS)
+    // cleanup：hasPending 變成 false、或離開這個畫面時，把計時器關掉，不然會一直在背景問
+    return () => clearInterval(timer)
+  }, [hasPending, workspaceId])
+
   async function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
@@ -79,12 +102,26 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
     try {
       const doc = await api.uploadDocument(workspaceId, file)
       setDocuments((prev) => [...prev, doc])
-      toast.success("上傳成功，處理完成後即可拿來問答")
+      if (doc.status === "failed") {
+        toast.error("文件處理失敗，可以按重試")
+      } else {
+        toast.success("上傳成功，處理完成後即可拿來問答")
+      }
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "上傳失敗")
     } finally {
       setUploading(false)
       if (fileInputRef.current) fileInputRef.current.value = ""
+    }
+  }
+
+  async function handleRetry(id: number) {
+    try {
+      const updated = await api.retryDocument(id)
+      // 只換掉被重試的那一份，其他文件不動
+      setDocuments((prev) => prev.map((d) => (d.id === id ? updated : d)))
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "重試失敗")
     }
   }
 
@@ -137,9 +174,27 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
                   <span className="truncate">{doc.filename}</span>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <Badge variant={doc.status === "processed" ? "default" : "secondary"}>
-                    {doc.status}
+                  <Badge
+                    variant={
+                      doc.status === "processed"
+                        ? "default"
+                        : doc.status === "failed"
+                          ? "destructive"
+                          : "secondary"
+                    }
+                  >
+                    {STATUS_LABELS[doc.status] ?? doc.status}
                   </Badge>
+                  {doc.status === "failed" && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="重試"
+                      onClick={() => void handleRetry(doc.id)}
+                    >
+                      <RotateCw className="size-4" />
+                    </Button>
+                  )}
                   <Button
                     variant="ghost"
                     size="icon"
