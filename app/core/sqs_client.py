@@ -3,20 +3,11 @@
 
 import json
 
-import boto3
-
+from app.core.aws_clients import make_client
 from app.core.config import settings
 
-# 憑證的取得方式跟 s3_client.py 一樣：本機用 .env 的金鑰，雲端靠 Role 自動取得
-if settings.aws_access_key_id and settings.aws_secret_access_key:
-    client = boto3.client(
-        "sqs",
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-        region_name=settings.aws_region,
-    )
-else:
-    client = boto3.client("sqs", region_name=settings.aws_region)
+# 憑證怎麼拿統一在 aws_clients.py 處理，跟 s3_client.py 一樣
+client = make_client("sqs")
 
 
 # 何時呼叫：document_service 把文件交出去處理時（上傳、手動重試、定期掃描重送）

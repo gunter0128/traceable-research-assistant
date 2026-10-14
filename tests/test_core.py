@@ -5,7 +5,8 @@ import os
 
 import pytest
 
-from app.core import chunker, lambda_secrets, pdf_parser
+from app.core import aws_clients, chunker, lambda_secrets, pdf_parser
+from app.core.config import settings
 from tests.pdf_fixtures import valid_pdf_bytes
 
 
@@ -92,3 +93,16 @@ def test_lambda_secrets_skipped_outside_lambda(monkeypatch):
 
     lambda_secrets.load_if_in_lambda()  # 不丟例外就算通過
 
+
+# 測試：有金鑰時（本機、Lambda），session token 要跟金鑰一起交給 boto3
+# Lambda 的臨時憑證少了 token 就無效；本機沒有 token 時是 None，boto3 會當作沒給
+def test_make_client_passes_session_token(monkeypatch):
+    monkeypatch.setattr(settings, "aws_access_key_id", "key")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "secret")
+    monkeypatch.setattr(settings, "aws_session_token", "token")
+    captured = {}
+    monkeypatch.setattr(aws_clients.boto3, "client", lambda service, **kwargs: captured.update(kwargs))
+
+    aws_clients.make_client("s3")
+
+    assert captured["aws_session_token"] == "token"
