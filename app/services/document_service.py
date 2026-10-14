@@ -17,9 +17,14 @@ from app.services import workspace_service
 
 # 一份文件最多被處理幾次，超過就直接標成失敗，不再重試
 MAX_ATTEMPTS = 3
+_GAVE_UP = f"處理了 {MAX_ATTEMPTS} 次都沒有成功，已停止自動重試"
 # 工單送出後超過這麼久還沒處理完，定期掃描就當作卡住了
 # Lambda 單次最多跑 15 分鐘，抓兩倍，避免把還在正常處理的文件誤判成卡住
 STUCK_AFTER = timedelta(minutes=30)
+# 上傳檔案大小上限：一般論文 1~5 MB、圖多的報告 10~20 MB
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+# 頁數上限：檔案大小不等於內容量，純文字的 PDF 很小卻可能有上千頁，處理時間會超過 Lambda 的 15 分鐘
+MAX_PAGES = 300
 
 
 class DocumentNotFound(Exception):
@@ -31,6 +36,15 @@ class NotDocumentOwner(Exception):
 
 
 class InvalidFileType(Exception):
+    pass
+
+
+class FileTooLarge(Exception):
+    pass
+
+
+# PDF 讀得開，但一個字都抓不到（通常是掃描檔，整頁都是圖片）
+class NoExtractableText(Exception):
     pass
 
 
@@ -52,6 +66,9 @@ def upload_document(
     # 只能上傳 PDF
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise InvalidFileType
+    # file.size：收檔時框架已經算好的檔案大小（bytes），在讀進記憶體、存進 S3 之前就先擋掉
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise FileTooLarge
 
     # uuid4()： 產生一個隨機的、幾乎不可能重複的識別碼
     # .hex： 把它變成一串十六進位字串
@@ -79,7 +96,7 @@ def dispatch_document(db: Session, document: Document) -> Document:
     # BotoCoreError：連不上 AWS（網路、憑證）；ClientError：AWS 回錯誤（沒權限、佇列不存在）
     except (BotoCoreError, ClientError):
         # 工單送不出去 = 沒有人會處理這份文件，直接標失敗讓使用者知道，可以手動重試
-        return document_repo.mark_failed(db, document)
+        return document_repo.mark_failed(db, document, "排入處理佇列失敗，可以重試")
     return document
 
 
@@ -99,7 +116,7 @@ def requeue_stuck_documents(db: Session) -> int:
     requeued = 0
     for document in document_repo.list_stuck(db, cutoff):
         if document.attempts >= MAX_ATTEMPTS:
-            document_repo.mark_failed(db, document)
+            document_repo.mark_failed(db, document, _GAVE_UP)
         else:
             dispatch_document(db, document)
             requeued += 1
@@ -111,7 +128,7 @@ def requeue_stuck_documents(db: Session) -> int:
 def process_document(db: Session, document: Document) -> Document:
     # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、定期掃描），統一在這裡擋
     if document.attempts >= MAX_ATTEMPTS:
-        return document_repo.mark_failed(db, document)
+        return document_repo.mark_failed(db, document, _GAVE_UP)
     document_repo.increment_attempts(db, document)
 
     try:
@@ -119,20 +136,35 @@ def process_document(db: Session, document: Document) -> Document:
         content = s3_client.download_file(document.storage_path)
         # pdf_parser.extract_text 要的是一個「檔案物件」，io.BytesIO 把一包 bytes 包裝成檔案物件，
         # 跟上傳那邊 file.file（UploadFile 的底層）是同一種東西
-        text = pdf_parser.extract_text(io.BytesIO(content))
+        text = pdf_parser.extract_text(io.BytesIO(content), max_pages=MAX_PAGES)
+        # 沒出錯不代表結果合理：抓不到任何字的話，存 0 段 chunk 然後標「完成」會誤導使用者
+        if not text:
+            raise NoExtractableText
         pieces = chunker.chunk_text(text)
         # 先清掉這份文件舊的 chunk：同一份文件處理兩次（重試）結果跟處理一次一樣，不會變兩倍
         chunk_repo.delete_for_document(db, document.id)
         for index, piece in enumerate(pieces):
             embedding = openai_client.embed_text(piece)
             chunk_repo.create(db, document.id, index, piece, embedding)
+    # 認得出來的錯誤：給使用者明確的原因，讓他知道該換檔案還是可以重試
+    except pdf_parser.UnreadablePdf:
+        return _fail(db, document, "PDF 檔案損壞或無法讀取")
+    except pdf_parser.TooManyPages:
+        return _fail(db, document, f"超過 {MAX_PAGES} 頁的上限")
+    except NoExtractableText:
+        return _fail(db, document, "抓不到任何文字，可能是掃描檔（目前不支援）")
+    # 其他預料之外的錯誤：只給一般性的訊息，不把內部錯誤細節（可能含系統資訊）直接顯示給使用者
     except Exception:
-        # rollback：把這次還沒 commit 的東西（刪掉的舊 chunk、新加的 chunk）全部撤回
-        db.rollback()
-        return document_repo.mark_failed(db, document)
+        return _fail(db, document, "處理時發生錯誤，可以稍後重試")
 
     # mark_processed 裡的 commit 會讓「所有新 chunk + 狀態改成 processed」在同一刻一起生效
     return document_repo.mark_processed(db, document)
+
+
+# 處理失敗的收尾：rollback 把這次還沒 commit 的東西（刪掉的舊 chunk、新加的 chunk）全部撤回，再標失敗
+def _fail(db: Session, document: Document, reason: str) -> Document:
+    db.rollback()
+    return document_repo.mark_failed(db, document, reason)
 
 
 def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document:

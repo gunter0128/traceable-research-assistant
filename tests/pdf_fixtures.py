@@ -12,3 +12,10 @@ def valid_pdf_bytes(text: str = "test content") -> bytes:
     pdf.set_font("Helvetica", size=12)
     pdf.cell(text=text)
     return bytes(pdf.output())
+
+
+# 一頁空白、沒有任何文字的 PDF：模擬掃描檔（整頁都是圖片，抓不到字）
+def blank_pdf_bytes() -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    return bytes(pdf.output())

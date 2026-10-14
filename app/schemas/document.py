@@ -14,5 +14,6 @@ class DocumentOut(BaseModel):
     status: str
     uploaded_at: datetime
     processed_at: datetime | None
+    error_message: str | None
 
     model_config = ConfigDict(from_attributes=True)

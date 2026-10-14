@@ -23,6 +23,8 @@ class Document(Base):
     attempts = Column(Integer, nullable=False, server_default="0")
     # 最近一次送工單的時間。定期掃描靠它判斷「送出去很久了還沒處理完 = 卡住了」
     queued_at = Column(DateTime(timezone=True), nullable=True)
+    # 失敗原因，給使用者看的（例如「抓不到文字，可能是掃描檔」）。沒失敗時是空的
+    error_message = Column(String, nullable=True)
 
     workspace = relationship("Workspace", back_populates="documents")
     chunks = relationship(

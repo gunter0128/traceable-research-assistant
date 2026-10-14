@@ -47,6 +47,11 @@ def upload_document(
         raise HTTPException(
             status_code=400, detail="only PDF files are allowed"
         ) from None
+    # 413 Content Too Large：HTTP 專門用來表示「你送來的內容太大」的狀態碼
+    except document_service.FileTooLarge:
+        raise HTTPException(
+            status_code=413, detail="file is larger than 20 MB"
+        ) from None
 
 
 @router.get("/workspaces/{workspace_id}/documents", response_model=list[DocumentOut])

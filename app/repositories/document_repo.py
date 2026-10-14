@@ -37,6 +37,7 @@ def delete(db: Session, document: Document) -> None:
 def mark_processed(db: Session, document: Document) -> Document:
     document.status = "processed"
     document.processed_at = datetime.now(timezone.utc)
+    document.error_message = None  # 之前失敗過、重試成功的話，把舊的失敗原因清掉
     db.commit()
     db.refresh(document)
     return document
@@ -44,8 +45,10 @@ def mark_processed(db: Session, document: Document) -> Document:
 
 # 何時呼叫：document_service.process_document() 中途出錯時（例如 PDF 解析失敗），讓 status 反映真實結果
 # 也用在：工單送不出去、重試次數用完
-def mark_failed(db: Session, document: Document) -> Document:
+# reason：給使用者看的失敗原因
+def mark_failed(db: Session, document: Document, reason: str) -> Document:
     document.status = "failed"
+    document.error_message = reason
     db.commit()
     db.refresh(document)
     return document
@@ -72,6 +75,7 @@ def increment_attempts(db: Session, document: Document) -> Document:
 def reset_for_retry(db: Session, document: Document) -> Document:
     document.status = "uploaded"
     document.attempts = 0
+    document.error_message = None
     db.commit()
     db.refresh(document)
     return document

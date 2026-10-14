@@ -10,12 +10,19 @@ class UnreadablePdf(Exception):
     pass
 
 
+class TooManyPages(Exception):
+    pass
+
+
 # 何時呼叫：document_service 把 S3 抓回來的 PDF 內容丟進來解析；測試裡也會直接傳本機路徑
 # source: str | Path | BinaryIO 代表可以是本機路徑，也可以是 io.BytesIO 這種「檔案物件」，
 # PdfReader 兩種都吃，不用自己先判斷是哪一種再分開寫
-def extract_text(source: str | Path | BinaryIO) -> str:
+# max_pages：超過就直接丟 TooManyPages，在抽文字之前先擋，不用白白把上千頁都讀完。上限多少由呼叫的人決定
+def extract_text(source: str | Path | BinaryIO, max_pages: int | None = None) -> str:
     try:
         reader = PdfReader(source) # 吃一個檔案路徑或檔案物件 回傳一個「PDF 讀取器」物件(它會自己打開、解析 PDF 內部結構)
+        if max_pages is not None and len(reader.pages) > max_pages:
+            raise TooManyPages
         pages = []
         for page in reader.pages:
             pages.append(page.extract_text() or "") # 把每一頁的文字抽取出來或是用空字串代替(避免None)

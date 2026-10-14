@@ -113,6 +113,7 @@ def test_upload_marks_failed_when_send_fails(client, monkeypatch, sent):
     response = _upload_pdf(client, token, ws_id)
 
     assert response.json()["status"] == "failed"
+    assert response.json()["error_message"] == "排入處理佇列失敗，可以重試"
 
 
 # 測試：Lambda 收到工單 → 文件被處理完成，chunk 存進去
@@ -171,6 +172,7 @@ def test_retry_failed_document(client, db_session, monkeypatch, sent):
     assert response.json()["status"] == "uploaded"
     assert sent == [document_id]
     assert db_session.get(Document, document_id).attempts == 0
+    assert response.json()["error_message"] is None  # 舊的失敗原因被清掉了
 
 
 # 測試：不是失敗狀態的文件不能重試（409）

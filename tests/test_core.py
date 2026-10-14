@@ -1,5 +1,7 @@
 # core/ 的純函式測試：chunker、pdf_parser。不碰資料庫、不碰 HTTP，不需要 client/db_session
 
+import io
+
 import pytest
 
 from app.core import chunker, pdf_parser
@@ -49,3 +51,9 @@ def test_extract_text_from_corrupt_pdf_raises(tmp_path):
 
     with pytest.raises(pdf_parser.UnreadablePdf):
         pdf_parser.extract_text(pdf_path)
+
+
+# 測試：頁數超過上限 → 丟 TooManyPages（valid_pdf_bytes 產生的是 1 頁，上限設 0 就超過）
+def test_extract_text_too_many_pages_raises():
+    with pytest.raises(pdf_parser.TooManyPages):
+        pdf_parser.extract_text(io.BytesIO(valid_pdf_bytes("hello")), max_pages=0)
