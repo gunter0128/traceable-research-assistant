@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.document import Document
@@ -42,8 +43,46 @@ def mark_processed(db: Session, document: Document) -> Document:
 
 
 # 何時呼叫：document_service.process_document() 中途出錯時（例如 PDF 解析失敗），讓 status 反映真實結果
+# 也用在：工單送不出去、重試次數用完
 def mark_failed(db: Session, document: Document) -> Document:
     document.status = "failed"
     db.commit()
     db.refresh(document)
     return document
+
+
+# 何時呼叫：送工單到 SQS 之前，記下送出的時間（定期掃描用它判斷有沒有卡住）
+def mark_queued(db: Session, document: Document) -> Document:
+    document.queued_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+# 何時呼叫：process_document() 一開始。這裡馬上 commit，不跟後面的 chunk 綁在一起：
+# 就算處理到一半程式整個當掉（來不及 rollback），這一次也要被算進去
+def increment_attempts(db: Session, document: Document) -> Document:
+    document.attempts += 1
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+# 何時呼叫：使用者手動按重試。使用者明確要求重來，次數歸零
+def reset_for_retry(db: Session, document: Document) -> Document:
+    document.status = "uploaded"
+    document.attempts = 0
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+# 找出卡住的文件：還沒處理完，而且工單在 cutoff 之前就送出去了
+# coalesce(a, b)：a 是空的就用 b。工單時間沒記到的（例如記時間那步就失敗了），改看上傳時間
+def list_stuck(db: Session, cutoff: datetime) -> list[Document]:
+    return (
+        db.query(Document)
+        .filter(Document.status == "uploaded")
+        .filter(func.coalesce(Document.queued_at, Document.uploaded_at) < cutoff)
+        .all()
+    )

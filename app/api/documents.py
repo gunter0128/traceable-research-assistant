@@ -79,6 +79,26 @@ def get_document(
         _document_error(exc)
 
 
+# 手動重試處理失敗的文件。不是失敗狀態（處理中 / 已完成）的回 409：這個請求本身沒錯，是跟文件目前的狀態衝突
+@router.post("/documents/{document_id}/retry", response_model=DocumentOut)
+def retry_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        return document_service.retry_document(db, document_id, current_user.id)
+    except (
+        document_service.DocumentNotFound,
+        document_service.NotDocumentOwner,
+    ) as exc:
+        _document_error(exc)
+    except document_service.DocumentNotRetryable:
+        raise HTTPException(
+            status_code=409, detail="only failed documents can be retried"
+        ) from None
+
+
 @router.delete("/documents/{document_id}", status_code=204)
 def delete_document(
     document_id: int,

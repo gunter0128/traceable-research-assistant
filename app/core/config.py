@@ -20,6 +20,9 @@ class Settings(BaseSettings): # BaseModel的子類別 不用給他明確的資�
     aws_secret_access_key: str | None = None
     aws_region: str
     s3_bucket_name: str
+    # 選填：雲端有設定 → 上傳後送工單到 SQS，交給 Lambda 背景處理
+    # 本機沒設定 → 上傳後直接在同一個 request 裡處理（見 docs/decisions/003）
+    sqs_queue_url: str | None = None
 
 
 settings = Settings()

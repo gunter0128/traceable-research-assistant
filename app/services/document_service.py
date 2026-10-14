@@ -2,15 +2,24 @@
 # 不寫 SQL 不碰 HTTP
 
 import io
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
-from app.core import chunker, openai_client, pdf_parser, s3_client
+from app.core import chunker, openai_client, pdf_parser, s3_client, sqs_client
+from app.core.config import settings
 from app.models.document import Document
 from app.repositories import chunk_repo, document_repo
 from app.services import workspace_service
+
+# 一份文件最多被處理幾次，超過就直接標成失敗，不再重試
+MAX_ATTEMPTS = 3
+# 工單送出後超過這麼久還沒處理完，定期掃描就當作卡住了
+# Lambda 單次最多跑 15 分鐘，抓兩倍，避免把還在正常處理的文件誤判成卡住
+STUCK_AFTER = timedelta(minutes=30)
 
 
 class DocumentNotFound(Exception):
@@ -22,6 +31,11 @@ class NotDocumentOwner(Exception):
 
 
 class InvalidFileType(Exception):
+    pass
+
+
+# 只有失敗的文件可以手動重試（處理中、已完成的不行）
+class DocumentNotRetryable(Exception):
     pass
 
 
@@ -48,12 +62,58 @@ def upload_document(
     s3_client.upload_file(key, file.file.read())
 
     document = document_repo.create(db, workspace_id, file.filename, key)
-    return process_document(db, document)
+    return dispatch_document(db, document)
+
+
+# 把文件交出去處理（上傳、手動重試、定期掃描重送都走這裡）
+# 雲端（有設定 SQS）：送工單，交給 Lambda 背景處理，立刻回傳（status 還是 uploaded）
+# 本機（沒設定 SQS）：直接在這裡處理完才回傳
+def dispatch_document(db: Session, document: Document) -> Document:
+    if settings.sqs_queue_url is None:
+        return process_document(db, document)
+
+    # 先記時間再送：送出去之後 Lambda 可能馬上就處理完了，順序反過來的話時間會記在處理完之後
+    document_repo.mark_queued(db, document)
+    try:
+        sqs_client.send_process_message(document.id)
+    # BotoCoreError：連不上 AWS（網路、憑證）；ClientError：AWS 回錯誤（沒權限、佇列不存在）
+    except (BotoCoreError, ClientError):
+        # 工單送不出去 = 沒有人會處理這份文件，直接標失敗讓使用者知道，可以手動重試
+        return document_repo.mark_failed(db, document)
+    return document
+
+
+# 使用者手動按重試：只有失敗的文件可以，次數歸零後重新交出去
+def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
+    document = get_owned_document(db, document_id, owner_id)
+    if document.status != "failed":
+        raise DocumentNotRetryable
+    document_repo.reset_for_retry(db, document)
+    return dispatch_document(db, document)
+
+
+# 定期掃描（每小時一次，由排程叫起來）：把卡住的文件重送，次數用完的標失敗
+# 回傳重送了幾份，方便在 log 裡看
+def requeue_stuck_documents(db: Session) -> int:
+    cutoff = datetime.now(timezone.utc) - STUCK_AFTER
+    requeued = 0
+    for document in document_repo.list_stuck(db, cutoff):
+        if document.attempts >= MAX_ATTEMPTS:
+            document_repo.mark_failed(db, document)
+        else:
+            dispatch_document(db, document)
+            requeued += 1
+    return requeued
 
 
 # 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
 # 整份文件是一個 transaction：全部成功才一起生效，中途任何一步失敗就整批丟掉，不會留下半套 chunk
 def process_document(db: Session, document: Document) -> Document:
+    # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、定期掃描），統一在這裡擋
+    if document.attempts >= MAX_ATTEMPTS:
+        return document_repo.mark_failed(db, document)
+    document_repo.increment_attempts(db, document)
+
     try:
         # document.storage_path 現在存的是 S3 key，不是本機路徑，要先把內容抓下來
         content = s3_client.download_file(document.storage_path)
