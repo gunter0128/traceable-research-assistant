@@ -52,6 +52,7 @@ def upload_document(
 
 
 # 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
+# 整份文件是一個 transaction：全部成功才一起生效，中途任何一步失敗就整批丟掉，不會留下半套 chunk
 def process_document(db: Session, document: Document) -> Document:
     try:
         # document.storage_path 現在存的是 S3 key，不是本機路徑，要先把內容抓下來
@@ -60,12 +61,17 @@ def process_document(db: Session, document: Document) -> Document:
         # 跟上傳那邊 file.file（UploadFile 的底層）是同一種東西
         text = pdf_parser.extract_text(io.BytesIO(content))
         pieces = chunker.chunk_text(text)
+        # 先清掉這份文件舊的 chunk：同一份文件處理兩次（重試）結果跟處理一次一樣，不會變兩倍
+        chunk_repo.delete_for_document(db, document.id)
         for index, piece in enumerate(pieces):
             embedding = openai_client.embed_text(piece)
             chunk_repo.create(db, document.id, index, piece, embedding)
     except Exception:
+        # rollback：把這次還沒 commit 的東西（刪掉的舊 chunk、新加的 chunk）全部撤回
+        db.rollback()
         return document_repo.mark_failed(db, document)
 
+    # mark_processed 裡的 commit 會讓「所有新 chunk + 狀態改成 processed」在同一刻一起生效
     return document_repo.mark_processed(db, document)
 
 

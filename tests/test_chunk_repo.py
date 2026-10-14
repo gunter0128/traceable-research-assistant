@@ -25,8 +25,11 @@ def _create_workspace(client, token, name="研究"):
     return response.json()["id"]
 
 
-def _add_document(db_session, workspace_id, filename="doc.pdf"):
-    document = Document(workspace_id=workspace_id, filename=filename, storage_path="x")
+# status 預設 "processed"：search_similar 只搜處理成功的文件，其他測試要的是正常可搜的文件
+def _add_document(db_session, workspace_id, filename="doc.pdf", status="processed"):
+    document = Document(
+        workspace_id=workspace_id, filename=filename, storage_path="x", status=status
+    )
     db_session.add(document)
     db_session.commit()
     db_session.refresh(document)
@@ -96,3 +99,17 @@ def test_search_similar_respects_limit(client, db_session):
     results = chunk_repo.search_similar(db_session, ws_id, QUERY, limit=3)
 
     assert len(results) == 3
+
+
+# 測試：處理失敗或還在處理中的文件，它的 chunk 不能被搜到
+def test_search_similar_skips_unprocessed_documents(client, db_session):
+    token = _register_and_login(client, "frank@example.com")
+    ws_id = _create_workspace(client, token)
+    failed_doc = _add_document(db_session, ws_id, "failed.pdf", status="failed")
+    pending_doc = _add_document(db_session, ws_id, "pending.pdf", status="uploaded")
+    _add_chunk(db_session, failed_doc.id, "失敗文件的內容", CLOSE)
+    _add_chunk(db_session, pending_doc.id, "處理中文件的內容", CLOSE)
+
+    results = chunk_repo.search_similar(db_session, ws_id, QUERY)
+
+    assert results == []
