@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 storage/
+
+# 個人用的進度規劃，只留本機
+docs/roadmap.md
