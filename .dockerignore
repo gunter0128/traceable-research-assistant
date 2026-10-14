@@ -8,3 +8,7 @@ __pycache__/
 .ruff_cache/
 storage/
 tests/
+# 後端 image 用不到的東西：前端（含 158 MB 的 node_modules）、文件、部署設定
+frontend/
+docs/
+deploy/

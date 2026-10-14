@@ -4,6 +4,11 @@
 
 import json
 
+from app.core import lambda_secrets
+
+# 先把密碼讀進環境變數，下面的 import 才會建立 settings（順序不能換：import 寫在程式碼後面是刻意的）
+lambda_secrets.load_if_in_lambda()
+
 from app.core.db import SessionLocal
 from app.repositories import document_repo
 from app.services import document_service

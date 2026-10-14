@@ -1,0 +1,4 @@
+{
+  "VisibilityTimeout": "3600",
+  "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:ap-southeast-2:416113247224:trace-app-documents-dlq\",\"maxReceiveCount\":\"3\"}"
+}
