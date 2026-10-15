@@ -171,11 +171,19 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
               >
                 <div className="flex min-w-0 items-center gap-2">
                   <FileText className="text-muted-foreground size-4 shrink-0" />
-                  {/* 失敗的文件在檔名下面多一行原因，讓使用者知道該重試還是換檔案 */}
+                  {/* 有訊息時在檔名下面多一行：失敗的是原因（紅字），處理中的是提示（灰字，例如「稍後會自動重試」） */}
                   <div className="flex min-w-0 flex-col">
                     <span className="truncate">{doc.filename}</span>
-                    {doc.status === "failed" && doc.error_message && (
-                      <span className="text-destructive text-xs">{doc.error_message}</span>
+                    {doc.error_message && (
+                      <span
+                        className={
+                          doc.status === "failed"
+                            ? "text-destructive text-xs"
+                            : "text-muted-foreground text-xs"
+                        }
+                      >
+                        {doc.error_message}
+                      </span>
                     )}
                   </div>
                 </div>

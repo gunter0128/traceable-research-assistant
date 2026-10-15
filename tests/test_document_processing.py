@@ -61,22 +61,24 @@ def _upload(client, token, workspace_id, content, filename="doc.pdf"):
     )
 
 
-# 假的 embed_text：前幾次正常回傳向量，第 fail_on 次呼叫時丟例外，模擬 OpenAI 中途斷線
+# 假的 embed_texts：前幾次正常回傳向量，第 fail_on 次呼叫時丟例外，模擬中途出錯
+# 搭配 EMBED_BATCH_SIZE = 1（一次只送一段）用，「第 3 次呼叫」才會剛好是「第 3 段」
 def _embedding_that_fails_on(fail_on):
     calls = {"count": 0}
 
-    def fake_embed(text):
+    def fake_embed(texts):
         calls["count"] += 1
         if calls["count"] == fail_on:
-            raise RuntimeError("模擬 OpenAI timeout")
-        return [0.1] * 1536
+            raise RuntimeError("模擬中途出錯")
+        return [[0.1] * 1536 for _ in texts]
 
     return fake_embed
 
 
 # 測試：第 3 段 embedding 失敗 → 文件標成 failed，而且前 2 段也不能留在資料庫裡
 def test_failed_processing_leaves_no_chunks(client, db_session, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_text", _embedding_that_fails_on(3))
+    monkeypatch.setattr(document_service, "EMBED_BATCH_SIZE", 1)
+    monkeypatch.setattr(openai_client, "embed_texts", _embedding_that_fails_on(3))
     token = _register_and_login(client, "alice@example.com")
     ws_id = _create_workspace(client, token)
 
@@ -89,7 +91,7 @@ def test_failed_processing_leaves_no_chunks(client, db_session, monkeypatch):
 
 # 測試：同一份文件處理兩次（之後背景重試會發生），chunk 不能變成兩倍
 def test_reprocessing_does_not_duplicate_chunks(client, db_session, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_text", lambda text: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
     token = _register_and_login(client, "bob@example.com")
     ws_id = _create_workspace(client, token)
     document_id = _upload_long_pdf(client, token, ws_id).json()["id"]
@@ -103,9 +105,10 @@ def test_reprocessing_does_not_duplicate_chunks(client, db_session, monkeypatch)
     assert second_count == first_count
 
 
-# 測試：第 3 段失敗時，給使用者的是一般性的訊息，不會把內部錯誤細節（"模擬 OpenAI timeout"）漏出去
+# 測試：第 3 段失敗時，給使用者的是一般性的訊息，不會把內部錯誤細節（"模擬中途出錯"）漏出去
 def test_unexpected_error_gives_generic_message(client, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_text", _embedding_that_fails_on(3))
+    monkeypatch.setattr(document_service, "EMBED_BATCH_SIZE", 1)
+    monkeypatch.setattr(openai_client, "embed_texts", _embedding_that_fails_on(3))
     token = _register_and_login(client, "carol@example.com")
     ws_id = _create_workspace(client, token)
 

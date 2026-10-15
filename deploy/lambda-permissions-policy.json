@@ -8,7 +8,8 @@
         "sqs:ReceiveMessage",
         "sqs:DeleteMessage",
         "sqs:GetQueueAttributes",
-        "sqs:SendMessage"
+        "sqs:SendMessage",
+        "sqs:ChangeMessageVisibility"
       ],
       "Resource": "arn:aws:sqs:ap-southeast-2:416113247224:trace-app-documents-queue"
     },

@@ -33,3 +33,12 @@ def ask(
         workspace_service.NotWorkspaceOwner,
     ) as exc:
         _workspace_error(exc)
+    # 503 Service Unavailable：「服務暫時無法提供」，表示問題不在使用者的請求本身
+    except qa_service.AIServiceUnavailable:
+        raise HTTPException(
+            status_code=503, detail="AI 服務暫時無法使用，請稍後再試"
+        ) from None
+    except qa_service.AIServiceMisconfigured:
+        raise HTTPException(
+            status_code=503, detail="系統設定有誤，請聯絡管理員"
+        ) from None

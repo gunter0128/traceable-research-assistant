@@ -18,3 +18,14 @@ def send_process_message(document_id: int) -> None:
         QueueUrl=settings.sqs_queue_url,
         MessageBody=json.dumps({"document_id": document_id}),
     )
+
+
+# 何時呼叫：worker 處理時 OpenAI 暫時連不上，要這張工單過一陣子再出現
+# receipt_handle：Lambda 拿到工單時 SQS 給的「收據」，憑它才能改這一張工單
+# visibility timeout 改成 seconds 秒：這段時間工單隱形，時間到了重新出現，再被 Lambda 拿去處理
+def delay_message(receipt_handle: str, seconds: int) -> None:
+    client.change_message_visibility(
+        QueueUrl=settings.sqs_queue_url,
+        ReceiptHandle=receipt_handle,
+        VisibilityTimeout=seconds,
+    )

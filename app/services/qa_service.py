@@ -9,20 +9,30 @@ from app.schemas.qa import AskResponse, CitationOut
 from app.services import workspace_service
 
 
+# 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
+# 暫時性的（重試過還是不行）跟永久性的（設定有誤）分開，給使用者的訊息不同
+class AIServiceUnavailable(Exception):
+    pass
+
+
+class AIServiceMisconfigured(Exception):
+    pass
+
+
 def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResponse:
     # 借用 workspace 的 ownership 檢查：先確認這個 workspace 是不是你的
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
 
-    query_embedding = openai_client.embed_text(question)
-    chunks = chunk_repo.search_similar(db, workspace_id, query_embedding)
-
-    # 把搜到的幾段內容兜成一段 context 標號只是方便閱讀，不會拿來解析
-    pieces = []
-    for i, chunk in enumerate(chunks, start=1):
-        pieces.append(f"[{i}] {chunk.content}")
-    context = "\n\n".join(pieces)
-
-    answer = openai_client.generate_answer(question, context)
+    try:
+        query_embedding = openai_client.embed_query(question)
+        chunks = chunk_repo.search_similar(db, workspace_id, query_embedding)
+        answer = openai_client.generate_answer(question, _build_context(chunks))
+    # openai_client 已經做完秒級重試了，走到這裡代表重試也沒用
+    # from None：不把 OpenAI 原本的錯誤接在後面，API 層只需要知道是哪一種
+    except openai_client.OpenAITemporaryError:
+        raise AIServiceUnavailable from None
+    except openai_client.OpenAIPermanentError:
+        raise AIServiceMisconfigured from None
 
     # 簡單版 citation：這次搜到、丟給 LLM 的 chunk 全部算數 不檢查答案有沒有每段都真的用到
     citations = []
@@ -36,3 +46,11 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResp
         )
 
     return AskResponse(answer=answer, citations=citations)
+
+
+# 把搜到的幾段內容兜成一段 context 標號只是方便閱讀，不會拿來解析
+def _build_context(chunks) -> str:
+    pieces = []
+    for i, chunk in enumerate(chunks, start=1):
+        pieces.append(f"[{i}] {chunk.content}")
+    return "\n\n".join(pieces)

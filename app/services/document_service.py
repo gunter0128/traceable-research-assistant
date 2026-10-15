@@ -25,6 +25,8 @@ STUCK_AFTER = timedelta(minutes=30)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # 頁數上限：檔案大小不等於內容量，純文字的 PDF 很小卻可能有上千頁，處理時間會超過 Lambda 的 15 分鐘
 MAX_PAGES = 300
+# 一次送幾段 chunk 去轉向量（OpenAI 上限 2048，100 段已經能把呼叫次數降到百分之一，單次請求也不會太大）
+EMBED_BATCH_SIZE = 100
 
 
 class DocumentNotFound(Exception):
@@ -45,6 +47,12 @@ class FileTooLarge(Exception):
 
 # PDF 讀得開，但一個字都抓不到（通常是掃描檔，整頁都是圖片）
 class NoExtractableText(Exception):
+    pass
+
+
+# OpenAI 暫時連不上、而且還有剩餘次數：這次先不處理，文件維持「處理中」
+# 丟給呼叫的人（worker）決定怎麼延後，worker 會叫 SQS 2 分鐘後再把工單送回來
+class RetryLater(Exception):
     pass
 
 
@@ -143,9 +151,13 @@ def process_document(db: Session, document: Document) -> Document:
         pieces = chunker.chunk_text(text)
         # 先清掉這份文件舊的 chunk：同一份文件處理兩次（重試）結果跟處理一次一樣，不會變兩倍
         chunk_repo.delete_for_document(db, document.id)
-        for index, piece in enumerate(pieces):
-            embedding = openai_client.embed_text(piece)
-            chunk_repo.create(db, document.id, index, piece, embedding)
+        # 一批一批送去轉向量：range(0, 總段數, 100) → 0、100、200……，每次切出 100 段
+        for start in range(0, len(pieces), EMBED_BATCH_SIZE):
+            batch = pieces[start : start + EMBED_BATCH_SIZE]
+            embeddings = openai_client.embed_texts(batch)
+            # zip：把兩個 list 一對一配對；strict=True 代表兩邊長度不一樣就直接報錯，不會默默少存幾段
+            for offset, (piece, embedding) in enumerate(zip(batch, embeddings, strict=True)):
+                chunk_repo.create(db, document.id, start + offset, piece, embedding)
     # 認得出來的錯誤：給使用者明確的原因，讓他知道該換檔案還是可以重試
     except pdf_parser.UnreadablePdf:
         return _fail(db, document, "PDF 檔案損壞或無法讀取")
@@ -153,12 +165,34 @@ def process_document(db: Session, document: Document) -> Document:
         return _fail(db, document, f"超過 {MAX_PAGES} 頁的上限")
     except NoExtractableText:
         return _fail(db, document, "抓不到任何文字，可能是掃描檔（目前不支援）")
+    # OpenAI 的錯誤：先在 openai_client 裡分好類，這裡決定業務上怎麼處理
+    except openai_client.OpenAIPermanentError:
+        return _fail(db, document, "系統設定有誤，請聯絡管理員")
+    except openai_client.OpenAITemporaryError:
+        return _defer_or_fail(db, document)
     # 其他預料之外的錯誤：只給一般性的訊息，不把內部錯誤細節（可能含系統資訊）直接顯示給使用者
-    except Exception:
+    # 刻意接住所有錯誤（noqa 告訴 ruff 這是故意的）：上面認得的錯誤都分類處理過了，
+    # 這裡是最後一道防線，確保不管發生什麼事，文件都會被標成失敗，不會卡在處理中
+    except Exception:  # noqa: BLE001
         return _fail(db, document, "處理時發生錯誤，可以稍後重試")
 
     # mark_processed 裡的 commit 會讓「所有新 chunk + 狀態改成 processed」在同一刻一起生效
     return document_repo.mark_processed(db, document)
+
+
+# OpenAI 暫時連不上時：雲端而且還有剩餘次數 → 留在「處理中」等下一回合；否則標失敗
+def _defer_or_fail(db: Session, document: Document) -> Document:
+    db.rollback()
+    # 本機沒有 SQS，沒辦法延後，只能直接標失敗讓使用者自己重試
+    if settings.sqs_queue_url is None:
+        return document_repo.mark_failed(db, document, "AI 服務暫時無法使用，請稍後按重試")
+    if document.attempts >= MAX_ATTEMPTS:
+        return document_repo.mark_failed(
+            db, document, f"AI 服務暫時無法使用，已自動重試 {MAX_ATTEMPTS} 次，請稍後按重試"
+        )
+    # 給使用者看的提示，狀態還是「處理中」
+    document_repo.set_error_message(db, document, "AI 服務暫時無法使用，稍後會自動重試")
+    raise RetryLater
 
 
 # 處理失敗的收尾：rollback 把這次還沒 commit 的東西（刪掉的舊 chunk、新加的 chunk）全部撤回，再標失敗

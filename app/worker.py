@@ -9,9 +9,13 @@ from app.core import lambda_secrets
 # 先把密碼讀進環境變數，下面的 import 才會建立 settings（順序不能換：import 寫在程式碼後面是刻意的）
 lambda_secrets.load_if_in_lambda()
 
+from app.core import sqs_client
 from app.core.db import SessionLocal
 from app.repositories import document_repo
 from app.services import document_service
+
+# OpenAI 暫時連不上時，工單延後多久（秒）再處理（見 docs/decisions/005）
+RETRY_DELAY_SECONDS = 120
 
 
 # SQS 有新工單時，Lambda 會呼叫這個函式
@@ -29,6 +33,11 @@ def handle_process_message(event, context):
             if document is None or document.status != "uploaded":
                 continue
             document_service.process_document(db, document)
+        except document_service.RetryLater:
+            # 叫 SQS 2 分鐘後再把這張工單送回來，然後把錯誤往外丟，讓這次執行算失敗
+            # Lambda 執行失敗時不會刪掉工單，工單才會在 2 分鐘後重新出現
+            sqs_client.delay_message(record["receiptHandle"], RETRY_DELAY_SECONDS)
+            raise
         finally:
             db.close()
 

@@ -19,8 +19,9 @@ def _fake_s3(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    # 上傳跟問問題都會呼叫 embed_text，兩邊用的是同一個函式，這裡一次擋掉
-    monkeypatch.setattr(openai_client, "embed_text", lambda text: [0.1] * 1536)
+    # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_query（一次一句），兩個都擋掉
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_query", lambda text: [0.1] * 1536)
 
 
 def _register_and_login(client, email):

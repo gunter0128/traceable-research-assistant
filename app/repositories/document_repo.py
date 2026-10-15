@@ -54,6 +54,14 @@ def mark_failed(db: Session, document: Document, reason: str) -> Document:
     return document
 
 
+# 何時呼叫：OpenAI 暫時連不上、文件等下一回合再處理時，給使用者一個提示（狀態不變，還是處理中）
+def set_error_message(db: Session, document: Document, message: str) -> Document:
+    document.error_message = message
+    db.commit()
+    db.refresh(document)
+    return document
+
+
 # 何時呼叫：送工單到 SQS 之前，記下送出的時間（定期掃描用它判斷有沒有卡住）
 def mark_queued(db: Session, document: Document) -> Document:
     document.queued_at = datetime.now(timezone.utc)

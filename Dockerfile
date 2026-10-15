@@ -9,6 +9,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# tiktoken 第一次用某個模型時，會上網下載它的編碼表（約 1.7 MB）
+# 在 build 時先下載好、存在 image 裡，執行時（尤其 Lambda 每次冷啟動）就不用上網，也不怕下載網址連不上
+ENV TIKTOKEN_CACHE_DIR=/app/.tiktoken_cache
+RUN python -c "import tiktoken; tiktoken.encoding_for_model('text-embedding-3-small')"
+
 # 把專案其他東西複製進去（.dockerignore 裡列的會被跳過，例如 .venv/、.env、tests/）
 COPY . .
 

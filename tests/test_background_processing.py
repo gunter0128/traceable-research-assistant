@@ -27,7 +27,7 @@ def _fake_s3(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_text", lambda text: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
 
 
 # 切換成雲端模式：設定一個假的 SQS 網址，送出去的工單全部記在 sent 這個 list 裡
@@ -151,7 +151,7 @@ def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
     db_session.commit()
 
     calls = []
-    monkeypatch.setattr(openai_client, "embed_text", lambda text: calls.append(text))
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: calls.append(texts))
     document_service.process_document(db_session, document)
 
     assert document.status == "failed"
