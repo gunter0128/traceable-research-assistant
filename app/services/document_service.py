@@ -19,9 +19,11 @@ from app.services import workspace_service
 # 一份文件最多被處理幾次，超過就直接標成失敗，不再重試
 MAX_ATTEMPTS = 3
 _GAVE_UP = f"處理了 {MAX_ATTEMPTS} 次都沒有成功，已停止自動重試"
-# 工單送出後超過這麼久還沒處理完，定期掃描就當作卡住了
-# Lambda 單次最多跑 15 分鐘，抓兩倍，避免把還在正常處理的文件誤判成卡住
-STUCK_AFTER = timedelta(minutes=30)
+# 處理期限：交出去處理（送出工單）超過這麼久還沒處理完，就標「處理逾時」（見 docs/decisions/007）
+# 正常幾秒到 1 分鐘、OpenAI / S3 暫時出問題最多約 10 分鐘就會有結果，15 分鐘比所有正常情況都長
+# 這是最後的保險：程式連「次數 +1」都做不到的情況（資料庫連不上、Lambda 一啟動就被中斷），次數上限擋不住
+PROCESSING_DEADLINE = timedelta(minutes=15)
+_TIMED_OUT = "處理逾時，請按重試"
 # 上傳檔案大小上限：一般論文 1~5 MB、圖多的報告 10~20 MB
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # 頁數上限：檔案大小不等於內容量，純文字的 PDF 很小卻可能有上千頁，處理時間會超過 Lambda 的 15 分鐘
@@ -70,7 +72,11 @@ class DocumentNotRetryable(Exception):
 def list_documents(db: Session, workspace_id: int, owner_id: int) -> list[Document]:
     # 借用 workspace 的 ownership 檢查：先確認這個 workspace 是不是你的
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
-    return document_repo.list_for_workspace(db, workspace_id)
+    documents = document_repo.list_for_workspace(db, workspace_id)
+    # 使用者在看的時候就檢查期限：前端每 3 秒會查一次，逾時的文件馬上就會顯示出來，不用等每小時的 sweeper
+    for document in documents:
+        _expire_if_overdue(db, document)
+    return documents
 
 
 def upload_document(
@@ -133,18 +139,25 @@ def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     return dispatch_document(db, document)
 
 
-# 定期掃描（每小時一次，由排程叫起來）：把卡住的文件重送，次數用完的標失敗
-# 回傳重送了幾份，方便在 log 裡看
-def requeue_stuck_documents(db: Session) -> int:
-    cutoff = datetime.now(timezone.utc) - STUCK_AFTER
-    requeued = 0
-    for document in document_repo.list_stuck(db, cutoff):
-        if document.attempts >= MAX_ATTEMPTS:
-            document_repo.mark_failed(db, document, _GAVE_UP)
-        else:
-            dispatch_document(db, document)
-            requeued += 1
-    return requeued
+# 定期掃描（每小時一次，由排程叫起來）：把超過處理期限的文件標「處理逾時」
+# 給沒有人在看的文件用（有人在看的，list_documents / get_owned_document 已經當場處理了）
+# 回傳標了幾份，方便在 log 裡看
+def expire_overdue_documents(db: Session) -> int:
+    cutoff = datetime.now(timezone.utc) - PROCESSING_DEADLINE
+    overdue = document_repo.list_overdue(db, cutoff)
+    for document in overdue:
+        document_repo.mark_failed(db, document, _TIMED_OUT)
+    return len(overdue)
+
+
+# 還在「處理中」、而且交出去處理超過期限 → 標「處理逾時」
+# 時間看 queued_at（最近一次送出工單的時間，按重試會重新計算）；沒記到的話看上傳時間
+def _expire_if_overdue(db: Session, document: Document) -> None:
+    if document.status != "uploaded":
+        return
+    started = document.queued_at or document.uploaded_at
+    if started < datetime.now(timezone.utc) - PROCESSING_DEADLINE:
+        document_repo.mark_failed(db, document, _TIMED_OUT)
 
 
 # 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
@@ -230,6 +243,8 @@ def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document
     # Document 沒有自己的 owner_id，透過它的 workspace 判斷
     if document.workspace.owner_id != owner_id:
         raise NotDocumentOwner
+    # 查單一份文件時也檢查期限（重試也會經過這裡，逾時的文件就變成可以重試的「失敗」）
+    _expire_if_overdue(db, document)
     return document
 
 

@@ -262,8 +262,8 @@ API（Fargate，main.py）
                                       └─ 存 chunk、改成完成 / 失敗 ──▶ Neon
 
 EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → handle_sweep）
-                              ├─ 找卡住的文件 ──▶ Neon
-                              └─ 重送工單 ──────▶ SQS 主佇列
+                              ├─ 超過 15 分鐘還在處理中的 → 標「處理逾時」──▶ Neon
+                              └─ 對帳：沒有紀錄的舊檔案 → 刪掉 ──────────▶ S3
 
 前端：有文件處理中時，每 3 秒問一次 API 狀態
 ```
@@ -284,7 +284,7 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 | `app/core/aws_clients.py` | 建 boto3 client 的共用寫法。本機、Fargate、Lambda 拿憑證的方式各不相同，規則只寫在這裡 |
 | `document_service.dispatch_document` | 交出去處理：雲端送工單、本機直接處理 |
 | `document_service.retry_document` | 手動重試失敗的文件（`POST /documents/{id}/retry`） |
-| `document_service.requeue_stuck_documents` | 每小時掃描：工單送出超過 30 分鐘還沒處理完的重送，次數用完的標失敗 |
+| `document_service.expire_overdue_documents` | 每小時掃描：交出去處理超過 15 分鐘還沒完成的標「處理逾時」（使用者查看時也會當場檢查，見 decisions/007） |
 
 ### 出錯時的處理
 
@@ -293,8 +293,9 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 | 處理到一半失敗 | 整份文件一個 transaction，rollback，不留半套 chunk（A1） |
 | 同一份文件被處理兩次 | 先刪舊 chunk 再存新的，結果一樣（冪等）；worker 收到已完成 / 已失敗的文件直接跳過 |
 | 工單送不出去 | 立刻標失敗，使用者可以按重試 |
-| 工單送出了但一直沒處理完 | 每小時掃描重送 |
+| OpenAI / S3 暫時連不上 | 秒級重試，不行就 2 分鐘後再一回合，最多 3 回合（約 10 分鐘）才標失敗（decisions/005） |
 | 每次處理都讓程式當掉 | `attempts` 欄位記次數，超過 3 次就不再處理；SQS 層面同一張工單被拿 3 次也會移到 dead-letter queue |
+| 不管什麼原因卡在處理中 | 交出去處理超過 15 分鐘就標「處理逾時」，使用者查看時當場檢查、sweeper 每小時也檢查（decisions/007）。這是唯一不靠程式執行到哪裡的保險：程式在「次數 +1」之前就當掉時，次數上限擋不住 |
 | 抓不到字、頁數或檔案太大、PDF 壞掉 | 標失敗並在 `error_message` 寫明原因，前端顯示 |
 
 ### 雲端實測（2026-10-15）

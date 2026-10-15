@@ -131,7 +131,7 @@ def test_sweep_also_cleans_orphans(monkeypatch, db_session, bucket):
 
     result = worker.handle_sweep(None, None)
 
-    assert result == {"requeued": 0, "orphans_deleted": 1}
+    assert result == {"expired": 0, "orphans_deleted": 1}
 
 
 # ---------- S3 錯誤的分類（docs/failure-modes.md 的缺口 1、2）----------

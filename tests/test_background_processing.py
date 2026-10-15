@@ -201,35 +201,31 @@ def test_cannot_retry_others_document(client, sent, monkeypatch):
     assert response.status_code == 403
 
 
-# 測試：定期掃描 → 卡住的（工單送出超過 30 分鐘）重送；剛送出的不動；次數用完的標失敗
-def test_sweep_requeues_only_stuck_documents(client, db_session, sent, worker_db):
+# 測試：sweeper → 交出去超過 15 分鐘還在處理中的標「處理逾時」；剛送出的不動；不會再重送工單
+def test_sweep_expires_only_overdue_documents(client, db_session, sent, worker_db):
     token = _register_and_login(client, "jack@example.com")
     ws_id = _create_workspace(client, token)
-    stuck_id = _upload_pdf(client, token, ws_id).json()["id"]
+    overdue_id = _upload_pdf(client, token, ws_id).json()["id"]
     fresh_id = _upload_pdf(client, token, ws_id).json()["id"]
-    exhausted_id = _upload_pdf(client, token, ws_id).json()["id"]
-
-    long_ago = datetime.now(timezone.utc) - timedelta(hours=1)
-    db_session.get(Document, stuck_id).queued_at = long_ago
-    exhausted = db_session.get(Document, exhausted_id)
-    exhausted.queued_at = long_ago
-    exhausted.attempts = document_service.MAX_ATTEMPTS
+    db_session.get(Document, overdue_id).queued_at = datetime.now(timezone.utc) - timedelta(minutes=16)
     db_session.commit()
-    sent.clear()  # 清掉上傳時送的工單，只看這次掃描送了什麼
+    sent.clear()  # 清掉上傳時送的工單，只看這次掃描有沒有送東西
 
     result = worker.handle_sweep(None, None)
 
-    assert result == {"requeued": 1, "orphans_deleted": 0}
-    assert sent == [stuck_id]
+    assert result == {"expired": 1, "orphans_deleted": 0}
+    assert sent == []
+    overdue = db_session.get(Document, overdue_id)
+    assert overdue.status == "failed"
+    assert overdue.error_message == "處理逾時，請按重試"
     assert db_session.get(Document, fresh_id).status == "uploaded"
-    assert db_session.get(Document, exhausted_id).status == "failed"
 
 
 # ---------- docs/failure-modes.md 的缺口 3：程式有處理、但原本沒有測試的情況 ----------
 
 
-# 測試：送工單前「記錄送出時間」那步就失敗了（queued_at 是空的）→ sweeper 改看上傳時間，一樣會重送
-def test_sweep_requeues_document_without_queued_at(client, db_session, sent, worker_db):
+# 測試：送工單前「記錄送出時間」那步就失敗了（queued_at 是空的）→ 改看上傳時間，一樣會被標逾時
+def test_sweep_expires_document_without_queued_at(client, db_session, sent, worker_db):
     token = _register_and_login(client, "kate@example.com")
     ws_id = _create_workspace(client, token)
     document_id = _upload_pdf(client, token, ws_id).json()["id"]
@@ -237,11 +233,59 @@ def test_sweep_requeues_document_without_queued_at(client, db_session, sent, wor
     document.queued_at = None
     document.uploaded_at = datetime.now(timezone.utc) - timedelta(hours=1)
     db_session.commit()
-    sent.clear()
 
     worker.handle_sweep(None, None)
 
-    assert sent == [document_id]
+    assert db_session.get(Document, document_id).status == "failed"
+
+
+# ---------- docs/decisions/007：演練 3 發現程式連「次數 +1」都做不到時，文件會永遠卡在處理中 ----------
+
+
+# 測試：使用者查看文件列表時就檢查期限，不用等每小時的 sweeper
+def test_listing_expires_overdue_document(client, db_session, sent):
+    token = _register_and_login(client, "mia@example.com")
+    ws_id = _create_workspace(client, token)
+    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    document = db_session.get(Document, document_id)
+    document.queued_at = datetime.now(timezone.utc) - timedelta(minutes=16)
+    db_session.commit()
+
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json()
+
+    assert documents[0]["status"] == "failed"
+    assert documents[0]["error_message"] == "處理逾時，請按重試"
+
+
+# 測試：處理中但還沒超過期限 → 不動（不能把正常處理中的文件誤判成逾時）
+def test_listing_keeps_document_within_deadline(client, db_session, sent):
+    token = _register_and_login(client, "nina@example.com")
+    ws_id = _create_workspace(client, token)
+    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    document = db_session.get(Document, document_id)
+    document.queued_at = datetime.now(timezone.utc) - timedelta(minutes=14)
+    db_session.commit()
+
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json()
+
+    assert documents[0]["status"] == "uploaded"
+
+
+# 測試：逾時的文件可以按重試，重試後重新計算 15 分鐘（不會因為上傳時間很久以前就馬上又逾時）
+def test_overdue_document_can_be_retried(client, db_session, sent):
+    token = _register_and_login(client, "owen@example.com")
+    ws_id = _create_workspace(client, token)
+    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    document = db_session.get(Document, document_id)
+    document.uploaded_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    document.queued_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    db_session.commit()
+
+    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(token))
+    after = client.get(f"/documents/{document_id}", headers=_auth_headers(token)).json()
+
+    assert response.status_code == 200
+    assert after["status"] == "uploaded"
 
 
 # 測試：同一份文件的工單來了兩次（SQS 只保證「至少送一次」）→ 第二次直接跳過，不重複處理

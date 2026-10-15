@@ -89,9 +89,9 @@ def reset_for_retry(db: Session, document: Document) -> Document:
     return document
 
 
-# 找出卡住的文件：還沒處理完，而且工單在 cutoff 之前就送出去了
+# 找出超過處理期限的文件：還沒處理完，而且在 cutoff 之前就交出去處理了
 # coalesce(a, b)：a 是空的就用 b。工單時間沒記到的（例如記時間那步就失敗了），改看上傳時間
-def list_stuck(db: Session, cutoff: datetime) -> list[Document]:
+def list_overdue(db: Session, cutoff: datetime) -> list[Document]:
     return (
         db.query(Document)
         .filter(Document.status == "uploaded")
