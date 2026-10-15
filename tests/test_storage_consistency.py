@@ -34,7 +34,7 @@ def bucket(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embeddings(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
 
 
 def _register_and_login(client, email):

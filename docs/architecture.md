@@ -284,7 +284,8 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 | `app/core/aws_clients.py` | 建 boto3 client 的共用寫法。本機、Fargate、Lambda 拿憑證的方式各不相同，規則只寫在這裡 |
 | `document_service.dispatch_document` | 交出去處理：雲端送工單、本機直接處理 |
 | `document_service.retry_document` | 手動重試失敗的文件（`POST /documents/{id}/retry`） |
-| `document_service.expire_overdue_documents` | 每小時掃描：交出去處理超過 15 分鐘還沒完成的標「處理逾時」（使用者查看時也會當場檢查，見 decisions/007） |
+| `document_service.expire_overdue_documents` | 每小時掃描：處理中 5 分鐘沒報平安的標「處理中斷」、排隊中 15 分鐘沒人處理的標「處理逾時」（使用者查看時也會當場檢查，見 decisions/007、008） |
+| 租約（`document_repo.claim` / `heartbeat` / `finish_processed`） | Lambda 處理前先取得租約（記一個隨機代碼），處理中一直報平安，存結果時要對得上代碼才算數（decisions/008） |
 
 ### 出錯時的處理
 
@@ -295,7 +296,9 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 | 工單送不出去 | 立刻標失敗，使用者可以按重試 |
 | OpenAI / S3 暫時連不上 | 秒級重試，不行就 2 分鐘後再一回合，最多 3 回合（約 10 分鐘）才標失敗（decisions/005） |
 | 每次處理都讓程式當掉 | `attempts` 欄位記次數，超過 3 次就不再處理；SQS 層面同一張工單被拿 3 次也會移到 dead-letter queue |
-| 不管什麼原因卡在處理中 | 交出去處理超過 15 分鐘就標「處理逾時」，使用者查看時當場檢查、sweeper 每小時也檢查（decisions/007）。這是唯一不靠程式執行到哪裡的保險：程式在「次數 +1」之前就當掉時，次數上限擋不住 |
+| 程式處理到一半死掉 | 處理中的 Lambda 每一步都報平安（另一條連線立刻 commit），超過 5 分鐘沒報平安就標「處理中斷」（decisions/008） |
+| 還沒開始處理就卡住 | 排隊中超過 15 分鐘還沒人取得租約就標「處理逾時」（decisions/007） |
+| 兩個 Lambda 處理同一份文件 | 租約只有一個人搶得到；被判定中斷後才醒來的那個，報平安或存結果時代碼對不上，自動放棄 |
 | 抓不到字、頁數或檔案太大、PDF 壞掉 | 標失敗並在 `error_message` 寫明原因，前端顯示 |
 
 ### 雲端實測（2026-10-15）

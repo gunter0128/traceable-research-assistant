@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core import chunker, openai_client, pdf_parser, s3_client, sqs_client
 from app.core.config import settings
+from app.core.db import SessionLocal
 from app.models.document import Document
 from app.repositories import chunk_repo, document_repo
 from app.services import workspace_service
@@ -19,10 +20,13 @@ from app.services import workspace_service
 # 一份文件最多被處理幾次，超過就直接標成失敗，不再重試
 MAX_ATTEMPTS = 3
 _GAVE_UP = f"處理了 {MAX_ATTEMPTS} 次都沒有成功，已停止自動重試"
-# 處理期限：交出去處理（送出工單）超過這麼久還沒處理完，就標「處理逾時」（見 docs/decisions/007）
-# 正常幾秒到 1 分鐘、OpenAI / S3 暫時出問題最多約 10 分鐘就會有結果，15 分鐘比所有正常情況都長
-# 這是最後的保險：程式連「次數 +1」都做不到的情況（資料庫連不上、Lambda 一啟動就被中斷），次數上限擋不住
-PROCESSING_DEADLINE = timedelta(minutes=15)
+# 處理中超過這麼久沒報平安，就判定程式死了（docs/decisions/008）
+# 正常情況下最長的空檔是一次 OpenAI 嘗試 30 秒 + 一次等待最多 60 秒，約 1.5 分鐘，5 分鐘不會誤判
+HEARTBEAT_TIMEOUT = timedelta(minutes=5)
+_INTERRUPTED = "處理中斷，請按重試"
+# 排隊中超過這麼久還沒人開始處理，就判定出事了（docs/decisions/007）
+# 排隊本來就可能很久：同時最多 2 個 Lambda，一次上傳很多份時後面的要等；等下一回合重試也在排隊中
+QUEUE_TIMEOUT = timedelta(minutes=15)
 _TIMED_OUT = "處理逾時，請按重試"
 # 上傳檔案大小上限：一般論文 1~5 MB、圖多的報告 10~20 MB
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -58,7 +62,7 @@ class NoExtractableText(Exception):
     pass
 
 
-# OpenAI 暫時連不上、而且還有剩餘次數：這次先不處理，文件維持「處理中」
+# OpenAI 暫時連不上、而且還有剩餘次數：這次先不處理，文件回到「排隊中」
 # 丟給呼叫的人（worker）決定怎麼延後，worker 會叫 SQS 2 分鐘後再把工單送回來
 class RetryLater(Exception):
     pass
@@ -69,14 +73,34 @@ class DocumentNotRetryable(Exception):
     pass
 
 
+# 處理到一半發現租約已經不是自己的了（被判定中斷、或別人接手了），要放棄這次處理
+class LeaseLost(Exception):
+    pass
+
+
+# 一次處理用的租約：記住文件編號和自己的代碼，負責報平安（docs/decisions/008）
+# 報平安要「另外寫入、立刻 commit」，不能跟處理用的 session 混在一起：
+# 處理用的 session 裡有還沒 commit 的 chunk，要等全部做完才 commit，在那之前報的平安別人都看不到
+class _Lease:
+    def __init__(self, document_id: int, token: str):
+        self.document_id = document_id
+        self.token = token
+
+    # done / total：順便更新進度。租約不是自己的了就丟 LeaseLost
+    def beat(self, done: int | None = None, total: int | None = None) -> None:
+        # with SessionLocal() as db：開一條獨立的 session，區塊結束自動關掉
+        with SessionLocal() as db:
+            if not document_repo.heartbeat(db, self.document_id, self.token, done, total):
+                raise LeaseLost
+
+
 def list_documents(db: Session, workspace_id: int, owner_id: int) -> list[Document]:
     # 借用 workspace 的 ownership 檢查：先確認這個 workspace 是不是你的
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
-    documents = document_repo.list_for_workspace(db, workspace_id)
-    # 使用者在看的時候就檢查期限：前端每 3 秒會查一次，逾時的文件馬上就會顯示出來，不用等每小時的 sweeper
-    for document in documents:
-        _expire_if_overdue(db, document)
-    return documents
+    # 使用者在看的時候就檢查有沒有卡住：前端每 3 秒會查一次，卡住的文件馬上就會顯示出來，不用等每小時的 sweeper
+    # 先標再查：標完之後查出來的就是最新的狀態
+    _expire_overdue(db, workspace_id=workspace_id)
+    return document_repo.list_for_workspace(db, workspace_id)
 
 
 def upload_document(
@@ -139,34 +163,45 @@ def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     return dispatch_document(db, document)
 
 
-# 定期掃描（每小時一次，由排程叫起來）：把超過處理期限的文件標「處理逾時」
+# 定期掃描（每小時一次，由排程叫起來）：把卡住的文件標失敗
 # 給沒有人在看的文件用（有人在看的，list_documents / get_owned_document 已經當場處理了）
 # 回傳標了幾份，方便在 log 裡看
 def expire_overdue_documents(db: Session) -> int:
-    cutoff = datetime.now(timezone.utc) - PROCESSING_DEADLINE
-    overdue = document_repo.list_overdue(db, cutoff)
-    for document in overdue:
-        document_repo.mark_failed(db, document, _TIMED_OUT)
-    return len(overdue)
+    return _expire_overdue(db)
 
 
-# 還在「處理中」、而且交出去處理超過期限 → 標「處理逾時」
-# 時間看 queued_at（最近一次送出工單的時間，按重試會重新計算）；沒記到的話看上傳時間
-def _expire_if_overdue(db: Session, document: Document) -> None:
-    if document.status != "uploaded":
-        return
-    started = document.queued_at or document.uploaded_at
-    if started < datetime.now(timezone.utc) - PROCESSING_DEADLINE:
-        document_repo.mark_failed(db, document, _TIMED_OUT)
+# 卡住的兩種情況（docs/decisions/008）：
+#   處理中，超過 5 分鐘沒報平安 → 程式死了 → 「處理中斷，請按重試」
+#   排隊中，送出工單超過 15 分鐘還沒人開始處理 → 「處理逾時，請按重試」
+def _expire_overdue(db: Session, document_id: int | None = None, workspace_id: int | None = None) -> int:
+    now = datetime.now(timezone.utc)
+    return document_repo.expire_overdue(
+        db,
+        heartbeat_before=now - HEARTBEAT_TIMEOUT,
+        queued_before=now - QUEUE_TIMEOUT,
+        interrupted_reason=_INTERRUPTED,
+        timed_out_reason=_TIMED_OUT,
+        document_id=document_id,
+        workspace_id=workspace_id,
+    )
 
 
 # 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
 # 整份文件是一個 transaction：全部成功才一起生效，中途任何一步失敗就整批丟掉，不會留下半套 chunk
+# 開始前要先取得租約（docs/decisions/008）：同一份文件同時只能有一個 Lambda 在處理，處理中一直報平安
 def process_document(db: Session, document: Document) -> Document:
-    # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、定期掃描），統一在這裡擋
-    if document.attempts >= MAX_ATTEMPTS:
-        return document_repo.mark_failed(db, document, _GAVE_UP)
-    document_repo.increment_attempts(db, document)
+    token = uuid4().hex
+    stale_before = datetime.now(timezone.utc) - HEARTBEAT_TIMEOUT
+    # 搶不到租約：別人正在處理、文件已經處理完 / 失敗了（重複的工單），什麼都不做
+    if not document_repo.claim(db, document.id, token, stale_before):
+        db.refresh(document)
+        return document
+    db.refresh(document)  # 拿到租約的同時次數 +1 了，重新讀一次
+    lease = _Lease(document.id, token)
+
+    # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、使用者重試），統一在這裡擋
+    if document.attempts > MAX_ATTEMPTS:
+        return _fail(db, document, lease, _GAVE_UP)
 
     try:
         # document.storage_path 現在存的是 S3 key，不是本機路徑，要先把內容抓下來
@@ -178,62 +213,79 @@ def process_document(db: Session, document: Document) -> Document:
         if not text:
             raise NoExtractableText
         pieces = chunker.chunk_text(text)
+        lease.beat(done=0, total=len(pieces))
         # 先清掉這份文件舊的 chunk：同一份文件處理兩次（重試）結果跟處理一次一樣，不會變兩倍
         chunk_repo.delete_for_document(db, document.id)
         # 一批一批送去轉向量：range(0, 總段數, 100) → 0、100、200……，每次切出 100 段
         for start in range(0, len(pieces), EMBED_BATCH_SIZE):
             batch = pieces[start : start + EMBED_BATCH_SIZE]
-            embeddings = openai_client.embed_texts(batch)
+            # on_attempt=lease.beat：每次呼叫 OpenAI 之前（包括重試）都報一次平安
+            embeddings = openai_client.embed_texts(batch, on_attempt=lease.beat)
             # zip：把兩個 list 一對一配對；strict=True 代表兩邊長度不一樣就直接報錯，不會默默少存幾段
             for offset, (piece, embedding) in enumerate(zip(batch, embeddings, strict=True)):
                 chunk_repo.create(db, document.id, start + offset, piece, embedding)
+            lease.beat(done=start + len(batch))
+    # 租約已經不是自己的了：別人接手了，或被判定中斷。這次寫的全部丟掉，不碰文件狀態（不是自己的了）
+    except LeaseLost:
+        db.rollback()
+        db.refresh(document)
+        return document
     # 認得出來的錯誤：給使用者明確的原因，讓他知道該換檔案還是可以重試
     except pdf_parser.UnreadablePdf:
-        return _fail(db, document, "PDF 檔案損壞或無法讀取")
+        return _fail(db, document, lease, "PDF 檔案損壞或無法讀取")
     except pdf_parser.TooManyPages:
-        return _fail(db, document, f"超過 {MAX_PAGES} 頁的上限")
+        return _fail(db, document, lease, f"超過 {MAX_PAGES} 頁的上限")
     except NoExtractableText:
-        return _fail(db, document, "抓不到任何文字，可能是掃描檔（目前不支援）")
+        return _fail(db, document, lease, "抓不到任何文字，可能是掃描檔（目前不支援）")
     # OpenAI 的錯誤：先在 openai_client 裡分好類，這裡決定業務上怎麼處理
     # S3 的錯誤：一樣在 s3_client 裡分好類。檔案不見了重試也沒用，訊息要說清楚，不能叫使用者「稍後重試」
     except s3_client.FileMissing:
-        return _fail(db, document, "找不到上傳的檔案，請刪除後重新上傳")
+        return _fail(db, document, lease, "找不到上傳的檔案，請刪除後重新上傳")
     except (openai_client.OpenAIPermanentError, s3_client.StoragePermanentError):
-        return _fail(db, document, "系統設定有誤，請聯絡管理員")
+        return _fail(db, document, lease, "系統設定有誤，請聯絡管理員")
     except openai_client.OpenAITemporaryError:
-        return _defer_or_fail(db, document, "AI 服務")
+        return _defer_or_fail(db, document, lease, "AI 服務")
     except s3_client.StorageTemporaryError:
-        return _defer_or_fail(db, document, "儲存服務")
+        return _defer_or_fail(db, document, lease, "儲存服務")
     # 其他預料之外的錯誤：只給一般性的訊息，不把內部錯誤細節（可能含系統資訊）直接顯示給使用者
     # 刻意接住所有錯誤（noqa 告訴 ruff 這是故意的）：上面認得的錯誤都分類處理過了，
     # 這裡是最後一道防線，確保不管發生什麼事，文件都會被標成失敗，不會卡在處理中
     except Exception:  # noqa: BLE001
-        return _fail(db, document, "處理時發生錯誤，可以稍後重試")
+        return _fail(db, document, lease, "處理時發生錯誤，可以稍後重試")
 
-    # mark_processed 裡的 commit 會讓「所有新 chunk + 狀態改成 processed」在同一刻一起生效
-    return document_repo.mark_processed(db, document)
+    # 「所有新 chunk + 狀態改成完成」在同一刻一起生效；租約已經不是自己的了，就整批丟掉
+    document_repo.finish_processed(db, document.id, token)
+    db.refresh(document)
+    return document
 
 
-# 外部服務（OpenAI、S3）暫時連不上時：雲端而且還有剩餘次數 → 留在「處理中」等下一回合；否則標失敗
+# 外部服務（OpenAI、S3）暫時連不上時：雲端而且還有剩餘次數 → 回到排隊中等下一回合；否則標失敗
 # service：哪個服務出問題，放進給使用者看的訊息裡（「AI 服務」/「儲存服務」）
-def _defer_or_fail(db: Session, document: Document, service: str) -> Document:
-    db.rollback()
+def _defer_or_fail(db: Session, document: Document, lease: _Lease, service: str) -> Document:
     # 本機沒有 SQS，沒辦法延後，只能直接標失敗讓使用者自己重試
     if settings.sqs_queue_url is None:
-        return document_repo.mark_failed(db, document, f"{service}暫時無法使用，請稍後按重試")
+        return _fail(db, document, lease, f"{service}暫時無法使用，請稍後按重試")
     if document.attempts >= MAX_ATTEMPTS:
-        return document_repo.mark_failed(
-            db, document, f"{service}暫時無法使用，已自動重試 {MAX_ATTEMPTS} 次，請稍後按重試"
+        return _fail(
+            db, document, lease, f"{service}暫時無法使用，已自動重試 {MAX_ATTEMPTS} 次，請稍後按重試"
         )
-    # 給使用者看的提示，狀態還是「處理中」
-    document_repo.set_error_message(db, document, f"{service}暫時無法使用，稍後會自動重試")
-    raise RetryLater
+    db.rollback()
+    # 放掉租約、回到排隊中，留一個提示給使用者。租約已經不是自己的了就不延後（別人在處理了）
+    if document_repo.defer_with_lease(
+        db, document.id, lease.token, f"{service}暫時無法使用，稍後會自動重試"
+    ):
+        raise RetryLater
+    db.refresh(document)
+    return document
 
 
 # 處理失敗的收尾：rollback 把這次還沒 commit 的東西（刪掉的舊 chunk、新加的 chunk）全部撤回，再標失敗
-def _fail(db: Session, document: Document, reason: str) -> Document:
+# 一樣要租約還是自己的才標，不然會蓋掉接手的 Lambda 的狀態
+def _fail(db: Session, document: Document, lease: _Lease, reason: str) -> Document:
     db.rollback()
-    return document_repo.mark_failed(db, document, reason)
+    document_repo.fail_with_lease(db, document.id, lease.token, reason)
+    db.refresh(document)
+    return document
 
 
 def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document:
@@ -243,8 +295,9 @@ def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document
     # Document 沒有自己的 owner_id，透過它的 workspace 判斷
     if document.workspace.owner_id != owner_id:
         raise NotDocumentOwner
-    # 查單一份文件時也檢查期限（重試也會經過這裡，逾時的文件就變成可以重試的「失敗」）
-    _expire_if_overdue(db, document)
+    # 查單一份文件時也檢查有沒有卡住（重試也會經過這裡，卡住的文件就變成可以重試的「失敗」）
+    if _expire_overdue(db, document_id=document_id):
+        db.refresh(document)
     return document
 
 

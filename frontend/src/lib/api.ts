@@ -22,6 +22,8 @@ export type Document = {
   uploaded_at: string
   processed_at: string | null
   error_message: string | null
+  progress_done: number | null
+  progress_total: number | null
 }
 
 export type Citation = {

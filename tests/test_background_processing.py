@@ -29,7 +29,7 @@ def _fake_s3(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
 
 
 # 切換成雲端模式：設定一個假的 SQS 網址，送出去的工單全部記在 sent 這個 list 裡
@@ -153,7 +153,7 @@ def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
     db_session.commit()
 
     calls = []
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: calls.append(texts))
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: calls.append(texts))
     document_service.process_document(db_session, document)
 
     assert document.status == "failed"
@@ -295,7 +295,7 @@ def test_worker_skips_duplicate_message(client, db_session, monkeypatch, sent, w
     document_id = _upload_pdf(client, token, ws_id).json()["id"]
     worker.handle_process_message(_sqs_event(document_id), None)
     calls = []
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: calls.append(texts))
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: calls.append(texts))
 
     worker.handle_process_message(_sqs_event(document_id), None)
 

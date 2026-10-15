@@ -20,8 +20,8 @@ def _fake_s3(monkeypatch):
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
     # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_query（一次一句），兩個都擋掉
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
-    monkeypatch.setattr(openai_client, "embed_query", lambda text: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
 
 
 def _register_and_login(client, email):
@@ -88,7 +88,7 @@ def test_cannot_ask_others_workspace(client):
 # generate_answer 也 mock 掉——這裡不測 LLM 答得好不好，只測我們自己寫的串接邏輯
 def test_ask_returns_answer_with_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda question, context: "這是生成的答案"
+        openai_client, "generate_answer", lambda question, context, **kwargs: "這是生成的答案"
     )
 
     # valid_pdf_bytes() 手刻的內容流只支援 latin-1，塞中文會編碼失敗，這裡故意用英文內容
@@ -114,7 +114,7 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
 # 測試：workspace 裡還沒有任何文件時問問題，不會噴錯，只是 citations 是空的
 def test_ask_with_no_documents_returns_empty_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda question, context: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda question, context, **kwargs: "文件中找不到相關資訊"
     )
 
     token = _register_and_login(client, "dave@example.com")

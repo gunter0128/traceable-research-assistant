@@ -66,7 +66,7 @@ def _upload(client, token, workspace_id, content, filename="doc.pdf"):
 def _embedding_that_fails_on(fail_on):
     calls = {"count": 0}
 
-    def fake_embed(texts):
+    def fake_embed(texts, **kwargs):
         calls["count"] += 1
         if calls["count"] == fail_on:
             raise RuntimeError("模擬中途出錯")
@@ -91,13 +91,16 @@ def test_failed_processing_leaves_no_chunks(client, db_session, monkeypatch):
 
 # 測試：同一份文件處理兩次（之後背景重試會發生），chunk 不能變成兩倍
 def test_reprocessing_does_not_duplicate_chunks(client, db_session, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
     token = _register_and_login(client, "bob@example.com")
     ws_id = _create_workspace(client, token)
     document_id = _upload_long_pdf(client, token, ws_id).json()["id"]
     first_count = db_session.query(Chunk).filter(Chunk.document_id == document_id).count()
 
     document = db_session.get(Document, document_id)
+    # 設回排隊中，第二次才搶得到租約、真的再處理一次（處理完的文件不會被重複處理）
+    document.status = "uploaded"
+    db_session.commit()
     document_service.process_document(db_session, document)
 
     second_count = db_session.query(Chunk).filter(Chunk.document_id == document_id).count()

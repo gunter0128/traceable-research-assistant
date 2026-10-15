@@ -23,12 +23,22 @@ import {
 
 // 後端的 status 是給程式看的英文，畫面上換成使用者看得懂的字
 const STATUS_LABELS: Record<string, string> = {
-  uploaded: "處理中",
+  uploaded: "排隊中",
+  processing: "處理中",
   processed: "完成",
   failed: "失敗",
 }
 
-// 有文件還在處理中時，每隔多久（毫秒）重新問一次後端狀態
+// 處理中而且知道總段數的話，顯示進度「處理中 200 / 330」
+function statusText(doc: Document): string {
+  const label = STATUS_LABELS[doc.status] ?? doc.status
+  if (doc.status === "processing" && doc.progress_total) {
+    return `${label} ${doc.progress_done ?? 0} / ${doc.progress_total}`
+  }
+  return label
+}
+
+// 有文件還在排隊或處理中時，每隔多久（毫秒）重新問一次後端狀態
 const POLL_INTERVAL_MS = 3000
 
 type ChatMessage = {
@@ -84,7 +94,7 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
 
   // 背景處理：上傳完文件還是「處理中」，由 worker 在背景做完後改資料庫，
   // 前端沒辦法被通知，只能自己定期問。只有在真的有處理中的文件時才問，全部處理完就停
-  const hasPending = documents.some((d) => d.status === "uploaded")
+  const hasPending = documents.some((d) => d.status === "uploaded" || d.status === "processing")
   useEffect(() => {
     if (!hasPending) return
     const timer = setInterval(() => {
@@ -197,7 +207,7 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
                           : "secondary"
                     }
                   >
-                    {STATUS_LABELS[doc.status] ?? doc.status}
+                    {statusText(doc)}
                   </Badge>
                   {doc.status === "failed" && (
                     <Button
@@ -247,6 +257,8 @@ function QaPanel({ workspaceId }: { workspaceId: number }) {
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "問答失敗")
       setMessages((prev) => prev.slice(0, -1))
+      // 失敗時把問題放回輸入框，使用者按一下就能重送，不用整句重打
+      setQuestion(q)
     } finally {
       setAsking(false)
     }
@@ -288,6 +300,13 @@ function QaPanel({ workspaceId }: { workspaceId: number }) {
                   )}
                 </div>
               ))}
+              {/* 等待回答時顯示，問答最久可能要等 1 分鐘，畫面完全沒動靜會讓人以為當掉了 */}
+              {asking && (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-muted-foreground text-xs font-medium">助理</span>
+                  <p className="text-muted-foreground animate-pulse text-sm">思考中…</p>
+                </div>
+              )}
             </div>
           )}
         </ScrollArea>

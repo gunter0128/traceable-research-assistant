@@ -29,8 +29,9 @@ def handle_process_message(event, context):
         db = SessionLocal()
         try:
             document = document_repo.get_by_id(db, document_id)
-            # 工單送出後文件被刪掉了，或是重複的工單（已經處理完、已經失敗）→ 什麼都不做
-            if document is None or document.status != "uploaded":
+            # 工單送出後文件被刪掉了 → 什麼都不做
+            # 重複的工單（已經處理完、已經失敗、別人正在處理）不用在這裡擋：process_document 搶不到租約就會跳過
+            if document is None:
                 continue
             document_service.process_document(db, document)
         except document_service.RetryLater:

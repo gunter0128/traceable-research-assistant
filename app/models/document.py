@@ -15,7 +15,8 @@ class Document(Base):
     )
     filename = Column(String, nullable=False)
     storage_path = Column(String, nullable=False)
-    # uploaded = 還沒處理完（等工單 / 處理中）、processed = 完成、failed = 失敗
+    # uploaded = 排隊中（等 Lambda 來處理 / 等下一回合重試）、processing = 某個 Lambda 正在處理
+    # processed = 完成、failed = 失敗（見 docs/decisions/008）
     status = Column(String, nullable=False, server_default="uploaded")
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     processed_at = Column(DateTime(timezone=True), nullable=True)
@@ -25,6 +26,14 @@ class Document(Base):
     queued_at = Column(DateTime(timezone=True), nullable=True)
     # 失敗原因，給使用者看的（例如「抓不到文字，可能是掃描檔」）。沒失敗時是空的
     error_message = Column(String, nullable=True)
+    # 租約（docs/decisions/008）：正在處理的 Lambda 取得租約時記下的隨機代碼，只有它知道
+    # 報平安、存結果時都要對得上，對不上代表自己被判定中斷、文件交給別人了
+    claim_token = Column(String, nullable=True)
+    # 最後一次報平安的時間。處理中超過 5 分鐘沒報平安，就判定程式死了
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    # 進度：已處理幾段 / 總共幾段，前端顯示「處理中 200 / 330」
+    progress_done = Column(Integer, nullable=True)
+    progress_total = Column(Integer, nullable=True)
 
     workspace = relationship("Workspace", back_populates="documents")
     chunks = relationship(

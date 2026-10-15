@@ -1,12 +1,22 @@
 # 開機時組裝整個 app：把各功能各自寫好的 router 掛進來，變成一個完整的系統
 # main.py 自己不寫業務邏輯，只負責把它們兜在一起
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 
 from app.api import auth, documents, qa, workspaces
 
 # app = 整個系統的路由分派表，uvicorn app.main:app 就是把這個物件跑起來
 app = FastAPI()
+
+
+# 全域錯誤處理：任何一個 API 遇到「連不上資料庫」（OperationalError），都回 503 和看得懂的訊息
+# 不然 FastAPI 預設回 500 純文字「Internal Server Error」，前端只能顯示「request failed with status 500」
+# @app.exception_handler(某種錯誤)：登記「遇到這種錯誤時，改用這個函式產生回應」，不用每個 endpoint 各自 try/except
+@app.exception_handler(OperationalError)
+def database_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": "服務暫時無法使用，請稍後再試"})
 
 # 掛上各功能自己的 router，app 才知道哪個路徑要交給哪個檔案處理
 app.include_router(auth.router)

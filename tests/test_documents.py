@@ -27,7 +27,7 @@ def _fake_s3(monkeypatch):
 # 這裡換成固定的假向量：測試不用花錢、不用網路、結果每次都一樣
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
 
 
 def _register_and_login(client, email):
