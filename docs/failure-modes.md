@@ -38,7 +38,7 @@
 | 轉向量 | OpenAI 說「請等 N 秒」 | 照做，但最多等 60 秒（以前套件會照做最多 120 秒，而且中間沒辦法報平安） | 測試（test_processing_caps_long_retry_after） |
 | 轉向量 | OpenAI 永久性錯誤（key 無效、餘額不足） | 立刻標失敗「系統設定有誤」 | 測試（test_permanent_error_fails_immediately）、本機真的 OpenAI（演練 2） |
 | 存 chunk | 中途任何錯誤 | rollback，一段都不留 | 測試（test_failed_processing_leaves_no_chunks） |
-| 整個執行 | Lambda 處理到一半被強制中斷（超時、記憶體不夠） | 沒 commit 的資料隨連線中斷自動丟棄；停止報平安，5 分鐘後標「處理中斷，請按重試」（decisions/008） | 測試（test_listing_marks_silent_document_interrupted）、☁ 待重做演練 3 |
+| 整個執行 | Lambda 處理到一半被強制中斷（超時、記憶體不夠） | 沒 commit 的資料隨連線中斷自動丟棄；停止報平安，5 分鐘後標「處理中斷，請按重試」（decisions/008） | 測試（test_listing_marks_silent_document_interrupted）、雲端（演練 3 重做：上傳後 5.3 分鐘標中斷） |
 | 整個執行 | 在取得租約之前就被中斷 | 文件還在排隊中，15 分鐘後標「處理逾時」 | 雲端（演練 3 發現的，decisions/007），測試（test_listing_expires_overdue_document） |
 | 整個執行 | 其實沒死只是很慢，被判定中斷後使用者按了重試 | 舊的 Lambda 報平安或存結果時發現租約不是自己的，放棄這次處理，不會存出兩份 | 測試（test_worker_gives_up_when_lease_is_taken、test_heartbeat_rejected_after_interrupted） |
 | 延後工單 | 沒有「延後」的權限 | 這次執行失敗，工單照預設 60 分鐘後重送（變慢，但不會遺失） | 雲端（演練 1 證明權限有效） |
@@ -82,3 +82,4 @@
 | 2. OpenAI key 錯誤（本機） | 本機用假的 key 啟動 API | 上傳的文件標「系統設定有誤」；問答 0.8 秒回 503 | 永久性錯誤分類正確，沒有白白重試 |
 | 問答：OpenAI 連不上（本機） | 本機用不存在的 OpenAI 位址啟動 API | 32 秒回 503「AI 服務暫時無法使用」 | 第一步轉向量就失敗（15 秒 × 2 次），沒走到生成答案，所以不到最壞的 1 分鐘 |
 | 3. Lambda 被強制中斷（雲端） | worker 逾時暫時改 1 秒、主佇列可見性逾時暫時改 60 秒 | 每次都剛好在 1000 毫秒被中斷；3 次後工單移到 dead-letter queue；**文件的處理次數一直是 0** | dead-letter queue 有效。但發現程式在「次數 +1」之前就當掉時，文件會永遠卡在處理中 → 加 15 分鐘的處理期限（decisions/007） |
+| 3 重做（雲端，decisions/008 之後） | worker 逾時暫時改 20 秒，加上 `OPENAI_BASE_URL` 改成不存在的位址，讓它拿到租約、開始處理之後才被中斷 | 上傳 17 秒後取得租約（處理中 0 / 1）；20 秒時被強制中斷；之後「距上次報平安」一路增加，310 秒時標「處理中斷，請按重試」，上傳後 5.3 分鐘；恢復設定後按重試，20 秒處理完成 | 心跳有效：從「乾等 15 分鐘」縮短到約 5 分鐘，而且是看到程式停止報平安才判定，不是猜的。API 這次跑的確實是新版 image（強制重新部署的規則有效） |
