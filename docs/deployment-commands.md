@@ -296,14 +296,19 @@ CMD 覆寫：同一個 image，Fargate 照 Dockerfile 跑 uvicorn，Lambda 改�
 
 ### push 新的 image 之後，要更新哪些東西
 
-兩個服務「什麼時候去查 `:latest` 現在是哪個 image」不一樣：**Fargate 每次啟動新容器時都會重新查；Lambda 只在建立或 `update-function-code` 時查一次，之後就固定用當時的那個 image（記的是內容指紋 digest，不是標籤）**，跟它現在有沒有在跑無關。
+**ECS 和 Lambda 都不會自己跟著 `:latest` 走**，兩個都記的是當時那個 image 的內容指紋（digest）：
 
-| push 新 image 之後 | API 開著（desired 1） | API 關著（desired 0） |
-|---|---|---|
-| 兩個 Lambda | `update-function-code` × 2 | `update-function-code` × 2 |
-| API（ECS） | `update-service --force-new-deployment` | 不用做，下次調回 1 時新容器自然拿到新版 |
+- **Lambda**：建立或 `update-function-code` 時查一次 `:latest`，之後固定用那個 image
+- **ECS**：每次「建立部署（deployment）」時查一次，這次部署底下啟動的所有容器都用同一個 image（ECS 的 software version consistency）。**把 desired count 從 0 調回 1 不算新的部署**，會沿用上一次部署記下的舊 image
+
+| push 新 image 之後 | 要做的事 |
+|---|---|
+| 兩個 Lambda | `update-function-code` × 2 |
+| API（ECS） | `update-service --force-new-deployment`，**不管 API 現在開著還是關著** |
 
 漏掉其中一個，API 和 worker 就會跑不同版本的程式碼。之後做 CI/CD（主線 C5）就是要把這整套自動化。
+
+這是踩過才知道的：2026-10-15 A5 演練時，把 API 從 0 調回 1，啟動的容器跑的竟然是前一天的 image（因為那之後沒有 `--force-new-deployment` 過），一開始以為「關著的 API 下次開啟就會拿到新版」是錯的。
 
 ### 更新 Lambda 到新的 image（每次 push 新 image 都要做）
 
