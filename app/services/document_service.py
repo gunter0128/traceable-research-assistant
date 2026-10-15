@@ -100,7 +100,7 @@ def upload_document(
         db.rollback()
         # 補救：紀錄建不起來，把剛存的檔案刪掉。連這步都失敗的話，留給每小時的對帳清
         # contextlib.suppress：把裡面丟出的錯誤吞掉。這裡刪不掉也沒關係，重點是把原本的錯誤往外丟
-        with contextlib.suppress(BotoCoreError, ClientError):
+        with contextlib.suppress(s3_client.StorageError):
             s3_client.delete_file(key)
         raise
     return dispatch_document(db, document)
@@ -182,10 +182,15 @@ def process_document(db: Session, document: Document) -> Document:
     except NoExtractableText:
         return _fail(db, document, "抓不到任何文字，可能是掃描檔（目前不支援）")
     # OpenAI 的錯誤：先在 openai_client 裡分好類，這裡決定業務上怎麼處理
-    except openai_client.OpenAIPermanentError:
+    # S3 的錯誤：一樣在 s3_client 裡分好類。檔案不見了重試也沒用，訊息要說清楚，不能叫使用者「稍後重試」
+    except s3_client.FileMissing:
+        return _fail(db, document, "找不到上傳的檔案，請刪除後重新上傳")
+    except (openai_client.OpenAIPermanentError, s3_client.StoragePermanentError):
         return _fail(db, document, "系統設定有誤，請聯絡管理員")
     except openai_client.OpenAITemporaryError:
-        return _defer_or_fail(db, document)
+        return _defer_or_fail(db, document, "AI 服務")
+    except s3_client.StorageTemporaryError:
+        return _defer_or_fail(db, document, "儲存服務")
     # 其他預料之外的錯誤：只給一般性的訊息，不把內部錯誤細節（可能含系統資訊）直接顯示給使用者
     # 刻意接住所有錯誤（noqa 告訴 ruff 這是故意的）：上面認得的錯誤都分類處理過了，
     # 這裡是最後一道防線，確保不管發生什麼事，文件都會被標成失敗，不會卡在處理中
@@ -196,18 +201,19 @@ def process_document(db: Session, document: Document) -> Document:
     return document_repo.mark_processed(db, document)
 
 
-# OpenAI 暫時連不上時：雲端而且還有剩餘次數 → 留在「處理中」等下一回合；否則標失敗
-def _defer_or_fail(db: Session, document: Document) -> Document:
+# 外部服務（OpenAI、S3）暫時連不上時：雲端而且還有剩餘次數 → 留在「處理中」等下一回合；否則標失敗
+# service：哪個服務出問題，放進給使用者看的訊息裡（「AI 服務」/「儲存服務」）
+def _defer_or_fail(db: Session, document: Document, service: str) -> Document:
     db.rollback()
     # 本機沒有 SQS，沒辦法延後，只能直接標失敗讓使用者自己重試
     if settings.sqs_queue_url is None:
-        return document_repo.mark_failed(db, document, "AI 服務暫時無法使用，請稍後按重試")
+        return document_repo.mark_failed(db, document, f"{service}暫時無法使用，請稍後按重試")
     if document.attempts >= MAX_ATTEMPTS:
         return document_repo.mark_failed(
-            db, document, f"AI 服務暫時無法使用，已自動重試 {MAX_ATTEMPTS} 次，請稍後按重試"
+            db, document, f"{service}暫時無法使用，已自動重試 {MAX_ATTEMPTS} 次，請稍後按重試"
         )
     # 給使用者看的提示，狀態還是「處理中」
-    document_repo.set_error_message(db, document, "AI 服務暫時無法使用，稍後會自動重試")
+    document_repo.set_error_message(db, document, f"{service}暫時無法使用，稍後會自動重試")
     raise RetryLater
 
 
@@ -233,7 +239,7 @@ def delete_document(db: Session, document_id: int, owner_id: int) -> None:
     # 順序刻意是「先刪紀錄、再刪檔案」，跟上傳反過來，理由一樣：
     # 刪檔案失敗只會留下沒人用的檔案（對帳會清）；反過來的話，紀錄還在但檔案沒了，使用者看得到卻再也處理不了
     document_repo.delete(db, document)
-    with contextlib.suppress(BotoCoreError, ClientError):
+    with contextlib.suppress(s3_client.StorageError):
         s3_client.delete_file(key)
 
 

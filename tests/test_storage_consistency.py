@@ -5,10 +5,12 @@ import io
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from app import worker
 from app.core import openai_client, s3_client
+from app.core.config import settings
+from app.models.document import Document
 from app.repositories import document_repo
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
@@ -58,7 +60,7 @@ def _upload(client, token, ws_id):
 
 
 def _s3_error(*args, **kwargs):
-    raise ClientError({"Error": {"Code": "InternalError", "Message": "模擬 S3 出錯"}}, "DeleteObject")
+    raise s3_client.StorageTemporaryError("模擬 S3 出錯")
 
 
 # 測試：檔案存進 S3 了，建紀錄卻失敗 → 把剛存的檔案刪掉，不留孤兒檔案
@@ -130,3 +132,84 @@ def test_sweep_also_cleans_orphans(monkeypatch, db_session, bucket):
     result = worker.handle_sweep(None, None)
 
     assert result == {"requeued": 0, "orphans_deleted": 1}
+
+
+# ---------- S3 錯誤的分類（docs/failure-modes.md 的缺口 1、2）----------
+
+
+def _client_error(code, status):
+    return ClientError(
+        {"Error": {"Code": code, "Message": "模擬"}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        "GetObject",
+    )
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (_client_error("NoSuchKey", 404), s3_client.FileMissing),
+        (_client_error("AccessDenied", 403), s3_client.StoragePermanentError),
+        (_client_error("SlowDown", 503), s3_client.StorageTemporaryError),
+        (_client_error("InternalError", 500), s3_client.StorageTemporaryError),
+        (EndpointConnectionError(endpoint_url="https://s3"), s3_client.StorageTemporaryError),
+    ],
+)
+# 測試：boto3 丟出來的錯誤，會被翻譯成正確的種類（檔案不存在 / 永久性 / 暫時性）
+def test_s3_errors_are_classified(monkeypatch, exc, expected):
+    def fake_get_object(**kwargs):
+        raise exc
+
+    monkeypatch.setattr(s3_client.client, "get_object", fake_get_object)
+
+    with pytest.raises(expected):
+        s3_client.download_file("documents/x.pdf")
+
+
+# 測試：處理時檔案不見了 → 標失敗，訊息叫使用者重新上傳（不能叫他「稍後重試」，重試永遠不會成功）
+def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch, bucket):
+    token = _register_and_login(client, "erin@example.com")
+    ws_id = _create_workspace(client, token)
+    monkeypatch.setattr(s3_client, "download_file", _raise(s3_client.FileMissing("NoSuchKey")))
+
+    body = _upload(client, token, ws_id).json()
+
+    assert body["status"] == "failed"
+    assert body["error_message"] == "找不到上傳的檔案，請刪除後重新上傳"
+
+
+# 測試：雲端、處理時 S3 暫時連不上 → 跟 OpenAI 一樣，留在處理中等下一回合
+def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch, bucket):
+    monkeypatch.setattr(settings, "sqs_queue_url", "https://fake-queue")
+    monkeypatch.setattr(document_service.sqs_client, "send_process_message", lambda document_id: None)
+    token = _register_and_login(client, "frank@example.com")
+    ws_id = _create_workspace(client, token)
+    document_id = _upload(client, token, ws_id).json()["id"]
+    document = db_session.get(Document, document_id)
+    monkeypatch.setattr(s3_client, "download_file", _raise(s3_client.StorageTemporaryError("模擬")))
+
+    with pytest.raises(document_service.RetryLater):
+        document_service.process_document(db_session, document)
+
+    db_session.refresh(document)
+    assert document.status == "uploaded"
+    assert document.error_message == "儲存服務暫時無法使用，稍後會自動重試"
+
+
+# 測試：上傳時 S3 暫時連不上 → 回 503 和看得懂的訊息（以前是 500），什麼都不存
+def test_upload_returns_503_when_storage_unavailable(client, monkeypatch, bucket):
+    token = _register_and_login(client, "grace@example.com")
+    ws_id = _create_workspace(client, token)
+    monkeypatch.setattr(s3_client, "upload_file", _raise(s3_client.StorageTemporaryError("模擬")))
+
+    response = _upload(client, token, ws_id)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "儲存服務暫時無法使用，請稍後再試"
+    assert client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json() == []
+
+
+def _raise(exc):
+    def fake(*args, **kwargs):
+        raise exc
+
+    return fake

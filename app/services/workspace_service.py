@@ -3,7 +3,6 @@
 
 import contextlib
 
-from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy.orm import Session
 
 from app.core import s3_client
@@ -53,5 +52,5 @@ def delete_workspace(db: Session, workspace_id: int, owner_id: int) -> None:
     keys = document_repo.list_storage_paths_for_workspace(db, workspace_id)
     workspace_repo.delete(db, workspace)
     for key in keys:
-        with contextlib.suppress(BotoCoreError, ClientError):
+        with contextlib.suppress(s3_client.StorageError):
             s3_client.delete_file(key)

@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
+from app.core import s3_client
 from app.core.db import get_db
 from app.models.user import User
 from app.schemas.document import DocumentOut
@@ -46,6 +47,15 @@ def upload_document(
     except document_service.InvalidFileType:
         raise HTTPException(
             status_code=400, detail="only PDF files are allowed"
+        ) from None
+    # 存檔案時 S3 出問題：問題不在使用者的請求，回 503，跟問答 AI 出問題時一致
+    except s3_client.StorageTemporaryError:
+        raise HTTPException(
+            status_code=503, detail="儲存服務暫時無法使用，請稍後再試"
+        ) from None
+    except s3_client.StoragePermanentError:
+        raise HTTPException(
+            status_code=503, detail="系統設定有誤，請聯絡管理員"
         ) from None
     # 413 Content Too Large：HTTP 專門用來表示「你送來的內容太大」的狀態碼
     except document_service.FileTooLarge:

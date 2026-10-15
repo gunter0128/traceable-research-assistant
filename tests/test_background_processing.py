@@ -223,3 +223,37 @@ def test_sweep_requeues_only_stuck_documents(client, db_session, sent, worker_db
     assert sent == [stuck_id]
     assert db_session.get(Document, fresh_id).status == "uploaded"
     assert db_session.get(Document, exhausted_id).status == "failed"
+
+
+# ---------- docs/failure-modes.md 的缺口 3：程式有處理、但原本沒有測試的情況 ----------
+
+
+# 測試：送工單前「記錄送出時間」那步就失敗了（queued_at 是空的）→ sweeper 改看上傳時間，一樣會重送
+def test_sweep_requeues_document_without_queued_at(client, db_session, sent, worker_db):
+    token = _register_and_login(client, "kate@example.com")
+    ws_id = _create_workspace(client, token)
+    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    document = db_session.get(Document, document_id)
+    document.queued_at = None
+    document.uploaded_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    db_session.commit()
+    sent.clear()
+
+    worker.handle_sweep(None, None)
+
+    assert sent == [document_id]
+
+
+# 測試：同一份文件的工單來了兩次（SQS 只保證「至少送一次」）→ 第二次直接跳過，不重複處理
+def test_worker_skips_duplicate_message(client, db_session, monkeypatch, sent, worker_db):
+    token = _register_and_login(client, "leo@example.com")
+    ws_id = _create_workspace(client, token)
+    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    worker.handle_process_message(_sqs_event(document_id), None)
+    calls = []
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts: calls.append(texts))
+
+    worker.handle_process_message(_sqs_event(document_id), None)
+
+    assert calls == []  # 第二次完全沒有呼叫 OpenAI
+    assert db_session.get(Document, document_id).status == "processed"
