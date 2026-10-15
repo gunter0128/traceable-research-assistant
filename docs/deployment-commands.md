@@ -32,9 +32,12 @@ V2(部署到 AWS)過程中用到的指令,整理起來備查。指令不像程�
 ### 建立 image
 
 ```bash
-docker build -t traceable-research-assistant .
+docker build --platform linux/amd64 --provenance=false -t traceable-research-assistant .
 ```
-照 [Dockerfile](../Dockerfile) 的步驟組出一個 image。`-t` 後面是取的名字,沒指定標籤(`:版本`)時,Docker 自動補 `:latest`。
+照 [Dockerfile](../Dockerfile) 的步驟組出一個 image。
+
+- `--platform linux/amd64`——明確指定 build 給 Intel/AMD 架構的 Linux（Lambda 預設的架構）。這台電腦本來就是，不寫也一樣，但換到 Apple 晶片的 Mac 就會 build 出 Lambda 跑不了的 image
+- `--provenance=false`——**Lambda 一定要加**。新版 Docker 預設會附加 provenance 資訊，image 會變成 Lambda 不接受的格式（ECR 上看到 `image.index` 就是中招了，正確的是 `image.manifest`）。Fargate 不在意這件事`-t` 後面是取的名字,沒指定標籤(`:版本`)時,Docker 自動補 `:latest`。
 
 **`:latest` 不是「保證最新版」的機制,只是沒指定標籤時的預設名字**。每次沒指定標籤重新 build,新的 image 會把這個名字蓋過去,感覺上「latest 一直是最新的」,但這是因為你一直用同一個預設名字,不是 Docker 在幫你追蹤版本。
 
@@ -94,6 +97,21 @@ aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS
 - `docker login --username AWS --password-stdin <網址>`——用這組通行證登入 ECR。`--username AWS` 的 `AWS` 是**固定寫死的字串**，不是你的帳號名稱；`--password-stdin` 代表密碼從管線接，不用手動打
 
 **12 小時內要推好幾次，只要登入一次；隔久了再推，要重新跑這行拿新的通行證。**
+
+**在 PowerShell（Windows PowerShell 5.1）上，上面那行會失敗**，出現 `400 Bad Request`：PowerShell 5.1 用 `|` 把一個程式的輸出傳給另一個程式時，會在密碼尾端多加換行字元，ECR 認不得。改成先存進變數再傳：
+
+```powershell
+$ACCOUNT = aws sts get-caller-identity --query Account --output text
+$REPO = "$ACCOUNT.dkr.ecr.ap-southeast-2.amazonaws.com/traceable-research-assistant"
+$PASSWORD = aws ecr get-login-password --region ap-southeast-2
+docker login --username AWS --password $PASSWORD "$ACCOUNT.dkr.ecr.ap-southeast-2.amazonaws.com"
+```
+- `aws sts get-caller-identity`——問 AWS「我現在用哪個帳號登入」，只取帳號 ID，就不用手動貼那串數字
+- 會出現「在指令裡寫密碼不安全」的警告，可以忽略：這是 12 小時後就失效的臨時密碼
+- 這三個變數只存在目前這個終端機視窗，關掉重開要重跑
+- 有了 `$REPO`，下面的 tag / push 可以寫成 `docker tag traceable-research-assistant:latest "${REPO}:latest"`、`docker push "${REPO}:latest"`（大括號是告訴 PowerShell 變數名稱到哪裡結束）
+
+**指令裡的 `<task-id>`、`<stream-name>` 這種寫法是佔位符號，要換成真的值，不能照打**。PowerShell 會把 `<` 當成特殊符號，直接報 `The '<' operator is reserved for future use`。
 
 ### Tag + Push（每次要發布新版本都要做）
 
@@ -213,6 +231,13 @@ aws ecs update-service --cluster trace-app-cluster --service trace-app-service -
 ```
 **`--force-new-deployment` 的用途**：就算 Task Definition 的 revision 號碼沒變（比方說只是用了同一個 `:latest` image tag、但 image 內容其實換新了），這個指令會強制 Service 不管快取，直接拉一份新的任務起來、健康後把舊的關掉。沒有這個指令，Service 會覺得「設定沒變啊」而繼續用舊的容器跑。
 
+改了 `deploy/task-definition.json`（例如加環境變數）的話，要先 `register-task-definition` 登記新版本，再用 `--task-definition trace-app` 讓 Service 改用最新版：
+
+```bash
+aws ecs update-service --cluster trace-app-cluster --service trace-app-service --task-definition trace-app --desired-count 1 --force-new-deployment --region ap-southeast-2
+```
+Task Definition 用指令從檔案登記，不在主控台改：檔案是唯一的來源，主控台改了檔案不會跟著變。
+
 跑完之後，用 `describe-services`/`describe-tasks` 確認新任務的 `runningCount` 變成 1、沒有立刻崩潰退出，再去 ECS 主控台的任務頁面抓新的公有 IP 測試(**每次任務重啟，公有 IP 會換**，不是固定網址)。
 
 ### 不用的時候記得關掉(避免持續計費)
@@ -221,6 +246,83 @@ aws ecs update-service --cluster trace-app-cluster --service trace-app-service -
 aws ecs update-service --cluster trace-app-cluster --service trace-app-service --desired-count 0 --region ap-southeast-2
 ```
 Fargate 是「任務在跑就按秒計費」，跟 OpenAI 那種按用量計費不一樣。測試完一段時間，把 `desired-count` 調成 0，之後要測再調回 1 即可，不用整個刪掉 Service。
+
+---
+
+## 背景處理：SQS + Lambda（A2，2026-10-15）
+
+上傳後不在 API 裡處理文件，改成送工單到 SQS，由 Lambda 上的 worker 處理。為什麼這樣設計見 [decisions/003](decisions/003-背景處理用-sqs-加-lambda.md)、[decisions/004](decisions/004-lambda-的部署方式.md)。這裡只記建了哪些東西、怎麼建的、之後要怎麼維護。
+
+```
+API（Fargate）──送工單──▶ trace-app-documents-queue ──失敗 3 次──▶ trace-app-documents-dlq
+                                  │
+                                  ▼ 有工單就叫醒（每次 1 張、最多同時 2 個）
+                         Lambda：trace-app-worker（handle_process_message）
+
+EventBridge：trace-app-sweeper-hourly（每小時）──▶ Lambda：trace-app-sweeper（handle_sweep）
+```
+
+### SQS 佇列（只做一次）
+
+設定寫在 `deploy/` 的 JSON 檔，PowerShell 直接把 JSON 寫在指令裡引號容易壞掉，用檔案比較穩。**dlq 要先建**，因為主佇列的設定會指向它：
+
+```powershell
+aws sqs create-queue --queue-name trace-app-documents-dlq --attributes file://deploy/sqs-dlq-attributes.json --region ap-southeast-2
+aws sqs create-queue --queue-name trace-app-documents-queue --attributes file://deploy/sqs-queue-attributes.json --region ap-southeast-2
+```
+- 主佇列 visibility timeout 3600 秒：Lambda 拿走工單後，工單隱形這麼久。**一定要比 Lambda 的逾時（600 秒）長**，不然 Lambda 還在處理，工單就重新出現被處理第二次
+- 同一張工單被拿 3 次都沒完成 → 移到 dlq，保留 14 天
+
+### Lambda 的 IAM Role（主控台建立，只做一次）
+
+`trace-app-worker-role`，兩個 Lambda 共用。IAM → Roles → Create role → AWS service / Lambda → 勾 `AWSLambdaBasicExecutionRole`（寫 log）→ 建好後再加一個內嵌政策，內容是 [deploy/lambda-permissions-policy.json](../deploy/lambda-permissions-policy.json)：只能用這一個佇列、只能讀 bucket 的 `documents/`、只能讀 `trace-app/` 開頭的密碼。
+
+API 的 `trace-app-task-role` 另外加了內嵌政策 [deploy/api-task-sqs-policy.json](../deploy/api-task-sqs-policy.json)：只能送訊息到主佇列。
+
+**在主控台改了權限，也要同步改 `deploy/` 裡的檔案**，不然檔案跟實際設定會對不起來。
+
+### 兩個 Lambda（主控台建立，只做一次）
+
+Lambda → 建立函數 → 容器映像 → 選 ECR 的 `traceable-research-assistant:latest`、x86_64、使用現有角色 `trace-app-worker-role`。建好後：
+
+| | trace-app-worker | trace-app-sweeper |
+|---|---|---|
+| 映像組態 → CMD 覆寫 | `python,-m,awslambdaric,app.worker.handle_process_message` | `python,-m,awslambdaric,app.worker.handle_sweep` |
+| 記憶體 / 逾時 | 1024 MB / 10 分鐘 | 512 MB / 2 分鐘 |
+| 環境變數 | `S3_BUCKET_NAME`、`SQS_QUEUE_URL` | 同左（sweeper 一定要有 `SQS_QUEUE_URL`，沒有的話會在 Lambda 裡直接處理文件） |
+| 觸發 | SQS 主佇列，批次大小 1、最大並行 2 | EventBridge 規則 `trace-app-sweeper-hourly`，`rate(1 hour)` |
+
+CMD 覆寫：同一個 image，Fargate 照 Dockerfile 跑 uvicorn，Lambda 改跑 `awslambdaric` 交給 `app/worker.py` 裡指定的函式。密碼不用設環境變數，worker 啟動時自己去 Secrets Manager 讀（`app/core/lambda_secrets.py`）。
+
+### 更新 Lambda 到新的 image（每次 push 新 image 都要做）
+
+**Lambda 不會自動換成 ECR 上最新的 `:latest`**。建立（或上次更新）時，它記住的是當時那個 image 的內容指紋（digest），之後 push 新的 image 它不會知道。所以 build + push 之後，除了更新 ECS，兩個 Lambda 也要各更新一次：
+
+```powershell
+aws lambda update-function-code --function-name trace-app-worker --image-uri "${REPO}:latest" --region ap-southeast-2
+aws lambda update-function-code --function-name trace-app-sweeper --image-uri "${REPO}:latest" --region ap-southeast-2
+```
+
+### 手動測試一個 Lambda（不會動到任何資料）
+
+傳一個空的工單清單給 worker：能正常啟動、讀到密碼、載入程式碼，就會回傳 `null`。sweeper 會真的去查資料庫，沒有卡住的文件時回傳 `{"requeued": 0}`。
+
+```bash
+aws lambda invoke --function-name trace-app-worker --cli-binary-format raw-in-base64-out --payload '{"Records": []}' --region ap-southeast-2 out.json
+```
+
+### 檢查佇列、查 Lambda 的 log
+
+```bash
+aws sqs get-queue-attributes --queue-url https://sqs.ap-southeast-2.amazonaws.com/416113247224/trace-app-documents-dlq --attribute-names ApproximateNumberOfMessages --region ap-southeast-2
+```
+**dlq 裡有東西 = 有工單試了 3 次都失敗**，要去查原因。
+
+Lambda 的 log 在 CloudWatch 的 `/aws/lambda/trace-app-worker`、`/aws/lambda/trace-app-sweeper`（Git Bash 一樣要先 `export MSYS_NO_PATHCONV=1`）。每次執行最後一行 `REPORT` 有執行時間；冷啟動的那次會多一個 `Init Duration`。
+
+### Lambda、SQS 不用關
+
+跟 Fargate 不一樣，沒有工作時不收費。測完只要把 ECS Service 調回 0。
 
 ---
 

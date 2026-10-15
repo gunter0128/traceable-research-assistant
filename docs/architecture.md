@@ -1,6 +1,6 @@
 # 架構筆記
 
-> V0（Auth / Workspace / Document）已完成，23 個測試通過。V1（RAG）已完成，端到端手動驗證過（真的上傳 PDF、真的問問題、答案正確且附引用），之後也補上了自動化測試（共 36 個）。這份文件記錄兩者的分工。
+> V0（Auth / Workspace / Document）、V1（RAG）、V2（部署到 AWS）已完成。2026-10-14 起不加新功能，改成把現有功能往深做（見 [decisions/001](decisions/001-往深做而不是往寬做.md)），第一項是把文件處理改成背景執行，見最後的「背景處理」一節。目前 57 個測試。這份文件記錄各部分的分工。
 
 ---
 
@@ -211,7 +211,7 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
 
 ---
 
-## V2（部署到 AWS）—— 進行中
+## V2（部署到 AWS）—— 已完成
 
 **方向**（2026-09-22 決定，考量點是求職含金量，不是最快能動）：雲端只選 AWS 一家，不跨雲混用。物件儲存用 S3、跑程式碼用 ECS + Fargate（容器化、免管伺服器）。詳細的指令跟每個資源的用途，記在 [`docs/deployment-commands.md`](deployment-commands.md)，這裡只記整體進度跟架構決定。
 
@@ -236,6 +236,72 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
 **部署的公有 IP 是浮動的**：每次任務重啟，IP 會換，不是固定網址。之後若要固定網址，需要加 Load Balancer，先不做（不是這階段的必要項目）。
 
 **運作期間持續在計費**：Fargate 是只要任務在跑就按秒計費，不是按請求計費，跟 OpenAI 那種用量計費不一樣。不用的時候記得把 Service 的 Desired tasks 調成 0，不然會持續燒 AWS 的 $200 額度。**目前 Desired tasks 是 0**（端到端測試過一輪、確認部署的版本能正常跑完 register → login → 建 workspace → 上傳 PDF → 問答全流程之後，手動關掉省錢）。要重新測試，照 `docs/deployment-commands.md` 的「套用新版本」那段把 Desired tasks 調回 1 即可，不用重建任何東西。
+
+---
+
+## 背景處理（A2）—— 已完成，雲端實測通過（2026-10-15）
+
+原本上傳 PDF 時，解析、切段、每段呼叫 OpenAI、存資料庫全部在同一個 request 裡做完才回應，大文件會讓使用者等到連線逾時。現在 API 只收檔、建紀錄、送工單，立刻回應；真正的處理交給 Lambda 上的 worker。設計理由見 [decisions/003](decisions/003-背景處理用-sqs-加-lambda.md)、[decisions/004](decisions/004-lambda-的部署方式.md)，部署指令見 [deployment-commands.md](deployment-commands.md) 的「背景處理」一節。
+
+### 整體流程
+
+```
+使用者上傳 PDF
+     │
+     ▼
+API（Fargate，main.py）
+     ├─ 存檔 ─────────────▶ S3
+     ├─ 建紀錄（處理中）───▶ Neon
+     ├─ 送工單 ───────────▶ SQS 主佇列 ──同一張失敗 3 次──▶ dead-letter queue
+     └─ 立刻回應「處理中」              │
+                                      │ 有工單就叫醒（每次 1 張、最多同時 2 個）
+                                      ▼
+                              Lambda：trace-app-worker（worker.py → handle_process_message）
+                                      ├─ 讀 PDF ─────▶ S3
+                                      ├─ 轉向量 ─────▶ OpenAI
+                                      └─ 存 chunk、改成完成 / 失敗 ──▶ Neon
+
+EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → handle_sweep）
+                              ├─ 找卡住的文件 ──▶ Neon
+                              └─ 重送工單 ──────▶ SQS 主佇列
+
+前端：有文件處理中時，每 3 秒問一次 API 狀態
+```
+
+**API 和 worker 從頭到尾不直接溝通**，只透過 SQS（「有事要做」）和資料庫（「做完了」）交換資訊。Fargate 上的 API 關著時，worker 照樣能處理。
+
+**同一個 image，兩種進入點**：Fargate 照 Dockerfile 跑 uvicorn → `main.py`；Lambda 用 CMD 覆寫改跑 `awslambdaric` → `worker.py`。兩邊呼叫的是同一份 `document_service.process_document`。
+
+**本機沒有 SQS**：`SQS_QUEUE_URL` 沒設定時，`dispatch_document` 直接在 request 裡呼叫 `process_document`，跟改版前一樣。
+
+### 新增的元件
+
+| 檔 | 職責 |
+|---|---|
+| `app/worker.py` | Lambda 的入口，跟 `api/` 同一種角色：拆開工單、開關 session，然後交給 `document_service` |
+| `app/core/sqs_client.py` | 送工單到 SQS，工單內容只有 `document_id` |
+| `app/core/lambda_secrets.py` | Lambda 冷啟動時從 Secrets Manager 讀三個密碼進環境變數（Fargate 有內建功能做這件事，Lambda 沒有） |
+| `app/core/aws_clients.py` | 建 boto3 client 的共用寫法。本機、Fargate、Lambda 拿憑證的方式各不相同，規則只寫在這裡 |
+| `document_service.dispatch_document` | 交出去處理：雲端送工單、本機直接處理 |
+| `document_service.retry_document` | 手動重試失敗的文件（`POST /documents/{id}/retry`） |
+| `document_service.requeue_stuck_documents` | 每小時掃描：工單送出超過 30 分鐘還沒處理完的重送，次數用完的標失敗 |
+
+### 出錯時的處理
+
+| 狀況 | 怎麼處理 |
+|---|---|
+| 處理到一半失敗 | 整份文件一個 transaction，rollback，不留半套 chunk（A1） |
+| 同一份文件被處理兩次 | 先刪舊 chunk 再存新的，結果一樣（冪等）；worker 收到已完成 / 已失敗的文件直接跳過 |
+| 工單送不出去 | 立刻標失敗，使用者可以按重試 |
+| 工單送出了但一直沒處理完 | 每小時掃描重送 |
+| 每次處理都讓程式當掉 | `attempts` 欄位記次數，超過 3 次就不再處理；SQS 層面同一張工單被拿 3 次也會移到 dead-letter queue |
+| 抓不到字、頁數或檔案太大、PDF 壞掉 | 標失敗並在 `error_message` 寫明原因，前端顯示 |
+
+### 雲端實測（2026-10-15）
+
+上傳回應 2.9 秒（狀態「處理中」），一頁的 PDF 在 14.7 秒後處理完成，空白 PDF 正確標成失敗並附原因，問答答對，主佇列和 dead-letter queue 都沒有殘留。兩份文件同時上傳時，兩個 Lambda 同時啟動。
+
+已知待改：Lambda 冷啟動的準備時間約 6 秒（第一次用新 image 時超過 10 秒上限、被重試）。其中一部分是 `chunker.py` 在載入時會上網下載 tiktoken 的編碼表，每次冷啟動都要重下載，也代表下載網址連不上時 Lambda 會無法啟動。打算在 build image 時先下載好。
 
 ---
 
