@@ -294,6 +294,17 @@ Lambda → 建立函數 → 容器映像 → 選 ECR 的 `traceable-research-ass
 
 CMD 覆寫：同一個 image，Fargate 照 Dockerfile 跑 uvicorn，Lambda 改跑 `awslambdaric` 交給 `app/worker.py` 裡指定的函式。密碼不用設環境變數，worker 啟動時自己去 Secrets Manager 讀（`app/core/lambda_secrets.py`）。
 
+### push 新的 image 之後，要更新哪些東西
+
+兩個服務「什麼時候去查 `:latest` 現在是哪個 image」不一樣：**Fargate 每次啟動新容器時都會重新查；Lambda 只在建立或 `update-function-code` 時查一次，之後就固定用當時的那個 image（記的是內容指紋 digest，不是標籤）**，跟它現在有沒有在跑無關。
+
+| push 新 image 之後 | API 開著（desired 1） | API 關著（desired 0） |
+|---|---|---|
+| 兩個 Lambda | `update-function-code` × 2 | `update-function-code` × 2 |
+| API（ECS） | `update-service --force-new-deployment` | 不用做，下次調回 1 時新容器自然拿到新版 |
+
+漏掉其中一個，API 和 worker 就會跑不同版本的程式碼。之後做 CI/CD（主線 C5）就是要把這整套自動化。
+
 ### 更新 Lambda 到新的 image（每次 push 新 image 都要做）
 
 **Lambda 不會自動換成 ECR 上最新的 `:latest`**。建立（或上次更新）時，它記住的是當時那個 image 的內容指紋（digest），之後 push 新的 image 它不會知道。所以 build + push 之後，除了更新 ECS，兩個 Lambda 也要各更新一次：
