@@ -1,10 +1,14 @@
 # workspace 的規則：ownership 檢查、CRUD 流程
 # 不寫 SQL 不碰 HTTP
 
+import contextlib
+
+from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy.orm import Session
 
+from app.core import s3_client
 from app.models.workspace import Workspace
-from app.repositories import workspace_repo
+from app.repositories import document_repo, workspace_repo
 
 
 # 一樣是個自定義的錯誤類別
@@ -44,4 +48,10 @@ def update_workspace(
 
 def delete_workspace(db: Session, workspace_id: int, owner_id: int) -> None:
     workspace = get_owned_workspace(db, workspace_id, owner_id)
+    # 底下的文件紀錄會被資料庫連帶刪掉（cascade），但 S3 上的檔案不會，要自己刪
+    # 先記下檔案位置（紀錄刪掉之後就查不到了），先刪紀錄、再刪檔案，理由同 document_service.delete_document
+    keys = document_repo.list_storage_paths_for_workspace(db, workspace_id)
     workspace_repo.delete(db, workspace)
+    for key in keys:
+        with contextlib.suppress(BotoCoreError, ClientError):
+            s3_client.delete_file(key)

@@ -98,3 +98,15 @@ def list_stuck(db: Session, cutoff: datetime) -> list[Document]:
         .filter(func.coalesce(Document.queued_at, Document.uploaded_at) < cutoff)
         .all()
     )
+
+
+# 何時呼叫：每小時的對帳，拿到「資料庫裡所有文件記錄的 S3 位置」，跟 S3 上實際的檔案比對
+# 只查 storage_path 這一欄，不用把整筆文件都查出來
+def list_storage_paths(db: Session) -> set[str]:
+    return {path for (path,) in db.query(Document.storage_path).all()}
+
+
+# 何時呼叫：刪除 workspace 之前，先記下底下所有文件的 S3 位置（紀錄刪掉之後就查不到了）
+def list_storage_paths_for_workspace(db: Session, workspace_id: int) -> list[str]:
+    rows = db.query(Document.storage_path).filter(Document.workspace_id == workspace_id).all()
+    return [path for (path,) in rows]

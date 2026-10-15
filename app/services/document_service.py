@@ -1,6 +1,7 @@
 # document 的規則：存檔案、透過 workspace 判斷 ownership、CRUD 流程
 # 不寫 SQL 不碰 HTTP
 
+import contextlib
 import io
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -25,6 +26,11 @@ STUCK_AFTER = timedelta(minutes=30)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # 頁數上限：檔案大小不等於內容量，純文字的 PDF 很小卻可能有上千頁，處理時間會超過 Lambda 的 15 分鐘
 MAX_PAGES = 300
+# 文件在 S3 上的 key 前綴，上傳時加、對帳時用它列出所有文件檔案
+STORAGE_PREFIX = "documents/"
+# 對帳時，沒有紀錄的 S3 檔案要存在超過這麼久才刪：上傳是先存 S3 再建紀錄，
+# 剛好在這兩步之間對帳的話，會看到一個「還沒有紀錄」的新檔案，不能把它誤刪
+ORPHAN_GRACE = timedelta(days=1)
 # 一次送幾段 chunk 去轉向量（OpenAI 上限 2048，100 段已經能把呼叫次數降到百分之一，單次請求也不會太大）
 EMBED_BATCH_SIZE = 100
 
@@ -82,11 +88,21 @@ def upload_document(
     # .hex： 把它變成一串十六進位字串
     # 加上隨機前綴 避免同名檔案在 S3 裡互相覆蓋掉
     # "documents/" 這個前綴只是 S3 key 裡的字串，不是真的資料夾，純粹方便之後找東西
-    key = f"documents/{uuid4().hex}_{file.filename}"
+    key = f"{STORAGE_PREFIX}{uuid4().hex}_{file.filename}"
     # file.file.read() 把上傳內容讀出來變成一包 bytes (file 是 UploadFile 這個物件 .file 是它裡面裝真正內容的屬性)
     s3_client.upload_file(key, file.file.read())
 
-    document = document_repo.create(db, workspace_id, file.filename, key)
+    # S3 和資料庫沒辦法包在同一個 transaction 裡（見 docs/decisions/006）
+    # 先存 S3 再建紀錄：中途失敗只會留下沒人用的檔案（無害），不會留下指向不存在檔案的紀錄（有害）
+    try:
+        document = document_repo.create(db, workspace_id, file.filename, key)
+    except Exception:
+        db.rollback()
+        # 補救：紀錄建不起來，把剛存的檔案刪掉。連這步都失敗的話，留給每小時的對帳清
+        # contextlib.suppress：把裡面丟出的錯誤吞掉。這裡刪不掉也沒關係，重點是把原本的錯誤往外丟
+        with contextlib.suppress(BotoCoreError, ClientError):
+            s3_client.delete_file(key)
+        raise
     return dispatch_document(db, document)
 
 
@@ -213,5 +229,22 @@ def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document
 
 def delete_document(db: Session, document_id: int, owner_id: int) -> None:
     document = get_owned_document(db, document_id, owner_id)
-    s3_client.delete_file(document.storage_path)  # 順便刪 S3 上的檔案
+    key = document.storage_path
+    # 順序刻意是「先刪紀錄、再刪檔案」，跟上傳反過來，理由一樣：
+    # 刪檔案失敗只會留下沒人用的檔案（對帳會清）；反過來的話，紀錄還在但檔案沒了，使用者看得到卻再也處理不了
     document_repo.delete(db, document)
+    with contextlib.suppress(BotoCoreError, ClientError):
+        s3_client.delete_file(key)
+
+
+# 每小時的對帳（跟卡住文件的掃描一起跑）：S3 上有檔案、資料庫卻沒有紀錄的，就是孤兒檔案，刪掉
+# 回傳刪了幾個，方便在 log 裡看
+def delete_orphan_files(db: Session) -> int:
+    known = document_repo.list_storage_paths(db)
+    cutoff = datetime.now(timezone.utc) - ORPHAN_GRACE
+    deleted = 0
+    for key, last_modified in s3_client.list_files(STORAGE_PREFIX):
+        if key not in known and last_modified < cutoff:
+            s3_client.delete_file(key)
+            deleted += 1
+    return deleted

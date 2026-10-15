@@ -23,6 +23,8 @@ def _fake_s3(monkeypatch):
     monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
     monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
     monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
+    # sweeper 現在也會對帳、列出 S3 檔案；這裡回空的，不碰真的 S3（對帳另外在 test_storage_consistency.py 測）
+    monkeypatch.setattr(s3_client, "list_files", lambda prefix: [])
 
 
 @pytest.fixture(autouse=True)
@@ -217,7 +219,7 @@ def test_sweep_requeues_only_stuck_documents(client, db_session, sent, worker_db
 
     result = worker.handle_sweep(None, None)
 
-    assert result == {"requeued": 1}
+    assert result == {"requeued": 1, "orphans_deleted": 0}
     assert sent == [stuck_id]
     assert db_session.get(Document, fresh_id).status == "uploaded"
     assert db_session.get(Document, exhausted_id).status == "failed"

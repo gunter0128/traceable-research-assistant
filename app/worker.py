@@ -42,12 +42,14 @@ def handle_process_message(event, context):
             db.close()
 
 
-# 排程每小時呼叫一次：把卡住的文件找出來重送
+# 排程每小時呼叫一次：把卡住的文件找出來重送，再對帳清掉 S3 上的孤兒檔案
+# 重送放前面：對帳就算出錯，也不影響比較重要的重送
 def handle_sweep(event, context):
     db = SessionLocal()
     try:
         requeued = document_service.requeue_stuck_documents(db)
+        orphans_deleted = document_service.delete_orphan_files(db)
     finally:
         db.close()
     # 回傳值會出現在 Lambda 的執行紀錄裡，方便事後查這次掃描做了什麼
-    return {"requeued": requeued}
+    return {"requeued": requeued, "orphans_deleted": orphans_deleted}
