@@ -18,7 +18,8 @@
       ],
       "environment": [
         { "name": "AWS_REGION", "value": "ap-southeast-2" },
-        { "name": "S3_BUCKET_NAME", "value": "traceable-research-assistant-416113247224-ap-southeast-2-an" }
+        { "name": "S3_BUCKET_NAME", "value": "traceable-research-assistant-416113247224-ap-southeast-2-an" },
+        { "name": "SQS_QUEUE_URL", "value": "https://sqs.ap-southeast-2.amazonaws.com/416113247224/trace-app-documents-queue" }
       ],
       "secrets": [
         { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:416113247224:secret:trace-app/database-url" },
