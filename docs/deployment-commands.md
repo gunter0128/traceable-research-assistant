@@ -78,19 +78,115 @@ aws sts get-caller-identity
 
 ---
 
+## 從零建立整套環境（全部用 CLI）
+
+2026-10-16 從雪梨搬到新加坡時（見 [decisions/011](decisions/011-搬到新加坡.md)），整套用下面的指令重建一次。下面幾個段落記的是當初在雪梨一個一個建的過程（有些在主控台點），概念說明比較詳細；**要重建的話照這一段做就好**。
+
+前提：IAM 角色（`trace-app-execution-role`、`trace-app-task-role`、`trace-app-worker-role`）已經存在。IAM 是全球共用的，換區域不用重建，只要更新權限內容（4-2）。
+
+在專案資料夾、PowerShell 裡跑。開新視窗都要先設這三個變數：
+
+```powershell
+$ACCOUNT = aws sts get-caller-identity --query Account --output text
+$REGION = "ap-southeast-1"
+$REPO = "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/traceable-research-assistant"
+```
+
+### 1. ECR + image
+
+```powershell
+aws ecr create-repository --repository-name traceable-research-assistant --region $REGION
+$PASSWORD = aws ecr get-login-password --region $REGION
+docker login --username AWS --password $PASSWORD "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+docker build --platform linux/amd64 --provenance=false -t traceable-research-assistant .
+docker tag traceable-research-assistant:latest "${REPO}:latest"
+docker push "${REPO}:latest"
+```
+
+### 2. 密碼
+
+搬家時是從舊區域複製（`$value` 從舊區域 `get-secret-value` 讀出來）；從零開始的話，`--secret-string` 直接填值：
+
+```powershell
+foreach ($name in "database-url", "secret-key", "openai-api-key") { $value = aws secretsmanager get-secret-value --secret-id "trace-app/$name" --region <舊區域> --query SecretString --output text; aws secretsmanager create-secret --name "trace-app/$name" --secret-string $value --region $REGION --query Name --output text }
+```
+
+### 3. S3
+
+```powershell
+$BUCKET = "traceable-research-assistant-$ACCOUNT-$REGION"
+aws s3api create-bucket --bucket $BUCKET --region $REGION --create-bucket-configuration LocationConstraint=$REGION
+```
+
+`LocationConstraint` 不寫的話會建在美國。新 bucket 預設擋掉所有公開存取、自動加密。搬家時再用 `aws s3 sync s3://舊bucket/documents/ s3://$BUCKET/documents/ --source-region <舊區域> --region $REGION` 把檔案複製過來。
+
+### 4. SQS + IAM 權限
+
+`deploy/` 裡的檔案寫死了區域和 bucket 名稱，換區域要先改。
+
+```powershell
+aws sqs create-queue --queue-name trace-app-documents-dlq --attributes file://deploy/sqs-dlq-attributes.json --region $REGION
+aws sqs create-queue --queue-name trace-app-documents-queue --attributes file://deploy/sqs-queue-attributes.json --region $REGION
+aws iam put-role-policy --role-name trace-app-execution-role --policy-name SecretsAccessForTraceApp --policy-document file://deploy/execution-role-secrets-policy.json
+aws iam put-role-policy --role-name trace-app-task-role --policy-name S3AccessForTraceAppTaskRole --policy-document file://deploy/api-task-s3-policy.json
+aws iam put-role-policy --role-name trace-app-task-role --policy-name trace_app_api_send_to_queue --policy-document file://deploy/api-task-sqs-policy.json
+aws iam put-role-policy --role-name trace-app-worker-role --policy-name trace_app_worker_permissions --policy-document file://deploy/lambda-permissions-policy.json
+aws iam create-policy-version --policy-arn "arn:aws:iam::${ACCOUNT}:policy/S3AccessForTraceApp" --policy-document file://deploy/local-dev-s3-policy.json --set-as-default
+```
+
+DLQ 要先建，主佇列的設定裡要指向它。最後一行是本機開發用的 `trace-app-s3` 帳號的權限（managed policy，改它要新增版本；最多 5 個版本，滿了要先刪舊的）。
+
+### 5. log group、API、Lambda、排程
+
+```powershell
+foreach ($group in "/ecs/trace-app", "/aws/lambda/trace-app-worker", "/aws/lambda/trace-app-sweeper") { aws logs create-log-group --log-group-name $group --region $REGION; aws logs put-retention-policy --log-group-name $group --retention-in-days 30 --region $REGION }
+
+aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json --region $REGION --query "taskDefinition.revision"
+aws ecs create-cluster --cluster-name trace-app-cluster --region $REGION --query "cluster.status"
+$SG = aws ec2 create-security-group --group-name trace-app-sg --description "trace-app API port 8000" --vpc-id <預設 VPC> --region $REGION --query GroupId --output text
+aws ec2 authorize-security-group-ingress --group-id $SG --protocol tcp --port 8000 --cidr 0.0.0.0/0 --region $REGION --query "Return"
+aws ecs create-service --cluster trace-app-cluster --service-name trace-app-service --task-definition trace-app --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[<子網路1>,<子網路2>,<子網路3>],securityGroups=[$SG],assignPublicIp=ENABLED}" --region $REGION --query "service.status"
+
+aws lambda create-function --function-name trace-app-worker --package-type Image --code "ImageUri=${REPO}:latest" --role "arn:aws:iam::${ACCOUNT}:role/trace-app-worker-role" --memory-size 1024 --timeout 600 --image-config file://deploy/lambda-worker-image-config.json --environment file://deploy/lambda-environment.json --region $REGION --query "State"
+aws lambda create-function --function-name trace-app-sweeper --package-type Image --code "ImageUri=${REPO}:latest" --role "arn:aws:iam::${ACCOUNT}:role/trace-app-worker-role" --memory-size 512 --timeout 120 --image-config file://deploy/lambda-sweeper-image-config.json --environment file://deploy/lambda-environment.json --region $REGION --query "State"
+aws lambda wait function-active-v2 --function-name trace-app-worker --region $REGION
+aws lambda wait function-active-v2 --function-name trace-app-sweeper --region $REGION
+
+aws lambda create-event-source-mapping --function-name trace-app-worker --event-source-arn "arn:aws:sqs:${REGION}:${ACCOUNT}:trace-app-documents-queue" --batch-size 1 --scaling-config MaximumConcurrency=2 --region $REGION --query "State"
+aws events put-rule --name trace-app-sweeper-hourly --schedule-expression "rate(1 hour)" --region $REGION --query "RuleArn"
+aws lambda add-permission --function-name trace-app-sweeper --statement-id eventbridge-hourly --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn "arn:aws:events:${REGION}:${ACCOUNT}:rule/trace-app-sweeper-hourly" --region $REGION --query "Statement"
+aws events put-targets --rule trace-app-sweeper-hourly --targets file://deploy/sweeper-schedule-target.json --region $REGION
+```
+
+- 預設 VPC 和它的子網路：`aws ec2 describe-vpcs --filters Name=isDefault,Values=true --region $REGION`、`aws ec2 describe-subnets --filters Name=default-for-az,Values=true --region $REGION --query "Subnets[].SubnetId"`
+- Lambda 的 image 設定、環境變數、排程目標都放在 `deploy/` 的 JSON 檔：直接寫在指令裡的話，PowerShell 5.1 會把 JSON 的雙引號吃掉
+- `add-permission`：Lambda 預設誰都不能呼叫，要明確允許排程服務（EventBridge）呼叫 sweeper。主控台設排程時會自動做這步，CLI 要自己做
+
+### 6. 驗證
+
+```powershell
+'{"probe": true}' | Out-File -Encoding ascii probe.json
+aws lambda invoke --function-name trace-app-worker --payload fileb://probe.json --region $REGION out.json
+Get-Content out.json
+```
+
+量 Lambda 到資料庫的速度。同區域的話，`tcp_connect_ms` 應該是個位數。
+
+---
+
 ## ECR:image 的雲端倉庫
 
 ### 建倉庫（只做一次）
 
 ```bash
-aws ecr create-repository --repository-name traceable-research-assistant --region ap-southeast-2
+aws ecr create-repository --repository-name traceable-research-assistant --region ap-southeast-1
 ```
 建立之後會一直存在，**不用每次推 image 都重建**。
 
 ### 登入（有效期 12 小時，過期要重做）
 
 ```bash
-aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin 416113247224.dkr.ecr.ap-southeast-2.amazonaws.com
+aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin 416113247224.dkr.ecr.ap-southeast-1.amazonaws.com
 ```
 - `aws ecr get-login-password`——跟 AWS 要一組臨時通行證（12 小時後失效）
 - `|`——管線，把左邊指令的輸出，直接餵給右邊指令當輸入
@@ -102,9 +198,9 @@ aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS
 
 ```powershell
 $ACCOUNT = aws sts get-caller-identity --query Account --output text
-$REPO = "$ACCOUNT.dkr.ecr.ap-southeast-2.amazonaws.com/traceable-research-assistant"
-$PASSWORD = aws ecr get-login-password --region ap-southeast-2
-docker login --username AWS --password $PASSWORD "$ACCOUNT.dkr.ecr.ap-southeast-2.amazonaws.com"
+$REPO = "$ACCOUNT.dkr.ecr.ap-southeast-1.amazonaws.com/traceable-research-assistant"
+$PASSWORD = aws ecr get-login-password --region ap-southeast-1
+docker login --username AWS --password $PASSWORD "$ACCOUNT.dkr.ecr.ap-southeast-1.amazonaws.com"
 ```
 - `aws sts get-caller-identity`——問 AWS「我現在用哪個帳號登入」，只取帳號 ID，就不用手動貼那串數字
 - 會出現「在指令裡寫密碼不安全」的警告，可以忽略：這是 12 小時後就失效的臨時密碼
@@ -116,13 +212,13 @@ docker login --username AWS --password $PASSWORD "$ACCOUNT.dkr.ecr.ap-southeast-
 ### Tag + Push（每次要發布新版本都要做）
 
 ```bash
-docker tag traceable-research-assistant:latest 416113247224.dkr.ecr.ap-southeast-2.amazonaws.com/traceable-research-assistant:latest
-docker push 416113247224.dkr.ecr.ap-southeast-2.amazonaws.com/traceable-research-assistant:latest
+docker tag traceable-research-assistant:latest 416113247224.dkr.ecr.ap-southeast-1.amazonaws.com/traceable-research-assistant:latest
+docker push 416113247224.dkr.ecr.ap-southeast-1.amazonaws.com/traceable-research-assistant:latest
 ```
 
 ECR 位址的結構(跟 GitHub 網址是同一種邏輯):
 ```
-416113247224.dkr.ecr.ap-southeast-2.amazonaws.com / traceable-research-assistant : latest
+416113247224.dkr.ecr.ap-southeast-1.amazonaws.com / traceable-research-assistant : latest
 └──────────伺服器網址（你帳號+區域專屬）──────────┘   └──倉庫名稱（對應 create-repository 時取的名字）──┘  └標籤┘
 ```
 
@@ -134,7 +230,7 @@ ECR 位址的結構(跟 GitHub 網址是同一種邏輯):
 ### 確認真的推上去了
 
 ```bash
-aws ecr describe-images --repository-name traceable-research-assistant --region ap-southeast-2
+aws ecr describe-images --repository-name traceable-research-assistant --region ap-southeast-1
 ```
 列出這個倉庫裡現有的 image，`imageStatus: "ACTIVE"` 代表確實存在且可用。
 
@@ -143,12 +239,12 @@ aws ecr describe-images --repository-name traceable-research-assistant --region 
 ## Secrets Manager：密鑰放哪
 
 ```bash
-aws secretsmanager create-secret --name trace-app/database-url --secret-string "值" --region ap-southeast-2
-aws secretsmanager update-secret --secret-id trace-app/database-url --secret-string "新值" --region ap-southeast-2
+aws secretsmanager create-secret --name trace-app/database-url --secret-string "值" --region ap-southeast-1
+aws secretsmanager update-secret --secret-id trace-app/database-url --secret-string "新值" --region ap-southeast-1
 ```
 `create-secret` 第一次建立；改內容用 `update-secret`，不用整個刪掉重建（刪除預設有 30 天緩衝期，要立刻重建同名的會卡住，加 `--force-delete-without-recovery` 才會真的馬上刪）。
 
-已建立的三個：`trace-app/database-url`、`trace-app/secret-key`、`trace-app/openai-api-key`（都在 `ap-southeast-2`）。
+已建立的三個：`trace-app/database-url`、`trace-app/secret-key`、`trace-app/openai-api-key`（都在 `ap-southeast-1`）。
 
 ---
 
@@ -172,13 +268,13 @@ aws secretsmanager update-secret --secret-id trace-app/database-url --secret-str
 寫在 [`deploy/task-definition.json`](../deploy/task-definition.json)，記錄「這個任務要用哪個 image、吃多少 CPU/記憶體、兩個 Role 分別是誰、環境變數跟密鑰從哪裡來、log 往哪裡送」。這份 JSON 可以直接在主控台的空白範本上填，也可以存成檔案用 CLI 註冊：
 
 ```bash
-aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json --region ap-southeast-2
+aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json --region ap-southeast-1
 ```
 
 每次註冊都會產生新的 revision（`trace-app:1`、`trace-app:2`...），舊的 revision 不會被覆蓋或刪除，只是不再是「最新」。**改了 Task Definition（比方說要用新 image、改環境變數）之後，要重新註冊產生新 revision，Service 才有新版本可以切換過去**——光改這份 JSON 檔案本身，不會自動影響正在跑的 Service。
 
 ```bash
-aws ecs describe-task-definition --task-definition trace-app --region ap-southeast-2
+aws ecs describe-task-definition --task-definition trace-app --region ap-southeast-1
 ```
 只讀，確認目前最新 revision 的內容。
 
@@ -195,7 +291,7 @@ aws ecs describe-task-definition --task-definition trace-app --region ap-southea
 透過主控台建立，叫 `trace-app-cluster`，選 Fargate（無伺服器，不用自己管底層機器）。Cluster 本身不跑任何東西，只是把相關的 Service/Task 歸在一起管理，方便之後在主控台找。
 
 ```bash
-aws ecs describe-clusters --clusters trace-app-cluster --region ap-southeast-2
+aws ecs describe-clusters --clusters trace-app-cluster --region ap-southeast-1
 ```
 
 ---
@@ -207,12 +303,12 @@ aws ecs describe-clusters --clusters trace-app-cluster --region ap-southeast-2
 ### 確認目前狀態(只讀)
 
 ```bash
-aws ecs describe-services --cluster trace-app-cluster --services trace-app-service --region ap-southeast-2
+aws ecs describe-services --cluster trace-app-cluster --services trace-app-service --region ap-southeast-1
 ```
 看 `runningCount`（目前真的在跑幾個）、`desiredCount`（希望跑幾個）、`deployments`（部署歷史跟狀態）。
 
 ```bash
-aws ecs describe-tasks --cluster trace-app-cluster --tasks <task-id> --region ap-southeast-2
+aws ecs describe-tasks --cluster trace-app-cluster --tasks <task-id> --region ap-southeast-1
 ```
 看單一任務的詳細狀態，包括失敗時的 `stoppedReason`、`exitCode`——診斷崩潰問題的第一步。
 
@@ -220,21 +316,21 @@ aws ecs describe-tasks --cluster trace-app-cluster --tasks <task-id> --region ap
 
 ```bash
 export MSYS_NO_PATHCONV=1   # Git Bash 專用：避免把 /ecs/trace-app 這種字串誤判成本機路徑
-aws logs describe-log-streams --log-group-name /ecs/trace-app --region ap-southeast-2
-aws logs get-log-events --log-group-name /ecs/trace-app --log-stream-name <stream-name> --region ap-southeast-2
+aws logs describe-log-streams --log-group-name /ecs/trace-app --region ap-southeast-1
+aws logs get-log-events --log-group-name /ecs/trace-app --log-stream-name <stream-name> --region ap-southeast-1
 ```
 
 ### 套用新版本(改了程式碼、重新 build+push+register 之後)
 
 ```bash
-aws ecs update-service --cluster trace-app-cluster --service trace-app-service --force-new-deployment --region ap-southeast-2
+aws ecs update-service --cluster trace-app-cluster --service trace-app-service --force-new-deployment --region ap-southeast-1
 ```
 **`--force-new-deployment` 的用途**：就算 Task Definition 的 revision 號碼沒變（比方說只是用了同一個 `:latest` image tag、但 image 內容其實換新了），這個指令會強制 Service 不管快取，直接拉一份新的任務起來、健康後把舊的關掉。沒有這個指令，Service 會覺得「設定沒變啊」而繼續用舊的容器跑。
 
 改了 `deploy/task-definition.json`（例如加環境變數）的話，要先 `register-task-definition` 登記新版本，再用 `--task-definition trace-app` 讓 Service 改用最新版：
 
 ```bash
-aws ecs update-service --cluster trace-app-cluster --service trace-app-service --task-definition trace-app --desired-count 1 --force-new-deployment --region ap-southeast-2
+aws ecs update-service --cluster trace-app-cluster --service trace-app-service --task-definition trace-app --desired-count 1 --force-new-deployment --region ap-southeast-1
 ```
 Task Definition 用指令從檔案登記，不在主控台改：檔案是唯一的來源，主控台改了檔案不會跟著變。
 
@@ -243,7 +339,7 @@ Task Definition 用指令從檔案登記，不在主控台改：檔案是唯一�
 ### 不用的時候記得關掉(避免持續計費)
 
 ```bash
-aws ecs update-service --cluster trace-app-cluster --service trace-app-service --desired-count 0 --region ap-southeast-2
+aws ecs update-service --cluster trace-app-cluster --service trace-app-service --desired-count 0 --region ap-southeast-1
 ```
 Fargate 是「任務在跑就按秒計費」，跟 OpenAI 那種按用量計費不一樣。測試完一段時間，把 `desired-count` 調成 0，之後要測再調回 1 即可，不用整個刪掉 Service。
 
@@ -267,8 +363,8 @@ EventBridge：trace-app-sweeper-hourly（每小時）──▶ Lambda：trace-ap
 設定寫在 `deploy/` 的 JSON 檔，PowerShell 直接把 JSON 寫在指令裡引號容易壞掉，用檔案比較穩。**dlq 要先建**，因為主佇列的設定會指向它：
 
 ```powershell
-aws sqs create-queue --queue-name trace-app-documents-dlq --attributes file://deploy/sqs-dlq-attributes.json --region ap-southeast-2
-aws sqs create-queue --queue-name trace-app-documents-queue --attributes file://deploy/sqs-queue-attributes.json --region ap-southeast-2
+aws sqs create-queue --queue-name trace-app-documents-dlq --attributes file://deploy/sqs-dlq-attributes.json --region ap-southeast-1
+aws sqs create-queue --queue-name trace-app-documents-queue --attributes file://deploy/sqs-queue-attributes.json --region ap-southeast-1
 ```
 - 主佇列 visibility timeout 3600 秒：Lambda 拿走工單後，工單隱形這麼久。**一定要比 Lambda 的逾時（600 秒）長**，不然 Lambda 還在處理，工單就重新出現被處理第二次
 - 同一張工單被拿 3 次都沒完成 → 移到 dlq，保留 14 天
@@ -315,8 +411,8 @@ CMD 覆寫：同一個 image，Fargate 照 Dockerfile 跑 uvicorn，Lambda 改�
 **Lambda 不會自動換成 ECR 上最新的 `:latest`**。建立（或上次更新）時，它記住的是當時那個 image 的內容指紋（digest），之後 push 新的 image 它不會知道。所以 build + push 之後，除了更新 ECS，兩個 Lambda 也要各更新一次：
 
 ```powershell
-aws lambda update-function-code --function-name trace-app-worker --image-uri "${REPO}:latest" --region ap-southeast-2
-aws lambda update-function-code --function-name trace-app-sweeper --image-uri "${REPO}:latest" --region ap-southeast-2
+aws lambda update-function-code --function-name trace-app-worker --image-uri "${REPO}:latest" --region ap-southeast-1
+aws lambda update-function-code --function-name trace-app-sweeper --image-uri "${REPO}:latest" --region ap-southeast-1
 ```
 
 ### 手動測試一個 Lambda（不會動到任何資料）
@@ -324,13 +420,13 @@ aws lambda update-function-code --function-name trace-app-sweeper --image-uri "$
 傳一個空的工單清單給 worker：能正常啟動、讀到密碼、載入程式碼，就會回傳 `null`。sweeper 會真的去查資料庫，沒有卡住的文件時回傳 `{"requeued": 0}`。
 
 ```bash
-aws lambda invoke --function-name trace-app-worker --cli-binary-format raw-in-base64-out --payload '{"Records": []}' --region ap-southeast-2 out.json
+aws lambda invoke --function-name trace-app-worker --cli-binary-format raw-in-base64-out --payload '{"Records": []}' --region ap-southeast-1 out.json
 ```
 
 ### 檢查佇列、查 Lambda 的 log
 
 ```bash
-aws sqs get-queue-attributes --queue-url https://sqs.ap-southeast-2.amazonaws.com/416113247224/trace-app-documents-dlq --attribute-names ApproximateNumberOfMessages --region ap-southeast-2
+aws sqs get-queue-attributes --queue-url https://sqs.ap-southeast-1.amazonaws.com/416113247224/trace-app-documents-dlq --attribute-names ApproximateNumberOfMessages --region ap-southeast-1
 ```
 **dlq 裡有東西 = 有工單試了 3 次都失敗**，要去查原因。
 
@@ -347,16 +443,16 @@ Lambda 的 log 在 CloudWatch 的 `/aws/lambda/trace-app-worker`、`/aws/lambda/
 CloudWatch 預設永久保留 log，費用會一直累積。三個 log group 都設成保留 30 天（見 [decisions/010](decisions/010-結構化-log.md)）：
 
 ```bash
-aws logs put-retention-policy --log-group-name /ecs/trace-app --retention-in-days 30 --region ap-southeast-2
-aws logs put-retention-policy --log-group-name /aws/lambda/trace-app-worker --retention-in-days 30 --region ap-southeast-2
-aws logs put-retention-policy --log-group-name /aws/lambda/trace-app-sweeper --retention-in-days 30 --region ap-southeast-2
+aws logs put-retention-policy --log-group-name /ecs/trace-app --retention-in-days 30 --region ap-southeast-1
+aws logs put-retention-policy --log-group-name /aws/lambda/trace-app-worker --retention-in-days 30 --region ap-southeast-1
+aws logs put-retention-policy --log-group-name /aws/lambda/trace-app-sweeper --retention-in-days 30 --region ap-southeast-1
 ```
 
 確認（`retentionInDays` 應該是 30）：
 
 ```bash
-aws logs describe-log-groups --log-group-name-prefix /aws/lambda/trace-app --region ap-southeast-2 --query "logGroups[].[logGroupName,retentionInDays]"
-aws logs describe-log-groups --log-group-name-prefix /ecs/trace-app --region ap-southeast-2 --query "logGroups[].[logGroupName,retentionInDays]"
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/trace-app --region ap-southeast-1 --query "logGroups[].[logGroupName,retentionInDays]"
+aws logs describe-log-groups --log-group-name-prefix /ecs/trace-app --region ap-southeast-1 --query "logGroups[].[logGroupName,retentionInDays]"
 ```
 
 ### 查詢範例（CloudWatch 主控台 → Logs Insights）

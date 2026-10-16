@@ -11,26 +11,26 @@
         "sqs:SendMessage",
         "sqs:ChangeMessageVisibility"
       ],
-      "Resource": "arn:aws:sqs:ap-southeast-2:416113247224:trace-app-documents-queue"
+      "Resource": "arn:aws:sqs:ap-southeast-1:416113247224:trace-app-documents-queue"
     },
     {
       "Sid": "ReadAndCleanUploadedPdfs",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::traceable-research-assistant-416113247224-ap-southeast-2-an/documents/*"
+      "Resource": "arn:aws:s3:::traceable-research-assistant-416113247224-ap-southeast-1/documents/*"
     },
     {
       "Sid": "ListUploadedPdfs",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::traceable-research-assistant-416113247224-ap-southeast-2-an",
+      "Resource": "arn:aws:s3:::traceable-research-assistant-416113247224-ap-southeast-1",
       "Condition": { "StringLike": { "s3:prefix": "documents/*" } }
     },
     {
       "Sid": "ReadAppSecrets",
       "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:ap-southeast-2:416113247224:secret:trace-app/*"
+      "Resource": "arn:aws:secretsmanager:ap-southeast-1:416113247224:secret:trace-app/*"
     }
   ]
 }
