@@ -55,6 +55,19 @@ export function WorkspaceDetail({
   workspace: Workspace
   onBack: () => void
 }) {
+  // 今天的用量到上限了沒（docs/decisions/012）
+  // 問答完、文件處理完之後查一次：跨過上限的那一次當下就顯示，不用等下一次被擋才知道
+  const [limitReached, setLimitReached] = useState(false)
+
+  function refreshUsage() {
+    // 查不到也沒關係，只是少顯示一個提示，不跳錯誤
+    api.usageToday().then((u) => setLimitReached(u.limit_reached)).catch(() => {})
+  }
+
+  useEffect(() => {
+    refreshUsage()
+  }, [])
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6 p-6">
       <div className="flex items-center gap-3">
@@ -64,15 +77,28 @@ export function WorkspaceDetail({
         <h1 className="text-2xl font-semibold">{workspace.name}</h1>
       </div>
 
+      {limitReached && (
+        <p className="border-destructive/50 text-destructive rounded-md border p-3 text-sm">
+          今日用量已達上限，明天再試。已經在處理中的文件會繼續處理完。
+        </p>
+      )}
+
       <div className="grid gap-6 md:grid-cols-[320px_1fr]">
-        <DocumentsPanel workspaceId={workspace.id} />
-        <QaPanel workspaceId={workspace.id} />
+        <DocumentsPanel workspaceId={workspace.id} onUsageChanged={refreshUsage} />
+        <QaPanel workspaceId={workspace.id} onUsageChanged={refreshUsage} />
       </div>
     </div>
   )
 }
 
-function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
+// onUsageChanged：用量可能變了（文件處理完了），請上層重新查一次
+function DocumentsPanel({
+  workspaceId,
+  onUsageChanged,
+}: {
+  workspaceId: number
+  onUsageChanged: () => void
+}) {
   const [documents, setDocuments] = useState<Document[]>([])
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
@@ -103,7 +129,11 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
       api.listDocuments(workspaceId).then(setDocuments).catch(() => {})
     }, POLL_INTERVAL_MS)
     // cleanup：hasPending 變成 false、或離開這個畫面時，把計時器關掉，不然會一直在背景問
-    return () => clearInterval(timer)
+    return () => {
+      clearInterval(timer)
+      // 處理中的文件都處理完了（hasPending 從 true 變 false）→ 轉向量花了錢，查一次用量
+      onUsageChanged()
+    }
   }, [hasPending, workspaceId])
 
   async function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
@@ -258,7 +288,13 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
   )
 }
 
-function QaPanel({ workspaceId }: { workspaceId: number }) {
+function QaPanel({
+  workspaceId,
+  onUsageChanged,
+}: {
+  workspaceId: number
+  onUsageChanged: () => void
+}) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [question, setQuestion] = useState("")
   const [asking, setAsking] = useState(false)
@@ -281,6 +317,7 @@ function QaPanel({ workspaceId }: { workspaceId: number }) {
         ...prev,
         { role: "assistant", content: res.answer, citations: res.citations },
       ])
+      onUsageChanged()
     } catch (err) {
       // 使用者自己按取消的，不用跳錯誤提示
       if (!controller.signal.aborted) {

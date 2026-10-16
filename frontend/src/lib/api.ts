@@ -37,6 +37,13 @@ export type AskResponse = {
   citations: Citation[]
 }
 
+// 今天（台灣時間）的用量（docs/decisions/012）。金額是字串：後端用精確小數，轉成 JSON 時變字串
+export type UsageToday = {
+  used_usd: string
+  limit_usd: string
+  limit_reached: boolean
+}
+
 export class ApiError extends Error {
   status: number
   constructor(status: number, message: string) {
@@ -130,6 +137,8 @@ export const api = {
 
   deleteDocument: (documentId: number) =>
     request<void>(`/documents/${documentId}`, { method: "DELETE" }),
+
+  usageToday: () => request<UsageToday>("/usage/today"),
 
   // signal：讓呼叫的人可以中途取消這個請求（AbortController 給的），取消時 fetch 會丟 AbortError
   ask: (workspaceId: number, question: string, signal?: AbortSignal) =>

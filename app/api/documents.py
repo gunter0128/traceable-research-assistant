@@ -5,11 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
+from app.api.usage import quota_error
 from app.core import s3_client
 from app.core.db import get_db
 from app.models.user import User
 from app.schemas.document import DocumentOut
-from app.services import document_service, workspace_service
+from app.services import document_service, usage_service, workspace_service
 
 router = APIRouter(tags=["documents"])
 
@@ -44,6 +45,8 @@ def upload_document(
         workspace_service.NotWorkspaceOwner,
     ) as exc:
         _workspace_error(exc)
+    except usage_service.QuotaExceeded as exc:
+        quota_error(exc)
     except document_service.InvalidFileType:
         raise HTTPException(
             status_code=400, detail="only PDF files are allowed"
@@ -108,6 +111,8 @@ def retry_document(
         document_service.NotDocumentOwner,
     ) as exc:
         _document_error(exc)
+    except usage_service.QuotaExceeded as exc:
+        quota_error(exc)
     except document_service.DocumentNotRetryable:
         raise HTTPException(
             status_code=409, detail="only failed or cancelled documents can be retried"

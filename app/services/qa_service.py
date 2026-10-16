@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core import log, openai_client
 from app.repositories import chunk_repo
 from app.schemas.qa import AskResponse, CitationOut
-from app.services import workspace_service
+from app.services import usage_service, workspace_service
 
 # 使用者最多等多久就要看到答案或錯誤訊息
 ANSWER_BUDGET_SECONDS = 60
@@ -28,6 +28,13 @@ class AIServiceMisconfigured(Exception):
 def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResponse:
     # 借用 workspace 的 ownership 檢查：先確認這個 workspace 是不是你的
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
+    # 今天的用量到上限了就不回答（docs/decisions/012）。還沒到的話，這次會完整回答完，就算答完之後超過了也一樣
+    usage_service.ensure_within_quota(db, owner_id)
+
+    # 每次呼叫 OpenAI 成功，先把用量收集起來，最後再一起寫進資料庫（見下面的 finally）
+    # 不在中途寫：寫入要 commit，commit 會讓已經查出來的段落資料失效，後面組引用時又要重查一次
+    usages = []
+    record_usage = usages.append
 
     # 整個問答共用 60 秒的時間預算（docs/decisions/008）：轉向量跟生成答案各自的重試加起來，也不會超過
     deadline = time.monotonic() + ANSWER_BUDGET_SECONDS
@@ -35,13 +42,21 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResp
     # 問題只記字數、不記內容：使用者的問題可能是未發表的研究
     try:
         with log.timed("qa_embed", question_chars=len(question)):
-            query_embedding = openai_client.embed_query(question, deadline=deadline)
+            query_embedding = openai_client.embed_query(question, deadline=deadline, on_usage=record_usage)
         with log.timed("qa_search") as fields:
             chunks = chunk_repo.search_similar(db, workspace_id, query_embedding)
             fields["chunks"] = len(chunks)
         with log.timed("qa_generate") as fields:
-            answer = openai_client.generate_answer(question, _build_context(chunks), deadline=deadline)
+            answer = openai_client.generate_answer(
+                question, _build_context(chunks), deadline=deadline, on_usage=record_usage
+            )
             fields["answer_chars"] = len(answer or "")
+        # 簡單版 citation：這次搜到、丟給 LLM 的 chunk 全部算數 不檢查答案有沒有每段都真的用到
+        # 放在 try 裡面：要在下面 finally 寫入用量（commit）之前讀完段落的內容
+        citations = [
+            CitationOut(document_id=chunk.document_id, filename=chunk.document.filename, content=chunk.content)
+            for chunk in chunks
+        ]
     # openai_client 已經做完秒級重試了，走到這裡代表重試也沒用
     # from None：不把 OpenAI 原本的錯誤接在後面，API 層只需要知道是哪一種
     except openai_client.OpenAITemporaryError:
@@ -50,17 +65,10 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResp
     except openai_client.OpenAIPermanentError:
         log.event("qa_failed", logging.ERROR, error_type="permanent")
         raise AIServiceMisconfigured from None
-
-    # 簡單版 citation：這次搜到、丟給 LLM 的 chunk 全部算數 不檢查答案有沒有每段都真的用到
-    citations = []
-    for chunk in chunks:
-        citations.append(
-            CitationOut(
-                document_id=chunk.document_id,
-                filename=chunk.document.filename,
-                content=chunk.content,
-            )
-        )
+    # finally：不管成功或失敗都會執行。轉向量成功、生成答案失敗的話，轉向量的錢還是花掉了，要記
+    finally:
+        for usage in usages:
+            usage_service.record(db, owner_id, "qa", usage)
 
     return AskResponse(answer=answer, citations=citations)
 

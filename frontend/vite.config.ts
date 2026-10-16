@@ -20,6 +20,7 @@ export default defineConfig({
       '/auth': 'http://localhost:8000',
       '/workspaces': 'http://localhost:8000',
       '/documents': 'http://localhost:8000',
+      '/usage': 'http://localhost:8000',
     },
   },
 })

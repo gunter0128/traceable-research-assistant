@@ -18,7 +18,7 @@ from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models.document import Document
 from app.repositories import chunk_repo, document_repo
-from app.services import workspace_service
+from app.services import usage_service, workspace_service
 
 # 一份文件最多被處理幾次，超過就直接標成失敗，不再重試
 MAX_ATTEMPTS = 3
@@ -117,6 +117,9 @@ def upload_document(
     db: Session, workspace_id: int, owner_id: int, file: UploadFile
 ) -> Document:
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
+    # 今天的用量到上限了就不收（docs/decisions/012）：收下來也沒辦法處理
+    # 還沒到的話，這份會完整處理完，就算處理完之後超過了也一樣
+    usage_service.ensure_within_quota(db, owner_id)
     # 只能上傳 PDF
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise InvalidFileType
@@ -177,6 +180,8 @@ def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     document = get_owned_document(db, document_id, owner_id)
     if document.status not in ("failed", "cancelled"):
         raise DocumentNotRetryable
+    # 重試也會呼叫 OpenAI，跟上傳一樣先檢查用量
+    usage_service.ensure_within_quota(db, owner_id)
     log.bind_document(document.id)
     log.event("retry_requested", previous_status=document.status)
     document_repo.reset_for_retry(db, document)
@@ -240,6 +245,14 @@ def process_document(db: Session, document: Document) -> Document:
         return document
     db.refresh(document)  # 拿到租約的同時次數 +1 了，重新讀一次
     lease = _Lease(document.id, token)
+    owner_id = document.workspace.owner_id
+
+    # 每批轉向量成功就記下花了多少，算在上傳的人（workspace 的主人）身上
+    # 跟報平安一樣另開 session、立刻 commit：處理用的 session 失敗時會 rollback，但錢已經花掉了，紀錄不能跟著消失
+    def record_usage(usage):
+        with SessionLocal() as usage_db:
+            usage_service.record(usage_db, owner_id, "document", usage, document_id=document.id)
+
     log.event("claimed", attempt=document.attempts)
 
     # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、使用者重試），統一在這裡擋
@@ -277,7 +290,7 @@ def process_document(db: Session, document: Document) -> Document:
                     fields["openai_attempts"] += 1
                     lease.beat()
 
-                embeddings = openai_client.embed_texts(batch, on_attempt=on_attempt)
+                embeddings = openai_client.embed_texts(batch, on_attempt=on_attempt, on_usage=record_usage)
                 # zip：把兩個 list 一對一配對；strict=True 代表兩邊長度不一樣就直接報錯，不會默默少存幾段
                 for offset, (piece, embedding) in enumerate(zip(batch, embeddings, strict=True)):
                     chunk_repo.create(db, document.id, start + offset, piece, embedding)

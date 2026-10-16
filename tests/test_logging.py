@@ -43,7 +43,7 @@ def _fakes(monkeypatch):
     monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
 
     # 跟真的 embed_texts 一樣，呼叫 OpenAI 之前先呼叫 on_attempt（試一次就成功）
-    def fake_embed(texts, on_attempt=None):
+    def fake_embed(texts, on_attempt=None, **kwargs):
         if on_attempt is not None:
             on_attempt()
         return [[0.1] * 1536 for _ in texts]

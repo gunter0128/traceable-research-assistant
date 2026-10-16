@@ -5,10 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
+from app.api.usage import quota_error
 from app.core.db import get_db
 from app.models.user import User
 from app.schemas.qa import AskRequest, AskResponse
-from app.services import qa_service, workspace_service
+from app.services import qa_service, usage_service, workspace_service
 
 router = APIRouter(tags=["qa"])
 
@@ -33,6 +34,8 @@ def ask(
         workspace_service.NotWorkspaceOwner,
     ) as exc:
         _workspace_error(exc)
+    except usage_service.QuotaExceeded as exc:
+        quota_error(exc)
     # 503 Service Unavailable：「服務暫時無法提供」，表示問題不在使用者的請求本身
     except qa_service.AIServiceUnavailable:
         raise HTTPException(

@@ -9,6 +9,8 @@ import logging
 import random
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import TypeVar
 
 import openai
@@ -20,6 +22,27 @@ from app.core.config import settings
 EMBEDDING_MODEL = "text-embedding-3-small"
 # 負責生成答案用的模型 跟上面 embedding 用的是不同任務 分開一個常數
 GENERATION_MODEL = "gpt-4o-mini"
+
+# 每 100 萬個 token 多少美元：(輸入, 輸出)。embedding 只有輸入
+# 2026-10 OpenAI 官網的價格，OpenAI 調價時要跟著改（docs/decisions/012）
+PRICES_PER_MILLION = {
+    EMBEDDING_MODEL: (Decimal("0.02"), Decimal("0")),
+    GENERATION_MODEL: (Decimal("0.15"), Decimal("0.60")),
+}
+
+
+# 一次呼叫用了多少（OpenAI 每次回應都會附上）
+# @dataclass：自動產生 __init__ 等方法的類別，適合用來裝「幾個欄位綁在一起」的資料
+@dataclass
+class Usage:
+    model: str
+    input_tokens: int
+    output_tokens: int = 0
+
+    # 這次花了多少美元
+    def cost_usd(self) -> Decimal:
+        input_price, output_price = PRICES_PER_MILLION[self.model]
+        return (self.input_tokens * input_price + self.output_tokens * output_price) / 1_000_000
 
 # max_retries=0：關掉 SDK 內建的重試，全部由下面的 _with_retries 處理
 # 每次嘗試最多等多久，呼叫時才用 with_options(timeout=...) 指定（文件處理跟問答不一樣）
@@ -149,8 +172,12 @@ def _with_retries(
 # 何時呼叫：document_service 處理文件時，一次把一批 chunk 送去轉向量
 # 一次送很多段，比一段一段送少很多次來回（300 頁約 330 段，每批 100 段只要呼叫 4 次）
 # on_attempt：每次嘗試前呼叫，document_service 用它報平安（docs/decisions/008）
+# on_usage：成功之後呼叫，把這次用了多少交給呼叫的人記錄（docs/decisions/012）
+#   只有成功才會呼叫：失敗的請求 OpenAI 不收錢
 def embed_texts(
-    texts: list[str], on_attempt: Callable[[], None] | None = None
+    texts: list[str],
+    on_attempt: Callable[[], None] | None = None,
+    on_usage: Callable[[Usage], None] | None = None,
 ) -> list[list[float]]:
     def call(timeout: float):
         # with_options(timeout=...)：只有這一次呼叫用這個等待上限，不影響其他地方
@@ -166,6 +193,7 @@ def embed_texts(
         give_up_on_long_wait=False,
         on_attempt=on_attempt,
     )
+    _report_embedding_usage(response, on_usage)
     # response.data 是「每一段各自的結果」，每筆帶一個 index 對應它是第幾段輸入
     # 照 index 排好再取向量，保證第 i 個向量一定對應第 i 段文字
     return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
@@ -173,7 +201,11 @@ def embed_texts(
 
 # 何時呼叫：qa_service 把使用者的問題轉成向量，拿去跟 chunk 比相似度
 # deadline：整個問答共用的截止時間（qa_service 算好傳進來）
-def embed_query(text: str, deadline: float | None = None) -> list[float]:
+def embed_query(
+    text: str,
+    deadline: float | None = None,
+    on_usage: Callable[[Usage], None] | None = None,
+) -> list[float]:
     def call(timeout: float):
         return client.with_options(timeout=timeout).embeddings.create(
             model=EMBEDDING_MODEL, input=text
@@ -187,12 +219,18 @@ def embed_query(text: str, deadline: float | None = None) -> list[float]:
         give_up_on_long_wait=True,
         deadline=deadline,
     )
+    _report_embedding_usage(response, on_usage)
     return response.data[0].embedding
 
 
 # 何時呼叫：qa_service 把問題跟搜到的 chunk 內容組成 context 之後，丟給 LLM 生成答案
 # system 那句話是強制「只能照資料回答，答不出來要老實說」防止 LLM 亂編答案
-def generate_answer(question: str, context: str, deadline: float | None = None) -> str:
+def generate_answer(
+    question: str,
+    context: str,
+    deadline: float | None = None,
+    on_usage: Callable[[Usage], None] | None = None,
+) -> str:
     def call(timeout: float):
         return client.with_options(timeout=timeout).chat.completions.create( # 對話生成的功能
             model=GENERATION_MODEL,
@@ -218,4 +256,13 @@ def generate_answer(question: str, context: str, deadline: float | None = None) 
         give_up_on_long_wait=True,
         deadline=deadline,
     )
+    if on_usage is not None:
+        # prompt_tokens：送進去的（問題 + 資料 + 規則）；completion_tokens：生成出來的答案
+        on_usage(Usage(GENERATION_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens))
     return response.choices[0].message.content # 選擇第一個候選回應(一個問題可能有好幾種回應)
+
+
+# embedding 的回應只有輸入的 token 數（沒有生成任何文字）
+def _report_embedding_usage(response, on_usage: Callable[[Usage], None] | None) -> None:
+    if on_usage is not None:
+        on_usage(Usage(EMBEDDING_MODEL, response.usage.prompt_tokens))

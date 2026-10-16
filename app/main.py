@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
 
-from app.api import auth, documents, qa, workspaces
+from app.api import auth, documents, qa, usage, workspaces
 from app.core import log
 
 log.setup()
@@ -63,6 +63,7 @@ app.include_router(auth.router)
 app.include_router(workspaces.router)
 app.include_router(documents.router)
 app.include_router(qa.router)
+app.include_router(usage.router)
 
 
 # 跟三個功能無關，單純檢查伺服器有沒有活著用的
