@@ -1,7 +1,7 @@
 # auth 的 endpoint：register / login / me
 # 這層只做 HTTP：驗 body(schema)、呼叫 service、把結果 / 錯誤翻成 HTTP 回應
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -47,6 +47,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 # FastAPI dependency：從 Authorization header 取 token → 解出 user id → 撈出 User
 # 需要登入的 endpoint 加 Depends(get_current_user) 就會自動先跑這個
 def get_current_user(
+    request: Request,
     creds: HTTPAuthorizationCredentials = Depends(bearer),
     db: Session = Depends(get_db),
 ) -> User:
@@ -56,6 +57,8 @@ def get_current_user(
     user = user_repo.get_user_by_id(db, int(user_id))
     if user is None:
         raise HTTPException(status_code=401, detail="user not found")
+    # 記下是誰發的請求，main.py 寫 request log 時會拿來用（docs/decisions/010）
+    request.state.user_id = user.id
     return user
 
 

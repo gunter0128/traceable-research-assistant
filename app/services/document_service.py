@@ -3,6 +3,9 @@
 
 import contextlib
 import io
+import logging
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -10,7 +13,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
-from app.core import chunker, openai_client, pdf_parser, s3_client, sqs_client
+from app.core import chunker, log, openai_client, pdf_parser, s3_client, sqs_client
 from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models.document import Document
@@ -93,10 +96,12 @@ class _Lease:
 
     # done / total：順便更新進度。租約不是自己的了就丟 LeaseLost
     def beat(self, done: int | None = None, total: int | None = None) -> None:
-        # with SessionLocal() as db：開一條獨立的 session，區塊結束自動關掉
-        with SessionLocal() as db:
-            if not document_repo.heartbeat(db, self.document_id, self.token, done, total):
-                raise LeaseLost
+        # 每次報平安都記花多久：報平安要連到資料庫（在新加坡），想知道它在總處理時間裡佔多少
+        with log.timed("heartbeat", done=done):
+            # with SessionLocal() as db：開一條獨立的 session，區塊結束自動關掉
+            with SessionLocal() as db:
+                if not document_repo.heartbeat(db, self.document_id, self.token, done, total):
+                    raise LeaseLost
 
 
 def list_documents(db: Session, workspace_id: int, owner_id: int) -> list[Document]:
@@ -125,7 +130,10 @@ def upload_document(
     # "documents/" 這個前綴只是 S3 key 裡的字串，不是真的資料夾，純粹方便之後找東西
     key = f"{STORAGE_PREFIX}{uuid4().hex}_{file.filename}"
     # file.file.read() 把上傳內容讀出來變成一包 bytes (file 是 UploadFile 這個物件 .file 是它裡面裝真正內容的屬性)
-    s3_client.upload_file(key, file.file.read())
+    content = file.file.read()
+    # 只記大小，不記檔名：檔名可能就透露研究內容（docs/decisions/010）
+    with log.timed("s3_upload", size_bytes=len(content)):
+        s3_client.upload_file(key, content)
 
     # S3 和資料庫沒辦法包在同一個 transaction 裡（見 docs/decisions/006）
     # 先存 S3 再建紀錄：中途失敗只會留下沒人用的檔案（無害），不會留下指向不存在檔案的紀錄（有害）
@@ -138,6 +146,8 @@ def upload_document(
         with contextlib.suppress(s3_client.StorageError):
             s3_client.delete_file(key)
         raise
+    log.bind_document(document.id)
+    log.event("uploaded")
     return dispatch_document(db, document)
 
 
@@ -146,6 +156,7 @@ def upload_document(
 # 本機（沒設定 SQS）：直接在這裡處理完才回傳
 def dispatch_document(db: Session, document: Document) -> Document:
     if settings.sqs_queue_url is None:
+        log.event("dispatched", mode="inline")
         return process_document(db, document)
 
     # 先記時間再送：送出去之後 Lambda 可能馬上就處理完了，順序反過來的話時間會記在處理完之後
@@ -154,8 +165,10 @@ def dispatch_document(db: Session, document: Document) -> Document:
         sqs_client.send_process_message(document.id)
     # BotoCoreError：連不上 AWS（網路、憑證）；ClientError：AWS 回錯誤（沒權限、佇列不存在）
     except (BotoCoreError, ClientError):
+        log.event("dispatch_failed", logging.ERROR, exc_info=True)
         # 工單送不出去 = 沒有人會處理這份文件，直接標失敗讓使用者知道，可以手動重試
         return document_repo.mark_failed(db, document, "排入處理佇列失敗，可以重試")
+    log.event("dispatched", mode="queue")
     return document
 
 
@@ -164,6 +177,8 @@ def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     document = get_owned_document(db, document_id, owner_id)
     if document.status not in ("failed", "cancelled"):
         raise DocumentNotRetryable
+    log.bind_document(document.id)
+    log.event("retry_requested", previous_status=document.status)
     document_repo.reset_for_retry(db, document)
     return dispatch_document(db, document)
 
@@ -176,6 +191,8 @@ def cancel_document(db: Session, document_id: int, owner_id: int) -> Document:
     # 查和改之間，Lambda 可能剛好處理完，先查再改會把「已完成」的文件誤改成「已取消」
     if not document_repo.cancel(db, document_id):
         raise DocumentNotCancellable
+    log.bind_document(document_id)
+    log.event("cancelled")
     document = document_repo.get_by_id(db, document_id)
     db.refresh(document)
     return document
@@ -193,7 +210,7 @@ def expire_overdue_documents(db: Session) -> int:
 #   排隊中，送出工單超過 15 分鐘還沒人開始處理 → 「處理逾時，請按重試」
 def _expire_overdue(db: Session, document_id: int | None = None, workspace_id: int | None = None) -> int:
     now = datetime.now(timezone.utc)
-    return document_repo.expire_overdue(
+    expired = document_repo.expire_overdue(
         db,
         heartbeat_before=now - HEARTBEAT_TIMEOUT,
         queued_before=now - QUEUE_TIMEOUT,
@@ -202,20 +219,28 @@ def _expire_overdue(db: Session, document_id: int | None = None, workspace_id: i
         document_id=document_id,
         workspace_id=workspace_id,
     )
+    # 有文件被判定卡住，代表某個 Lambda 死掉了或工單不見了，是要注意的事（WARNING）
+    if expired:
+        log.event("expired_overdue", logging.WARNING, count=expired, workspace_id=workspace_id)
+    return expired
 
 
 # 抓 PDF 文字 → 切段 → 每段轉向量 → 存進 chunks 表 → 更新 document 狀態
 # 整份文件是一個 transaction：全部成功才一起生效，中途任何一步失敗就整批丟掉，不會留下半套 chunk
 # 開始前要先取得租約（docs/decisions/008）：同一份文件同時只能有一個 Lambda 在處理，處理中一直報平安
 def process_document(db: Session, document: Document) -> Document:
+    log.bind_document(document.id)
+    started = time.perf_counter()
     token = uuid4().hex
     stale_before = datetime.now(timezone.utc) - HEARTBEAT_TIMEOUT
     # 搶不到租約：別人正在處理、文件已經處理完 / 失敗了（重複的工單），什麼都不做
     if not document_repo.claim(db, document.id, token, stale_before):
         db.refresh(document)
+        log.event("claim_skipped", status=document.status)
         return document
     db.refresh(document)  # 拿到租約的同時次數 +1 了，重新讀一次
     lease = _Lease(document.id, token)
+    log.event("claimed", attempt=document.attempts)
 
     # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、使用者重試），統一在這裡擋
     if document.attempts > MAX_ATTEMPTS:
@@ -223,30 +248,45 @@ def process_document(db: Session, document: Document) -> Document:
 
     try:
         # document.storage_path 現在存的是 S3 key，不是本機路徑，要先把內容抓下來
-        content = s3_client.download_file(document.storage_path)
+        with log.timed("downloaded") as fields:
+            content = s3_client.download_file(document.storage_path)
+            # 執行完才知道檔案多大，中途補進這筆 log 的欄位
+            fields["size_bytes"] = len(content)
         # pdf_parser.extract_text 要的是一個「檔案物件」，io.BytesIO 把一包 bytes 包裝成檔案物件，
         # 跟上傳那邊 file.file（UploadFile 的底層）是同一種東西
-        text = pdf_parser.extract_text(io.BytesIO(content), max_pages=MAX_PAGES)
+        with log.timed("parsed") as fields:
+            text = pdf_parser.extract_text(io.BytesIO(content), max_pages=MAX_PAGES)
+            fields["chars"] = len(text)
         # 沒出錯不代表結果合理：抓不到任何字的話，存 0 段 chunk 然後標「完成」會誤導使用者
         if not text:
             raise NoExtractableText
-        pieces = chunker.chunk_text(text)
+        with log.timed("chunked") as fields:
+            pieces = chunker.chunk_text(text)
+            fields["chunks"] = len(pieces)
         lease.beat(done=0, total=len(pieces))
         # 先清掉這份文件舊的 chunk：同一份文件處理兩次（重試）結果跟處理一次一樣，不會變兩倍
         chunk_repo.delete_for_document(db, document.id)
         # 一批一批送去轉向量：range(0, 總段數, 100) → 0、100、200……，每次切出 100 段
         for start in range(0, len(pieces), EMBED_BATCH_SIZE):
             batch = pieces[start : start + EMBED_BATCH_SIZE]
-            # on_attempt=lease.beat：每次呼叫 OpenAI 之前（包括重試）都報一次平安
-            embeddings = openai_client.embed_texts(batch, on_attempt=lease.beat)
-            # zip：把兩個 list 一對一配對；strict=True 代表兩邊長度不一樣就直接報錯，不會默默少存幾段
-            for offset, (piece, embedding) in enumerate(zip(batch, embeddings, strict=True)):
-                chunk_repo.create(db, document.id, start + offset, piece, embedding)
+            with log.timed("embed_batch", batch=start // EMBED_BATCH_SIZE + 1, chunks=len(batch)) as fields:
+                fields["openai_attempts"] = 0
+
+                # 每次呼叫 OpenAI 之前（包括重試）都報一次平安，順便數這一批試了幾次
+                def on_attempt():
+                    fields["openai_attempts"] += 1
+                    lease.beat()
+
+                embeddings = openai_client.embed_texts(batch, on_attempt=on_attempt)
+                # zip：把兩個 list 一對一配對；strict=True 代表兩邊長度不一樣就直接報錯，不會默默少存幾段
+                for offset, (piece, embedding) in enumerate(zip(batch, embeddings, strict=True)):
+                    chunk_repo.create(db, document.id, start + offset, piece, embedding)
             lease.beat(done=start + len(batch))
-    # 租約已經不是自己的了：別人接手了，或被判定中斷。這次寫的全部丟掉，不碰文件狀態（不是自己的了）
+    # 租約已經不是自己的了：別人接手了、被判定中斷、或使用者取消了。這次寫的全部丟掉，不碰文件狀態（不是自己的了）
     except LeaseLost:
         db.rollback()
         db.refresh(document)
+        log.event("lease_lost", logging.WARNING, status=document.status, total_ms=log.elapsed_ms(started))
         return document
     # 認得出來的錯誤：給使用者明確的原因，讓他知道該換檔案還是可以重試
     except pdf_parser.UnreadablePdf:
@@ -269,10 +309,15 @@ def process_document(db: Session, document: Document) -> Document:
     # 刻意接住所有錯誤（noqa 告訴 ruff 這是故意的）：上面認得的錯誤都分類處理過了，
     # 這裡是最後一道防線，確保不管發生什麼事，文件都會被標成失敗，不會卡在處理中
     except Exception:  # noqa: BLE001
+        # 給使用者的訊息很籠統，所以 log 裡一定要留完整的錯誤堆疊，不然事後完全不知道發生什麼事
+        log.event("unexpected_error", logging.ERROR, exc_info=True)
         return _fail(db, document, lease, "處理時發生錯誤，可以稍後重試")
 
     # 「所有新 chunk + 狀態改成完成」在同一刻一起生效；租約已經不是自己的了，就整批丟掉
-    document_repo.finish_processed(db, document.id, token)
+    if document_repo.finish_processed(db, document.id, token):
+        log.event("processed", chunks=len(pieces), total_ms=log.elapsed_ms(started))
+    else:
+        log.event("lease_lost", logging.WARNING, total_ms=log.elapsed_ms(started))
     db.refresh(document)
     return document
 
@@ -292,6 +337,7 @@ def _defer_or_fail(db: Session, document: Document, lease: _Lease, service: str)
     if document_repo.defer_with_lease(
         db, document.id, lease.token, f"{service}暫時無法使用，稍後會自動重試"
     ):
+        log.event("deferred", logging.WARNING, service=service, attempt=document.attempts)
         raise RetryLater
     db.refresh(document)
     return document
@@ -300,6 +346,13 @@ def _defer_or_fail(db: Session, document: Document, lease: _Lease, service: str)
 # 處理失敗的收尾：rollback 把這次還沒 commit 的東西（刪掉的舊 chunk、新加的 chunk）全部撤回，再標失敗
 # 一樣要租約還是自己的才標，不然會蓋掉接手的 Lambda 的狀態
 def _fail(db: Session, document: Document, lease: _Lease, reason: str) -> Document:
+    # sys.exc_info()[1]：目前正在處理的例外（_fail 大多是在 except 裡被呼叫的），記下是哪一種錯誤造成的
+    # reason 是給使用者看的中文訊息，error_type 是給自己查的（例如 OpenAIPermanentError）
+    error = sys.exc_info()[1]
+    log.event(
+        "failed", logging.WARNING, reason=reason, attempt=document.attempts,
+        error_type=type(error).__name__ if error else None,
+    )
     db.rollback()
     document_repo.fail_with_lease(db, document.id, lease.token, reason)
     db.refresh(document)

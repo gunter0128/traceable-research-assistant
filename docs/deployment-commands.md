@@ -342,6 +342,44 @@ Lambda 的 log 在 CloudWatch 的 `/aws/lambda/trace-app-worker`、`/aws/lambda/
 
 ---
 
+## CloudWatch Logs：log 保留天數（C1，2026-10-16）
+
+CloudWatch 預設永久保留 log，費用會一直累積。三個 log group 都設成保留 30 天（見 [decisions/010](decisions/010-結構化-log.md)）：
+
+```bash
+aws logs put-retention-policy --log-group-name /ecs/trace-app --retention-in-days 30 --region ap-southeast-2
+aws logs put-retention-policy --log-group-name /aws/lambda/trace-app-worker --retention-in-days 30 --region ap-southeast-2
+aws logs put-retention-policy --log-group-name /aws/lambda/trace-app-sweeper --retention-in-days 30 --region ap-southeast-2
+```
+
+確認（`retentionInDays` 應該是 30）：
+
+```bash
+aws logs describe-log-groups --log-group-name-prefix /aws/lambda/trace-app --region ap-southeast-2 --query "logGroups[].[logGroupName,retentionInDays]"
+aws logs describe-log-groups --log-group-name-prefix /ecs/trace-app --region ap-southeast-2 --query "logGroups[].[logGroupName,retentionInDays]"
+```
+
+### 查詢範例（CloudWatch 主控台 → Logs Insights）
+
+選好 log group 之後貼上查詢。log 是 JSON，欄位可以直接用。
+
+一份文件的完整經歷（API 和 worker 兩個 log group 一起選）：
+
+```
+fields @timestamp, event, duration_ms, reason
+| filter document_id = 42
+| sort @timestamp asc
+```
+
+各步驟平均花多久：
+
+```
+filter ispresent(duration_ms)
+| stats count(*), avg(duration_ms), max(duration_ms) by event
+```
+
+---
+
 ## 前端：本機開發環境建置
 
 `frontend/` 是獨立的 React 專案（Vite + TypeScript + Tailwind CSS v4 + shadcn/ui 風格的元件），跟 `app/` 的 Python 環境完全分開。新電腦要接手，裝好 Node.js 之後（見本文件最上面的前置工具表），跑：

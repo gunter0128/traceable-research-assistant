@@ -3,6 +3,7 @@
 
 import json
 
+from app.core import log
 from app.core.aws_clients import make_client
 from app.core.config import settings
 
@@ -10,13 +11,16 @@ from app.core.config import settings
 client = make_client("sqs")
 
 
-# 何時呼叫：document_service 把文件交出去處理時（上傳、手動重試、定期掃描重送）
+# 何時呼叫：document_service 把文件交出去處理時（上傳、手動重試）
 # 工單內容只放 document_id，worker 拿到後自己去資料庫查其他資料
+# 再帶上這次請求的編號（docs/decisions/010）：Lambda 寫 log 時沿用它，「上傳」和「背景處理」的 log 才串得起來
 def send_process_message(document_id: int) -> None:
     # json.dumps：把 dict 轉成 JSON 字串，SQS 的訊息內容只能是字串
     client.send_message(
         QueueUrl=settings.sqs_queue_url,
-        MessageBody=json.dumps({"document_id": document_id}),
+        MessageBody=json.dumps(
+            {"document_id": document_id, "request_id": log.request_id_var.get()}
+        ),
     )
 
 

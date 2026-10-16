@@ -23,4 +23,5 @@ EXPOSE 8000
 # 容器啟動時真正執行的指令
 # --host 0.0.0.0 不能省：本機開發預設只聽 127.0.0.1（只有自己連得到），
 # 但容器裡的 request 是從外面進來的，要聽 0.0.0.0 才會接受外部連線
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --no-access-log：關掉 uvicorn 自己的純文字請求紀錄，改由 main.py 寫 JSON 格式的（docs/decisions/010）
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

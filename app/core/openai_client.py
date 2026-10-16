@@ -5,6 +5,7 @@
 #      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法在重試之間報平安、也沒辦法控制總時間
 # 分類完怎麼處理（延後、標失敗、回 503）由呼叫的 service 決定，這裡不管
 
+import logging
 import random
 import time
 from collections.abc import Callable
@@ -13,6 +14,7 @@ from typing import TypeVar
 import openai
 from openai import OpenAI
 
+from app.core import log
 from app.core.config import settings
 
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -123,7 +125,7 @@ def _with_retries(
             # 永久性錯誤：試幾次都一樣，直接丟出去
             if isinstance(error, OpenAIPermanentError) or attempt == attempts - 1:
                 raise error from exc
-            wait = _retry_after_seconds(exc)
+            retry_after = wait = _retry_after_seconds(exc)
             if wait is None:
                 wait = _backoff_seconds(attempt)
             elif wait > max_wait:
@@ -132,6 +134,13 @@ def _with_retries(
                 wait = max_wait
             if deadline is not None and time.monotonic() + wait >= deadline:
                 raise error from exc
+            # 每次重試記一筆：事後才看得出 OpenAI 多常出問題、出的是哪種問題、OpenAI 有沒有叫我們等
+            log.event(
+                "openai_retry", logging.WARNING,
+                attempt=attempt + 1, error=type(exc).__name__,
+                status_code=getattr(exc, "status_code", None),
+                retry_after=retry_after, wait_seconds=round(wait, 2),
+            )
             time.sleep(wait)
     # 迴圈一定會在裡面 return 或 raise，走不到這裡；寫出來讓型別檢查知道
     raise OpenAITemporaryError("重試次數用完了")

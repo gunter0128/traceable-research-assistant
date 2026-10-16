@@ -1,11 +1,12 @@
 # 問答的流程：確認 workspace 是你的 → 問題轉向量 → 搜相關 chunk → 組 context 丟給 LLM → 整理成答案 + 引用來源
 # 不寫 SQL 不碰 HTTP
 
+import logging
 import time
 
 from sqlalchemy.orm import Session
 
-from app.core import openai_client
+from app.core import log, openai_client
 from app.repositories import chunk_repo
 from app.schemas.qa import AskResponse, CitationOut
 from app.services import workspace_service
@@ -30,15 +31,24 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResp
 
     # 整個問答共用 60 秒的時間預算（docs/decisions/008）：轉向量跟生成答案各自的重試加起來，也不會超過
     deadline = time.monotonic() + ANSWER_BUDGET_SECONDS
+    # 每一段各記花多久，回答「問答慢在哪」（docs/decisions/010）
+    # 問題只記字數、不記內容：使用者的問題可能是未發表的研究
     try:
-        query_embedding = openai_client.embed_query(question, deadline=deadline)
-        chunks = chunk_repo.search_similar(db, workspace_id, query_embedding)
-        answer = openai_client.generate_answer(question, _build_context(chunks), deadline=deadline)
+        with log.timed("qa_embed", question_chars=len(question)):
+            query_embedding = openai_client.embed_query(question, deadline=deadline)
+        with log.timed("qa_search") as fields:
+            chunks = chunk_repo.search_similar(db, workspace_id, query_embedding)
+            fields["chunks"] = len(chunks)
+        with log.timed("qa_generate") as fields:
+            answer = openai_client.generate_answer(question, _build_context(chunks), deadline=deadline)
+            fields["answer_chars"] = len(answer or "")
     # openai_client 已經做完秒級重試了，走到這裡代表重試也沒用
     # from None：不把 OpenAI 原本的錯誤接在後面，API 層只需要知道是哪一種
     except openai_client.OpenAITemporaryError:
+        log.event("qa_failed", logging.WARNING, error_type="temporary")
         raise AIServiceUnavailable from None
     except openai_client.OpenAIPermanentError:
+        log.event("qa_failed", logging.ERROR, error_type="permanent")
         raise AIServiceMisconfigured from None
 
     # 簡單版 citation：這次搜到、丟給 LLM 的 chunk 全部算數 不檢查答案有沒有每段都真的用到
