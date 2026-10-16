@@ -213,6 +213,8 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
 
 ## V2（部署到 AWS）—— 已完成
 
+> 這一段記的是最早的部署方式（API 跑在 ECS）。2026-10-16 全部從雪梨搬到新加坡、2026-10-17 API 改用 Lambda 並刪掉 ECS，現在的架構見下面的「目前的部署架構（C4）」。
+
 **方向**（2026-09-22 決定，考量點是求職含金量，不是最快能動）：雲端只選 AWS 一家，不跨雲混用。物件儲存用 S3、跑程式碼用 ECS + Fargate（容器化、免管伺服器）。詳細的指令跟每個資源的用途，記在 [`docs/deployment-commands.md`](deployment-commands.md)，這裡只記整體進度跟架構決定。
 
 **目前狀態（2026-10-06）**：
@@ -236,6 +238,51 @@ client  POST /workspaces/9/ask {"question": "這篇論文評估了哪些資料�
 **部署的公有 IP 是浮動的**：每次任務重啟，IP 會換，不是固定網址。之後若要固定網址，需要加 Load Balancer，先不做（不是這階段的必要項目）。
 
 **運作期間持續在計費**：Fargate 是只要任務在跑就按秒計費，不是按請求計費，跟 OpenAI 那種用量計費不一樣。不用的時候記得把 Service 的 Desired tasks 調成 0，不然會持續燒 AWS 的 $200 額度。**目前 Desired tasks 是 0**（端到端測試過一輪、確認部署的版本能正常跑完 register → login → 建 workspace → 上傳 PDF → 問答全流程之後，手動關掉省錢）。要重新測試，照 `docs/deployment-commands.md` 的「套用新版本」那段把 Desired tasks 調回 1 即可，不用重建任何東西。
+
+---
+
+## 目前的部署架構（C4，2026-10-17）
+
+全部在新加坡（ap-southeast-1），跟 Neon 資料庫同一個區域（[decisions/011](decisions/011-搬到新加坡.md)）。API 從 ECS 改成 Lambda，前面用 CloudFront 合成一個固定的 HTTPS 網址（[decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）：
+
+```
+                    CloudFront（https://dpozdeau5nd0p.cloudfront.net）
+                    ┌──────────┴──────────┐
+              網頁畫面                    API 請求（/auth、/workspaces、/documents、/usage）
+                 │                          │
+           S3（前端檔案）            Lambda：trace-app-api（FastAPI + Mangum）
+                                            │
+               使用者的瀏覽器 ──直接上傳──→ S3（PDF）
+                                            │
+                                    SQS → Lambda：trace-app-worker
+                                            │
+                     每小時排程 → Lambda：trace-app-sweeper
+                                            │
+                                  Neon 資料庫（新加坡）
+```
+
+| 元件 | 用途 |
+|---|---|
+| CloudFront | 固定的 HTTPS 網址；依路徑把請求轉給 API 或前端；快取前端檔案 |
+| S3（前端） | `npm run build` 產生的靜態檔案，只有 CloudFront 能讀 |
+| Lambda：trace-app-api | 同一份 FastAPI 程式碼，用 Mangum 轉接 Lambda 的事件格式（`app/lambda_api.py`） |
+| S3（PDF） | 使用者的 PDF。瀏覽器拿 API 發的上傳許可直接傳上來，不經過 API |
+| SQS + Lambda：trace-app-worker | 背景處理文件（A2） |
+| Lambda：trace-app-sweeper | 每小時把卡住的文件標失敗、清孤兒檔案（007、006） |
+| Secrets Manager | 資料庫網址、JWT 密鑰、OpenAI key，Lambda 啟動時讀取 |
+| CloudWatch Logs | 三個 Lambda 的結構化 log，保留 30 天（010） |
+
+三個 Lambda 用同一份 Docker image，只是啟動時呼叫的函式不同。整條線上沒有需要一直開著的機器，沒人用的時候幾乎不花錢。
+
+上傳的流程（Lambda 一次只能收 6 MB，上限是 20 MB，所以檔案不經過 API）：
+
+```
+① 前端 → POST /workspaces/{id}/uploads {檔名, 大小} → API 檢查後回傳上傳許可（presigned POST）
+② 前端 → 直接 POST 檔案到 S3（S3 依許可上的條件檢查大小、位置、期限）
+③ 前端 → POST /workspaces/{id}/documents {key, 檔名} → API 確認檔案在 S3 上，建紀錄、送工單
+```
+
+部署指令見 [deployment-commands.md](deployment-commands.md) 的「從零建立整套環境」和「每次發布新版本」。
 
 ---
 

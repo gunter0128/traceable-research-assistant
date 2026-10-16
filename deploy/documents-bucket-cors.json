@@ -2,7 +2,7 @@
   "CORSRules": [
     {
       "AllowedOrigins": [
-        "https://<CLOUDFRONT_DOMAIN>",
+        "https://dpozdeau5nd0p.cloudfront.net",
         "http://localhost:5173"
       ],
       "AllowedMethods": [

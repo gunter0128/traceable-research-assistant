@@ -14,11 +14,11 @@
         "S3OriginConfig": {
           "OriginAccessIdentity": ""
         },
-        "OriginAccessControlId": "<OAC_ID>"
+        "OriginAccessControlId": "E3M4WGLQFQ44BX"
       },
       {
         "Id": "api",
-        "DomainName": "<FUNCTION_URL_DOMAIN>",
+        "DomainName": "xv4y55f3etpl3mnn2ax2h75k3m0iubtq.lambda-url.ap-southeast-1.on.aws",
         "CustomOriginConfig": {
           "HTTPPort": 80,
           "HTTPSPort": 443,

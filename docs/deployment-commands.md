@@ -80,9 +80,19 @@ aws sts get-caller-identity
 
 ## 從零建立整套環境（全部用 CLI）
 
-2026-10-16 從雪梨搬到新加坡時（見 [decisions/011](decisions/011-搬到新加坡.md)），整套用下面的指令重建一次。下面幾個段落記的是當初在雪梨一個一個建的過程（有些在主控台點），概念說明比較詳細；**要重建的話照這一段做就好**。
+現在的架構（2026-10-17 起，見 [decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）：
 
-前提：IAM 角色（`trace-app-execution-role`、`trace-app-task-role`、`trace-app-worker-role`）已經存在。IAM 是全球共用的，換區域不用重建，只要更新權限內容（4-2）。
+```
+CloudFront（https://dpozdeau5nd0p.cloudfront.net）
+  ├─ /auth/*、/workspaces*、/documents/*、/usage/*、/docs → Lambda：trace-app-api（Function URL）
+  └─ 其他 → S3：前端檔案
+瀏覽器 ──直接上傳──→ S3：PDF
+SQS → Lambda：trace-app-worker；每小時排程 → Lambda：trace-app-sweeper
+```
+
+三個 Lambda 用同一份 Docker image，只是啟動設定（`deploy/*-image-config.json`）不同。整條線上沒有需要一直開著的機器，**沒人用的時候不用關任何東西**。
+
+這一段是 2026-10-16 搬到新加坡（[decisions/011](decisions/011-搬到新加坡.md)）、2026-10-17 改成 Lambda API 時實際跑過的指令整理。下面其他段落是當初在雪梨一個一個建的過程（包含已經不用的 ECS），概念說明比較詳細，**要重建的話照這一段做就好**。`deploy/` 裡的檔案寫死了區域、bucket 名稱、網址，換區域或重建時要先改。
 
 在專案資料夾、PowerShell 裡跑。開新視窗都要先設這三個變數：
 
@@ -111,58 +121,93 @@ docker push "${REPO}:latest"
 foreach ($name in "database-url", "secret-key", "openai-api-key") { $value = aws secretsmanager get-secret-value --secret-id "trace-app/$name" --region <舊區域> --query SecretString --output text; aws secretsmanager create-secret --name "trace-app/$name" --secret-string $value --region $REGION --query Name --output text }
 ```
 
-### 3. S3
+### 3. S3（放 PDF）
 
 ```powershell
 $BUCKET = "traceable-research-assistant-$ACCOUNT-$REGION"
 aws s3api create-bucket --bucket $BUCKET --region $REGION --create-bucket-configuration LocationConstraint=$REGION
 ```
 
-`LocationConstraint` 不寫的話會建在美國。新 bucket 預設擋掉所有公開存取、自動加密。搬家時再用 `aws s3 sync s3://舊bucket/documents/ s3://$BUCKET/documents/ --source-region <舊區域> --region $REGION` 把檔案複製過來。
+`LocationConstraint` 不寫的話會建在美國。新 bucket 預設擋掉所有公開存取、自動加密。搬家時再用 `aws s3 sync s3://舊bucket/documents/ s3://$BUCKET/documents/ --source-region <舊區域> --region $REGION` 把檔案複製過來。允許瀏覽器直接上傳的 CORS 設定在第 7 步（要等 CloudFront 的網址）。
 
-### 4. SQS + IAM 權限
-
-`deploy/` 裡的檔案寫死了區域和 bucket 名稱，換區域要先改。
+### 4. SQS + IAM
 
 ```powershell
 aws sqs create-queue --queue-name trace-app-documents-dlq --attributes file://deploy/sqs-dlq-attributes.json --region $REGION
 aws sqs create-queue --queue-name trace-app-documents-queue --attributes file://deploy/sqs-queue-attributes.json --region $REGION
-aws iam put-role-policy --role-name trace-app-execution-role --policy-name SecretsAccessForTraceApp --policy-document file://deploy/execution-role-secrets-policy.json
-aws iam put-role-policy --role-name trace-app-task-role --policy-name S3AccessForTraceAppTaskRole --policy-document file://deploy/api-task-s3-policy.json
-aws iam put-role-policy --role-name trace-app-task-role --policy-name trace_app_api_send_to_queue --policy-document file://deploy/api-task-sqs-policy.json
+
+aws iam create-role --role-name trace-app-worker-role --assume-role-policy-document file://deploy/lambda-trust-policy.json --query "Role.RoleName"
+aws iam attach-role-policy --role-name trace-app-worker-role --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 aws iam put-role-policy --role-name trace-app-worker-role --policy-name trace_app_worker_permissions --policy-document file://deploy/lambda-permissions-policy.json
+
+aws iam create-role --role-name trace-app-api-role --assume-role-policy-document file://deploy/lambda-trust-policy.json --query "Role.RoleName"
+aws iam attach-role-policy --role-name trace-app-api-role --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+aws iam put-role-policy --role-name trace-app-api-role --policy-name trace_app_api_permissions --policy-document file://deploy/api-lambda-permissions-policy.json
+
 aws iam create-policy-version --policy-arn "arn:aws:iam::${ACCOUNT}:policy/S3AccessForTraceApp" --policy-document file://deploy/local-dev-s3-policy.json --set-as-default
 ```
 
-DLQ 要先建，主佇列的設定裡要指向它。最後一行是本機開發用的 `trace-app-s3` 帳號的權限（managed policy，改它要新增版本；最多 5 個版本，滿了要先刪舊的）。
+- DLQ 要先建，主佇列的設定裡要指向它
+- IAM 是全球共用的：只是換區域的話角色不用重建，只要 `put-role-policy` 更新權限內容
+- API 和 worker 各一個角色：API 要能「上傳檔案」（才能簽上傳許可），worker 要能「從 SQS 拿工單」，各給各的
+- 最後一行是本機開發用的 `trace-app-s3` 帳號的權限（managed policy，改它要新增版本；最多 5 個版本，滿了要先刪舊的）
+- 新建的角色要等約 10 秒才能給 Lambda 用，太快建 Lambda 會出現「無法使用這個角色」，再跑一次就好
 
-### 5. log group、API、Lambda、排程
+### 5. 三個 Lambda、觸發、排程
 
 ```powershell
-foreach ($group in "/ecs/trace-app", "/aws/lambda/trace-app-worker", "/aws/lambda/trace-app-sweeper") { aws logs create-log-group --log-group-name $group --region $REGION; aws logs put-retention-policy --log-group-name $group --retention-in-days 30 --region $REGION }
+foreach ($name in "api", "worker", "sweeper") { aws logs create-log-group --log-group-name "/aws/lambda/trace-app-$name" --region $REGION; aws logs put-retention-policy --log-group-name "/aws/lambda/trace-app-$name" --retention-in-days 30 --region $REGION }
 
-aws ecs register-task-definition --cli-input-json file://deploy/task-definition.json --region $REGION --query "taskDefinition.revision"
-aws ecs create-cluster --cluster-name trace-app-cluster --region $REGION --query "cluster.status"
-$SG = aws ec2 create-security-group --group-name trace-app-sg --description "trace-app API port 8000" --vpc-id <預設 VPC> --region $REGION --query GroupId --output text
-aws ec2 authorize-security-group-ingress --group-id $SG --protocol tcp --port 8000 --cidr 0.0.0.0/0 --region $REGION --query "Return"
-aws ecs create-service --cluster trace-app-cluster --service-name trace-app-service --task-definition trace-app --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[<子網路1>,<子網路2>,<子網路3>],securityGroups=[$SG],assignPublicIp=ENABLED}" --region $REGION --query "service.status"
-
+aws lambda create-function --function-name trace-app-api --package-type Image --code "ImageUri=${REPO}:latest" --role "arn:aws:iam::${ACCOUNT}:role/trace-app-api-role" --memory-size 1024 --timeout 60 --image-config file://deploy/api-lambda-image-config.json --environment file://deploy/lambda-environment.json --region $REGION --query "State"
 aws lambda create-function --function-name trace-app-worker --package-type Image --code "ImageUri=${REPO}:latest" --role "arn:aws:iam::${ACCOUNT}:role/trace-app-worker-role" --memory-size 1024 --timeout 600 --image-config file://deploy/lambda-worker-image-config.json --environment file://deploy/lambda-environment.json --region $REGION --query "State"
 aws lambda create-function --function-name trace-app-sweeper --package-type Image --code "ImageUri=${REPO}:latest" --role "arn:aws:iam::${ACCOUNT}:role/trace-app-worker-role" --memory-size 512 --timeout 120 --image-config file://deploy/lambda-sweeper-image-config.json --environment file://deploy/lambda-environment.json --region $REGION --query "State"
-aws lambda wait function-active-v2 --function-name trace-app-worker --region $REGION
-aws lambda wait function-active-v2 --function-name trace-app-sweeper --region $REGION
+foreach ($name in "api", "worker", "sweeper") { aws lambda wait function-active-v2 --function-name "trace-app-$name" --region $REGION }
 
+# API 的固定網址（Function URL），公開：API 自己有登入檢查（decisions/013）。AWS 規定兩個權限都要給
+aws lambda create-function-url-config --function-name trace-app-api --auth-type NONE --region $REGION --query "FunctionUrl"
+aws lambda add-permission --function-name trace-app-api --statement-id public-url --action lambda:InvokeFunctionUrl --principal "*" --function-url-auth-type NONE --region $REGION --query "Statement"
+aws lambda add-permission --function-name trace-app-api --statement-id public-url-invoke --action lambda:InvokeFunction --principal "*" --invoked-via-function-url --region $REGION --query "Statement"
+
+# SQS → worker；每小時 → sweeper
 aws lambda create-event-source-mapping --function-name trace-app-worker --event-source-arn "arn:aws:sqs:${REGION}:${ACCOUNT}:trace-app-documents-queue" --batch-size 1 --scaling-config MaximumConcurrency=2 --region $REGION --query "State"
 aws events put-rule --name trace-app-sweeper-hourly --schedule-expression "rate(1 hour)" --region $REGION --query "RuleArn"
 aws lambda add-permission --function-name trace-app-sweeper --statement-id eventbridge-hourly --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn "arn:aws:events:${REGION}:${ACCOUNT}:rule/trace-app-sweeper-hourly" --region $REGION --query "Statement"
 aws events put-targets --rule trace-app-sweeper-hourly --targets file://deploy/sweeper-schedule-target.json --region $REGION
 ```
 
-- 預設 VPC 和它的子網路：`aws ec2 describe-vpcs --filters Name=isDefault,Values=true --region $REGION`、`aws ec2 describe-subnets --filters Name=default-for-az,Values=true --region $REGION --query "Subnets[].SubnetId"`
 - Lambda 的 image 設定、環境變數、排程目標都放在 `deploy/` 的 JSON 檔：直接寫在指令裡的話，PowerShell 5.1 會把 JSON 的雙引號吃掉
-- `add-permission`：Lambda 預設誰都不能呼叫，要明確允許排程服務（EventBridge）呼叫 sweeper。主控台設排程時會自動做這步，CLI 要自己做
+- API 的時間上限 60 秒，跟 CloudFront 等待的上限一樣
+- 新建的 Lambda **第一次**啟動會特別慢（要先從 ECR 拉整個 image，2026-10-17 實測 14 秒，超過 10 秒的準備上限被重來一次），之後的冷啟動約 3.4 秒
+- `add-permission`：Lambda 預設誰都不能呼叫，要明確允許。主控台設排程時會自動做這步，CLI 要自己做
 
-### 6. 驗證
+### 6. 前端 + CloudFront
+
+```powershell
+aws s3api create-bucket --bucket "traceable-research-assistant-frontend-$ACCOUNT" --region $REGION --create-bucket-configuration LocationConstraint=$REGION
+cd frontend; npm run build; aws s3 sync dist "s3://traceable-research-assistant-frontend-$ACCOUNT" --delete --region $REGION; cd ..
+
+aws cloudfront create-origin-access-control --origin-access-control-config file://deploy/cloudfront-frontend-oac.json --query "OriginAccessControl.Id" --output text
+# ↑ 印出的 ID、和第 5 步印出的 Function URL 網域，填進 deploy/cloudfront-distribution.json
+aws cloudfront create-distribution --distribution-config file://deploy/cloudfront-distribution.json --query "Distribution.[Id,DomainName,Status]" --output text
+```
+
+- 前端的 bucket 不公開，CloudFront 用 OAC 這個身分讀它
+- `cloudfront-distribution.json` 是「路徑 → 轉給誰」的對照表：API 的路徑轉給 Lambda、不快取；其他轉給前端的 bucket、會快取
+- 建好之後要 5～10 分鐘才會變成 `Deployed`：`aws cloudfront get-distribution --id <ID> --query "Distribution.Status" --output text`
+
+### 7. 最後兩個權限設定
+
+把第 6 步印出的 CloudFront ID 填進 `deploy/frontend-bucket-policy.json`、網址填進 `deploy/documents-bucket-cors.json`：
+
+```powershell
+aws s3api put-bucket-policy --bucket "traceable-research-assistant-frontend-$ACCOUNT" --policy file://deploy/frontend-bucket-policy.json --region $REGION
+aws s3api put-bucket-cors --bucket "traceable-research-assistant-$ACCOUNT-$REGION" --cors-configuration file://deploy/documents-bucket-cors.json --region $REGION
+```
+
+- 前端的 bucket：只允許這一個 CloudFront 讀
+- PDF 的 bucket：允許從 CloudFront 網址和本機開發（`http://localhost:5173`）打開的網頁直接上傳（只開放 POST）
+
+### 8. 驗證
 
 ```powershell
 '{"probe": true}' | Out-File -Encoding ascii probe.json
@@ -170,7 +215,37 @@ aws lambda invoke --function-name trace-app-worker --payload fileb://probe.json 
 Get-Content out.json
 ```
 
-量 Lambda 到資料庫的速度。同區域的話，`tcp_connect_ms` 應該是個位數。
+量 Lambda 到資料庫的速度，同區域的話 `tcp_connect_ms` 應該是個位數。再用瀏覽器打開 CloudFront 的網址，登入、上傳、問答各試一次。
+
+---
+
+## 每次發布新版本
+
+改了程式之後要做的事。漏掉其中一步，各部分就會跑不同版本的程式碼（這是 C5 要自動化的東西）。
+
+**後端**（改了 `app/`、`requirements.txt`、`Dockerfile`）：
+
+```powershell
+$PASSWORD = aws ecr get-login-password --region $REGION
+docker login --username AWS --password $PASSWORD "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+docker build --platform linux/amd64 --provenance=false -t traceable-research-assistant .
+docker tag traceable-research-assistant:latest "${REPO}:latest"
+docker push "${REPO}:latest"
+foreach ($name in "api", "worker", "sweeper") { aws lambda update-function-code --function-name "trace-app-$name" --image-uri "${REPO}:latest" --region $REGION --query "LastUpdateStatus" }
+```
+
+確認 push 的最後一行有 `latest: digest: sha256:...` 才更新 Lambda。Lambda 記住的是 image 的內容指紋，不是 `:latest` 這個名字，**不更新的話會一直跑舊版**。
+
+改了資料庫的 model 的話，先跑 `alembic upgrade head`（連正式資料庫），再更新 Lambda。
+
+**前端**（改了 `frontend/`）：
+
+```powershell
+cd frontend; npm run build; aws s3 sync dist "s3://traceable-research-assistant-frontend-$ACCOUNT" --delete --region $REGION; cd ..
+aws cloudfront create-invalidation --distribution-id E2IPB9CUGG6K2W --paths "/*" --query "Invalidation.Status" --output text
+```
+
+`create-invalidation`：CloudFront 會把前端檔案暫存在各地的機房，不讓它失效的話，使用者最久一天內都還會看到舊版。
 
 ---
 
@@ -250,6 +325,8 @@ aws secretsmanager update-secret --secret-id trace-app/database-url --secret-str
 
 ## 兩個 IAM Role（透過主控台建立，不是 CLI）
 
+> 2026-10-17 起 API 改用 Lambda，ECS 已經刪除（[decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）。ECS 相關的段落保留當初的紀錄，設定檔在 git 歷史裡（commit `7f6e663`）。
+
 **`trace-app-execution-role`**——`arn:aws:iam::416113247224:role/trace-app-execution-role`
 負責「啟動容器前」的事：抓 image、讀密鑰、送 log。掛了兩份政策：
 - `AmazonECSTaskExecutionRolePolicy`（AWS 現成的，抓 image + 送 log）
@@ -264,6 +341,8 @@ aws secretsmanager update-secret --secret-id trace-app/database-url --secret-str
 ---
 
 ## Task Definition：容器的「食譜」
+
+> 2026-10-17 起 API 改用 Lambda，ECS 已經刪除（[decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）。ECS 相關的段落保留當初的紀錄，設定檔在 git 歷史裡（commit `7f6e663`）。
 
 寫在 [`deploy/task-definition.json`](../deploy/task-definition.json)，記錄「這個任務要用哪個 image、吃多少 CPU/記憶體、兩個 Role 分別是誰、環境變數跟密鑰從哪裡來、log 往哪裡送」。這份 JSON 可以直接在主控台的空白範本上填，也可以存成檔案用 CLI 註冊：
 
@@ -282,11 +361,15 @@ aws ecs describe-task-definition --task-definition trace-app --region ap-southea
 
 ## Security Group：防火牆規則
 
+> 2026-10-17 起 API 改用 Lambda，ECS 已經刪除（[decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）。ECS 相關的段落保留當初的紀錄，設定檔在 git 歷史裡（commit `7f6e663`）。
+
 透過主控台建立，叫 `trace-app-sg`。開放 inbound（外面連進來）TCP 8000 port，來源設成 `0.0.0.0/0`（任何地方都能連，因為這是公開 API，沒有另外架 VPN/內網）。outbound（容器對外連，比方說連 Neon 資料庫、呼叫 OpenAI API）預設全部放行，不用額外設定。
 
 ---
 
 ## ECS Cluster：組織容器的「資料夾」
+
+> 2026-10-17 起 API 改用 Lambda，ECS 已經刪除（[decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）。ECS 相關的段落保留當初的紀錄，設定檔在 git 歷史裡（commit `7f6e663`）。
 
 透過主控台建立，叫 `trace-app-cluster`，選 Fargate（無伺服器，不用自己管底層機器）。Cluster 本身不跑任何東西，只是把相關的 Service/Task 歸在一起管理，方便之後在主控台找。
 
@@ -297,6 +380,8 @@ aws ecs describe-clusters --clusters trace-app-cluster --region ap-southeast-1
 ---
 
 ## ECS Service：讓任務「跑起來並保持活著」
+
+> 2026-10-17 起 API 改用 Lambda，ECS 已經刪除（[decisions/013](decisions/013-固定網址與-api-改用-lambda.md)）。ECS 相關的段落保留當初的紀錄，設定檔在 git 歷史裡（commit `7f6e663`）。
 
 透過主控台建立，叫 `trace-app-service`。指向 `trace-app-cluster`、用最新的 `trace-app` Task Definition、Desired tasks 設 1、網路選預設 VPC 的三個子網路 + `trace-app-sg`、**公有 IP 設成啟用**（不然外面連不進去）。
 
