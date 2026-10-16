@@ -28,6 +28,11 @@ def create(
     return document
 
 
+# 何時呼叫：上傳完成時，確認這個 S3 檔案還沒有建過紀錄
+def exists_with_storage_path(db: Session, storage_path: str) -> bool:
+    return db.query(Document.id).filter(Document.storage_path == storage_path).first() is not None
+
+
 def delete(db: Session, document: Document) -> None:
     db.delete(document)
     db.commit()

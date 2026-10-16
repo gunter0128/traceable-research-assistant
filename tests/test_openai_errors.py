@@ -1,7 +1,6 @@
 # 呼叫 OpenAI 出錯時的處理（docs/decisions/005）：錯誤分類、文件處理延後重試、問答回 503、批次送
 # 真的 OpenAI 都換成假的函式，用丟出不同錯誤來模擬各種狀況
 
-import io
 import json
 import time
 
@@ -16,6 +15,7 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
@@ -54,11 +54,7 @@ def _auth_headers(token):
 def _upload(client, email):
     token = _register_and_login(client, email)
     ws_id = client.post("/workspaces", json={"name": "研究"}, headers=_auth_headers(token)).json()["id"]
-    response = client.post(
-        f"/workspaces/{ws_id}/documents",
-        headers=_auth_headers(token),
-        files={"file": ("doc.pdf", io.BytesIO(valid_pdf_bytes()), "application/pdf")},
-    )
+    response = upload_pdf(client, _auth_headers(token), ws_id, valid_pdf_bytes())
     return token, ws_id, response.json()["id"]
 
 

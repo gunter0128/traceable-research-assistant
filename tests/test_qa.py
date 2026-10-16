@@ -1,11 +1,11 @@
 # /ask 端點的測試：問答 + ownership。真的打 OpenAI 的部分全部 mock 掉，不花錢、結果每次都一樣
 
-import io
 
 import pytest
 
 from app.core import openai_client, s3_client
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 # autouse=True 的意思是：「不用等有人在參數列表裡點名要你，這個檔案裡每一個測試開始前，自動先跑我」
 # 所以這個 fixture 不會看到有人呼叫他
@@ -44,13 +44,7 @@ def _create_workspace(client, token, name="研究"):
 
 
 def _upload_pdf(client, token, workspace_id, text="Multi-hop retrieval is the core method"):
-    return client.post(
-        f"/workspaces/{workspace_id}/documents",
-        headers=_auth_headers(token),
-        files={
-            "file": ("thesis.pdf", io.BytesIO(valid_pdf_bytes(text)), "application/pdf") # io.BytesIO(bytes資料) 把一包 bytes包裝成一個檔案物件
-        },
-    )
+    return upload_pdf(client, _auth_headers(token), workspace_id, valid_pdf_bytes(text), "thesis.pdf")
 
 
 # 測試：沒登入不能問

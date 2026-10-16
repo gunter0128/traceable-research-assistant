@@ -1,7 +1,6 @@
 # S3 跟資料庫的一致性（docs/decisions/006）：兩邊沒辦法包在同一個 transaction 裡
 # 測的是：中途失敗時只會留下孤兒檔案（無害），不會留下壞掉的紀錄（有害）；孤兒檔案會被對帳清掉
 
-import io
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -14,6 +13,7 @@ from app.models.document import Document
 from app.repositories import document_repo
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 
 # 假的 S3：比其他測試檔多記一個「最後修改時間」，對帳要靠它判斷檔案放多久了
@@ -52,11 +52,7 @@ def _create_workspace(client, token):
 
 
 def _upload(client, token, ws_id):
-    return client.post(
-        f"/workspaces/{ws_id}/documents",
-        headers=_auth_headers(token),
-        files={"file": ("doc.pdf", io.BytesIO(valid_pdf_bytes()), "application/pdf")},
-    )
+    return upload_pdf(client, _auth_headers(token), ws_id, valid_pdf_bytes())
 
 
 def _s3_error(*args, **kwargs):
@@ -170,6 +166,8 @@ def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch, b
     token = _register_and_login(client, "erin@example.com")
     ws_id = _create_workspace(client, token)
     monkeypatch.setattr(s3_client, "download_file", _raise(s3_client.FileMissing("NoSuchKey")))
+    # 上傳完成時檔案還在（確認得到大小），處理時才不見
+    monkeypatch.setattr(s3_client, "file_size", lambda key: 100)
 
     body = _upload(client, token, ws_id).json()
 
@@ -195,11 +193,11 @@ def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch
     assert document.error_message == "儲存服務暫時無法使用，稍後會自動重試"
 
 
-# 測試：上傳時 S3 暫時連不上 → 回 503 和看得懂的訊息（以前是 500），什麼都不存
+# 測試：上傳完成、API 去 S3 確認檔案時 S3 暫時連不上 → 回 503 和看得懂的訊息（不是 500），不建紀錄
 def test_upload_returns_503_when_storage_unavailable(client, monkeypatch, bucket):
     token = _register_and_login(client, "grace@example.com")
     ws_id = _create_workspace(client, token)
-    monkeypatch.setattr(s3_client, "upload_file", _raise(s3_client.StorageTemporaryError("模擬")))
+    monkeypatch.setattr(s3_client, "file_size", _raise(s3_client.StorageTemporaryError("模擬")))
 
     response = _upload(client, token, ws_id)
 

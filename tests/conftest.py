@@ -53,3 +53,24 @@ def client(db_session):
     app.dependency_overrides[get_db] = override_get_db  # 前置：app 遇到 get_db 就改用這個 → endpoint 全連測試資料庫
     yield TestClient(app)  # 造一個 TestClient(FastAPI提供的工具 模擬真實HTTP請求)交給測試
     app.dependency_overrides.clear()  # 收尾：移除上面的替換，app 恢復正常
+
+
+# 上傳改成瀏覽器直接傳到 S3（docs/decisions/013），測試裡用假的取代兩個 S3 呼叫，所有測試都自動套用
+#   create_upload_form：假的上傳許可（真的那個只在本機計算，但需要 AWS 憑證）
+#   file_size：去各測試自己的假 bucket 查檔案大小。寫成 s3_client.download_file(key)
+#     而不是直接拿某個 dict，是因為每個測試檔的假 bucket 都不一樣，這樣會用到「當下被換掉的那個」
+@pytest.fixture(autouse=True)
+def _fake_upload_form(monkeypatch):
+    from app.core import s3_client
+
+    def file_size(key):
+        try:
+            return len(s3_client.download_file(key))
+        except KeyError:
+            raise s3_client.FileMissing("404") from None
+
+    monkeypatch.setattr(
+        s3_client, "create_upload_form",
+        lambda key, max_bytes, expires_seconds: {"url": "https://fake-bucket", "fields": {"key": key}},
+    )
+    monkeypatch.setattr(s3_client, "file_size", file_size)

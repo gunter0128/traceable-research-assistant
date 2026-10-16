@@ -1,7 +1,6 @@
 # 背景處理（雲端模式）的測試：送工單、Lambda 收工單、手動重試、定期掃描
 # 真的 SQS 換成一個記錄「送了哪些工單」的 list，跟 _fake_s3 用 dict 假裝 S3 是同一個道理
 
-import io
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +14,7 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
@@ -68,11 +68,7 @@ def _create_workspace(client, token, name="研究"):
 
 
 def _upload_pdf(client, token, workspace_id):
-    return client.post(
-        f"/workspaces/{workspace_id}/documents",
-        headers=_auth_headers(token),
-        files={"file": ("doc.pdf", io.BytesIO(valid_pdf_bytes()), "application/pdf")},
-    )
+    return upload_pdf(client, _auth_headers(token), workspace_id, valid_pdf_bytes())
 
 
 # 假的送工單函式：一呼叫就丟例外，模擬 SQS 連不上

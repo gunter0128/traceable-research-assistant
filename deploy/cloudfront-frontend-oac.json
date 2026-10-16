@@ -1,0 +1,7 @@
+{
+  "Name": "trace-app-frontend-oac",
+  "Description": "CloudFront reads the frontend bucket",
+  "SigningProtocol": "sigv4",
+  "SigningBehavior": "always",
+  "OriginAccessControlOriginType": "s3"
+}

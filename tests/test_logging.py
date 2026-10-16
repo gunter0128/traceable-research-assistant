@@ -1,7 +1,6 @@
 # 結構化 log（docs/decisions/010）
 # 測的是：每一筆都是 JSON、自動帶上請求編號和文件編號、上傳和背景處理串得起來、不記使用者的內容
 
-import io
 import json
 import logging
 
@@ -10,6 +9,7 @@ import pytest
 from app.core import log, openai_client, s3_client, sqs_client
 from app.core.config import settings
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 
 # 把 "app" 這個 logger 寫出的每一筆，用正式的 JSON 格式轉好、收集到一個 list 裡給測試檢查
@@ -59,11 +59,7 @@ def _login(client, email="alice@example.com"):
 
 def _upload(client, headers, filename="secret-findings.pdf"):
     ws_id = client.post("/workspaces", json={"name": "研究"}, headers=headers).json()["id"]
-    return client.post(
-        f"/workspaces/{ws_id}/documents",
-        headers=headers,
-        files={"file": (filename, io.BytesIO(valid_pdf_bytes("retrieval " * 50)), "application/pdf")},
-    )
+    return upload_pdf(client, headers, ws_id, valid_pdf_bytes("retrieval " * 50), filename)
 
 
 # 測試：一筆 log 轉出來是 JSON，有固定欄位、目前的編號、和這筆自己的欄位

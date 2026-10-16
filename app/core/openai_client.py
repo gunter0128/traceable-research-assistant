@@ -53,7 +53,7 @@ PROCESSING_TIMEOUT = 30
 PROCESSING_ATTEMPTS = 5
 PROCESSING_MAX_WAIT = 60
 # 問答（使用者在等）：每次最多等 15 秒、最多試 2 次；OpenAI 叫我們等超過 5 秒就直接放棄
-# 總時間由 qa_service 給的 deadline 控制（整個問答共用 60 秒）
+# 總時間由 qa_service 給的 deadline 控制（整個問答共用 50 秒）
 QA_TIMEOUT = 15
 QA_ATTEMPTS = 2
 QA_MAX_WAIT = 5

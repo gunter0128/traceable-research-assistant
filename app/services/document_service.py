@@ -6,11 +6,11 @@ import io
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from app.core import chunker, log, openai_client, pdf_parser, s3_client, sqs_client
@@ -40,6 +40,8 @@ STORAGE_PREFIX = "documents/"
 # 對帳時，沒有紀錄的 S3 檔案要存在超過這麼久才刪：上傳是先存 S3 再建紀錄，
 # 剛好在這兩步之間對帳的話，會看到一個「還沒有紀錄」的新檔案，不能把它誤刪
 ORPHAN_GRACE = timedelta(days=1)
+# 上傳許可的有效時間：拿到許可之後，10 分鐘內要把檔案傳完（20 MB 就算網路很慢也夠了）
+UPLOAD_URL_EXPIRES_SECONDS = 600
 # 一次送幾段 chunk 去轉向量（OpenAI 上限 2048，100 段已經能把呼叫次數降到百分之一，單次請求也不會太大）
 EMBED_BATCH_SIZE = 100
 
@@ -58,6 +60,24 @@ class InvalidFileType(Exception):
 
 class FileTooLarge(Exception):
     pass
+
+
+# 前端說「傳好了」，S3 上卻找不到這個檔案（沒傳成功、或上傳許可過期了）
+class UploadNotFound(Exception):
+    pass
+
+
+# 前端給的 key 不是發給這個 workspace 的、或已經建過紀錄了
+class InvalidUploadKey(Exception):
+    pass
+
+
+# 發給前端的上傳許可：url 和 fields 是瀏覽器直接傳到 S3 要用的，key 是傳好之後通知 API 時要帶回來的
+@dataclass
+class UploadTicket:
+    url: str
+    fields: dict
+    key: str
 
 
 # PDF 讀得開，但一個字都抓不到（通常是掃描檔，整頁都是圖片）
@@ -113,45 +133,72 @@ def list_documents(db: Session, workspace_id: int, owner_id: int) -> list[Docume
     return document_repo.list_for_workspace(db, workspace_id)
 
 
-def upload_document(
-    db: Session, workspace_id: int, owner_id: int, file: UploadFile
-) -> Document:
+# 上傳分三步（docs/decisions/013）：檔案不經過 API，瀏覽器直接傳到 S3
+#   1. start_upload：前端說「我要傳一個檔案」，API 檢查完，發一張上傳許可
+#   2. 瀏覽器拿許可把檔案直接傳到 S3
+#   3. finish_upload：前端說「傳好了」，API 確認檔案真的在 S3 上，才建紀錄、交出去處理
+# 為什麼：API 跑在 Lambda 上，Lambda 收的請求最大只有 6 MB，我們的上限是 20 MB
+# 順序跟原本一樣是「先有 S3 的檔案、再建紀錄」（docs/decisions/006）：
+# 傳了檔案卻沒有說「傳好了」的話，只會留下沒人用的檔案，每小時的對帳會清掉
+
+
+# 第 1 步：發上傳許可。size_bytes 是前端說的檔案大小，先擋掉明顯太大的；真正的大小由 S3 依許可上的條件檢查
+def start_upload(
+    db: Session, workspace_id: int, owner_id: int, filename: str, size_bytes: int
+) -> UploadTicket:
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
     # 今天的用量到上限了就不收（docs/decisions/012）：收下來也沒辦法處理
     # 還沒到的話，這份會完整處理完，就算處理完之後超過了也一樣
     usage_service.ensure_within_quota(db, owner_id)
-    # 只能上傳 PDF
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise InvalidFileType
-    # file.size：收檔時框架已經算好的檔案大小（bytes），在讀進記憶體、存進 S3 之前就先擋掉
-    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+    _check_filename(filename)
+    if size_bytes > MAX_UPLOAD_BYTES:
         raise FileTooLarge
 
-    # uuid4()： 產生一個隨機的、幾乎不可能重複的識別碼
-    # .hex： 把它變成一串十六進位字串
-    # 加上隨機前綴 避免同名檔案在 S3 裡互相覆蓋掉
-    # "documents/" 這個前綴只是 S3 key 裡的字串，不是真的資料夾，純粹方便之後找東西
-    key = f"{STORAGE_PREFIX}{uuid4().hex}_{file.filename}"
-    # file.file.read() 把上傳內容讀出來變成一包 bytes (file 是 UploadFile 這個物件 .file 是它裡面裝真正內容的屬性)
-    content = file.file.read()
-    # 只記大小，不記檔名：檔名可能就透露研究內容（docs/decisions/010）
-    with log.timed("s3_upload", size_bytes=len(content)):
-        s3_client.upload_file(key, content)
+    # key 的格式：documents/<workspace 編號>/<隨機碼>.pdf
+    #   workspace 編號：第 3 步用它確認這個檔案是傳到這個 workspace 的，別人拿不到你的 key 來用
+    #   uuid4().hex：隨機、幾乎不可能重複的識別碼，同名檔案不會互相覆蓋，也猜不到別人的 key
+    #   不放檔名：檔名可能透露研究內容，S3 的 key 會出現在 log 和主控台裡（檔名存在資料庫）
+    key = f"{STORAGE_PREFIX}{workspace_id}/{uuid4().hex}.pdf"
+    form = s3_client.create_upload_form(key, MAX_UPLOAD_BYTES, UPLOAD_URL_EXPIRES_SECONDS)
+    log.event("upload_started", size_bytes=size_bytes)
+    return UploadTicket(url=form["url"], fields=form["fields"], key=key)
 
-    # S3 和資料庫沒辦法包在同一個 transaction 裡（見 docs/decisions/006）
-    # 先存 S3 再建紀錄：中途失敗只會留下沒人用的檔案（無害），不會留下指向不存在檔案的紀錄（有害）
+
+# 第 3 步：前端說「傳好了」。確認檔案真的在 S3 上、是這個 workspace 的，才建紀錄、交出去處理
+def finish_upload(db: Session, workspace_id: int, owner_id: int, key: str, filename: str) -> Document:
+    workspace_service.get_owned_workspace(db, workspace_id, owner_id)
+    _check_filename(filename)
+    # 只接受發給這個 workspace 的 key：不然有人可以拿別人的 key，把別人的檔案「認領」到自己的 workspace
+    if not key.startswith(f"{STORAGE_PREFIX}{workspace_id}/"):
+        raise InvalidUploadKey
+    # 同一個檔案只能建一筆紀錄：兩筆紀錄指向同一個檔案的話，刪掉其中一筆，另一筆的檔案也跟著不見了
+    if document_repo.exists_with_storage_path(db, key):
+        raise InvalidUploadKey
     try:
-        document = document_repo.create(db, workspace_id, file.filename, key)
+        size = s3_client.file_size(key)
+    # 前端說傳好了，S3 上卻沒有：沒傳成功、或許可過期了
+    except s3_client.FileMissing:
+        raise UploadNotFound from None
+
+    try:
+        document = document_repo.create(db, workspace_id, filename, key)
     except Exception:
         db.rollback()
-        # 補救：紀錄建不起來，把剛存的檔案刪掉。連這步都失敗的話，留給每小時的對帳清
+        # 補救：紀錄建不起來，把剛傳的檔案刪掉。連這步都失敗的話，留給每小時的對帳清
         # contextlib.suppress：把裡面丟出的錯誤吞掉。這裡刪不掉也沒關係，重點是把原本的錯誤往外丟
         with contextlib.suppress(s3_client.StorageError):
             s3_client.delete_file(key)
         raise
     log.bind_document(document.id)
-    log.event("uploaded")
+    # 只記大小，不記檔名：檔名可能就透露研究內容（docs/decisions/010）
+    log.event("uploaded", size_bytes=size)
     return dispatch_document(db, document)
+
+
+# 只能上傳 PDF
+def _check_filename(filename: str) -> None:
+    if not filename or not filename.lower().endswith(".pdf"):
+        raise InvalidFileType
 
 
 # 把文件交出去處理（上傳、手動重試、定期掃描重送都走這裡）

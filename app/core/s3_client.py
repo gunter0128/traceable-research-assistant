@@ -90,3 +90,31 @@ def list_files(prefix: str) -> list[tuple[str, datetime]]:
             for item in page.get("Contents", []):
                 files.append((item["Key"], item["LastModified"]))
     return files
+
+
+# 何時呼叫：使用者要上傳檔案時，給瀏覽器一張「上傳許可」，讓它直接把檔案傳到 S3，不經過 API（docs/decisions/013）
+# 回傳 {"url": 要傳去的網址, "fields": 要一起送出的表單欄位}，瀏覽器用 multipart 表單 POST 過去
+# generate_presigned_post：用我們的權限「預先簽好」一張許可，只在本機計算，不會連到 S3
+#   許可裡寫死了：只能存到 key 這個位置、檔案大小在 1 ~ max_bytes 之間、expires_seconds 秒內有效
+#   條件是 S3 自己檢查的，就算有人改了前端程式，也傳不了超過上限的檔案、或存到別的位置
+def create_upload_form(key: str, max_bytes: int, expires_seconds: int) -> dict:
+    with _translate_errors():
+        return client.generate_presigned_post(
+            Bucket=settings.s3_bucket_name,
+            Key=key,
+            Conditions=[["content-length-range", 1, max_bytes]],
+            ExpiresIn=expires_seconds,
+        )
+
+
+# 何時呼叫：瀏覽器說「傳好了」之後，確認檔案真的在 S3 上，順便拿到實際大小
+# head_object：只問檔案的資訊（大小、時間），不下載內容。檔案不存在時 S3 回 404（不是 NoSuchKey）
+def file_size(key: str) -> int:
+    try:
+        with _translate_errors():
+            return client.head_object(Bucket=settings.s3_bucket_name, Key=key)["ContentLength"]
+    except StoragePermanentError as exc:
+        # head_object 沒有回應內容，錯誤代碼就只是 "404"，_translate_errors 認不出來會當成永久性錯誤
+        if str(exc) == "404":
+            raise FileMissing(str(exc)) from exc
+        raise

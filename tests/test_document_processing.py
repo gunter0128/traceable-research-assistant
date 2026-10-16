@@ -1,7 +1,6 @@
 # process_document() 出錯時的行為：處理到一半失敗、同一份文件處理兩次
 # test_documents.py 測的是「正常情況下能動」，這裡測的是「出事時資料還是對的」
 
-import io
 
 import pytest
 
@@ -10,6 +9,7 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
 from tests.pdf_fixtures import blank_pdf_bytes, valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 # 夠長的文字 切下去會變成好幾段 chunk（chunk_size 是 500 token，這裡約 2000 token）
 # 只有一段的話測不出「做到一半」的情況
@@ -44,21 +44,11 @@ def _create_workspace(client, token, name="研究"):
 
 
 def _upload_long_pdf(client, token, workspace_id):
-    return client.post(
-        f"/workspaces/{workspace_id}/documents",
-        headers=_auth_headers(token),
-        files={
-            "file": ("long.pdf", io.BytesIO(valid_pdf_bytes(LONG_TEXT)), "application/pdf")
-        },
-    )
+    return upload_pdf(client, _auth_headers(token), workspace_id, valid_pdf_bytes(LONG_TEXT), "long.pdf")
 
 
 def _upload(client, token, workspace_id, content, filename="doc.pdf"):
-    return client.post(
-        f"/workspaces/{workspace_id}/documents",
-        headers=_auth_headers(token),
-        files={"file": (filename, io.BytesIO(content), "application/pdf")},
-    )
+    return upload_pdf(client, _auth_headers(token), workspace_id, content, filename)
 
 
 # 假的 embed_texts：前幾次正常回傳向量，第 fail_on 次呼叫時丟例外，模擬中途出錯

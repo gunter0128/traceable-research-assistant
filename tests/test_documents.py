@@ -1,11 +1,11 @@
 # document 上傳 + CRUD 的測試：上傳 / 列表 / 查 / 刪 + ownership（透過 workspace）
 
-import io
 
 import pytest
 
 from app.core import openai_client, s3_client
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 # 每個測試三段（AAA）測試撰寫慣例：
 # Arrange ：把系統弄到需要的狀態(不是在測這個 可省略)。
@@ -52,20 +52,13 @@ def _create_workspace(client, token, name="研究"):
 def _upload_pdf(client, token, workspace_id, filename="IRCoT.pdf"):
     # 要用「真的」能被解析的 PDF，不能隨便塞假 byte —— process_document() 現在會真的
     # 去解析內容，假的 PDF 會讓 status 變成 "failed"，不是這裡要測的東西
-    return client.post(
-        f"/workspaces/{workspace_id}/documents",
-        headers=_auth_headers(token),
-        files={
-            "file": (filename, io.BytesIO(valid_pdf_bytes()), "application/pdf")
-        },
-    )
+    return upload_pdf(client, _auth_headers(token), workspace_id, valid_pdf_bytes(), filename)
 
 
 # 測試：沒登入不能上傳
 def test_upload_requires_auth(client):
     response = client.post(
-        "/workspaces/1/documents",
-        files={"file": ("x.pdf", io.BytesIO(b"x"), "application/pdf")},
+        "/workspaces/1/uploads", json={"filename": "x.pdf", "size_bytes": 1}
     )
     assert response.status_code == 401
 
@@ -95,13 +88,81 @@ def test_upload_non_pdf_rejected(client):
     token = _register_and_login(client, "bob@example.com")
     ws_id = _create_workspace(client, token)
 
-    response = client.post(
-        f"/workspaces/{ws_id}/documents",
-        headers=_auth_headers(token),
-        files={"file": ("note.txt", io.BytesIO(b"hello"), "text/plain")},
-    )
+    response = upload_pdf(client, _auth_headers(token), ws_id, b"hello", "note.txt")
 
     assert response.status_code == 400
+
+
+# ---------- 瀏覽器直接上傳到 S3（docs/decisions/013）----------
+
+
+def _start(client, token, ws_id, filename="doc.pdf"):
+    return client.post(
+        f"/workspaces/{ws_id}/uploads",
+        json={"filename": filename, "size_bytes": 100},
+        headers=_auth_headers(token),
+    ).json()
+
+
+def _finish(client, token, ws_id, key, filename="doc.pdf"):
+    return client.post(
+        f"/workspaces/{ws_id}/documents",
+        json={"key": key, "filename": filename},
+        headers=_auth_headers(token),
+    )
+
+
+# 測試：上傳許可的 key 放在這個 workspace 底下，而且不含檔名（檔名可能透露研究內容）
+def test_upload_key_is_scoped_to_workspace(client):
+    token = _register_and_login(client, "kate@example.com")
+    ws_id = _create_workspace(client, token)
+
+    key = _start(client, token, ws_id, "secret-findings.pdf")["key"]
+
+    assert key.startswith(f"documents/{ws_id}/")
+    assert "secret" not in key
+
+
+# 測試：拿到許可卻沒有真的傳到 S3，就說「傳好了」→ 400，不建紀錄
+def test_finish_without_file_rejected(client):
+    token = _register_and_login(client, "leo@example.com")
+    ws_id = _create_workspace(client, token)
+    key = _start(client, token, ws_id)["key"]
+
+    response = _finish(client, token, ws_id, key)
+
+    assert response.status_code == 400
+    assert client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json() == []
+
+
+# 測試：拿別的 workspace 的 key 來「認領」檔案 → 400
+# （不然 B 只要知道 A 的 key，就能把 A 的檔案建進自己的 workspace 讀內容）
+def test_cannot_claim_key_of_other_workspace(client):
+    token_a = _register_and_login(client, "mia_a@example.com")
+    ws_a = _create_workspace(client, token_a)
+    key_a = _start(client, token_a, ws_a)["key"]
+    s3_client.upload_file(key_a, valid_pdf_bytes())  # A 真的傳上去了
+    token_b = _register_and_login(client, "mia_b@example.com")
+    ws_b = _create_workspace(client, token_b)
+
+    response = _finish(client, token_b, ws_b, key_a)
+
+    assert response.status_code == 400
+
+
+# 測試：同一個檔案說兩次「傳好了」→ 第二次 400，不會有兩筆紀錄指向同一個檔案
+# （不然刪掉其中一筆，另一筆的檔案也跟著不見了）
+def test_same_key_cannot_be_finished_twice(client, db_session):
+    token = _register_and_login(client, "nina@example.com")
+    ws_id = _create_workspace(client, token)
+    key = _start(client, token, ws_id)["key"]
+    s3_client.upload_file(key, valid_pdf_bytes())
+
+    first = _finish(client, token, ws_id, key)
+    second = _finish(client, token, ws_id, key)
+
+    assert first.status_code == 201
+    assert second.status_code == 400
 
 
 # 測試：B 不能傳文件到 A 的 workspace

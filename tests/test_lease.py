@@ -2,7 +2,6 @@
 # 測的是：同一份文件同時只有一個 Lambda 能處理；處理中一直報平安；停止報平安就判定中斷；
 # 租約被搶走的那個 Lambda 會放棄，不會跟接手的存出兩份內容
 
-import io
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -15,6 +14,7 @@ from app.models.document import Document
 from app.repositories import document_repo
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 # 夠長的文字，切下去會變成好幾段，進度才看得出來
 LONG_TEXT = "retrieval " * 2000
@@ -47,11 +47,7 @@ def _auth_headers(token):
 def _upload(client, email, text=LONG_TEXT):
     token = _register_and_login(client, email)
     ws_id = client.post("/workspaces", json={"name": "研究"}, headers=_auth_headers(token)).json()["id"]
-    response = client.post(
-        f"/workspaces/{ws_id}/documents",
-        headers=_auth_headers(token),
-        files={"file": ("doc.pdf", io.BytesIO(valid_pdf_bytes(text)), "application/pdf")},
-    )
+    response = upload_pdf(client, _auth_headers(token), ws_id, valid_pdf_bytes(text))
     return token, ws_id, response.json()["id"]
 
 

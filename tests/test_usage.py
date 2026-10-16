@@ -2,7 +2,6 @@
 # 測的是：每次呼叫 OpenAI 都記下花了多少；開始之前沒到上限就放行、而且完整做完；
 # 跨過上限之後馬上查得到；下一次才擋；全系統的上限擋得住大量註冊的帳號
 
-import io
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -15,6 +14,7 @@ from app.models.usage_record import UsageRecord
 from app.models.user import User
 from app.services import usage_service
 from tests.pdf_fixtures import valid_pdf_bytes
+from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
@@ -56,11 +56,7 @@ def _workspace(client, headers):
 
 
 def _upload(client, headers, ws_id):
-    return client.post(
-        f"/workspaces/{ws_id}/documents",
-        headers=headers,
-        files={"file": ("a.pdf", io.BytesIO(valid_pdf_bytes("retrieval " * 50)), "application/pdf")},
-    )
+    return upload_pdf(client, headers, ws_id, valid_pdf_bytes("retrieval " * 50), "a.pdf")
 
 
 def _ask(client, headers, ws_id):

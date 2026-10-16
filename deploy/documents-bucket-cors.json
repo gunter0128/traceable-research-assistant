@@ -1,0 +1,17 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": [
+        "https://<CLOUDFRONT_DOMAIN>",
+        "http://localhost:5173"
+      ],
+      "AllowedMethods": [
+        "POST"
+      ],
+      "AllowedHeaders": [
+        "*"
+      ],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}

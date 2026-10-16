@@ -12,7 +12,9 @@ from app.schemas.qa import AskResponse, CitationOut
 from app.services import usage_service, workspace_service
 
 # 使用者最多等多久就要看到答案或錯誤訊息
-ANSWER_BUDGET_SECONDS = 60
+# 原本 60 秒，改成 50 秒（docs/decisions/013）：CloudFront 等後端回應最多 60 秒，超過就直接回錯誤給使用者，
+# 而 Lambda 冷啟動還要再加幾秒，留 10 秒的餘裕
+ANSWER_BUDGET_SECONDS = 50
 
 
 # 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
@@ -36,7 +38,7 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str) -> AskResp
     usages = []
     record_usage = usages.append
 
-    # 整個問答共用 60 秒的時間預算（docs/decisions/008）：轉向量跟生成答案各自的重試加起來，也不會超過
+    # 整個問答共用 50 秒的時間預算（docs/decisions/008）：轉向量跟生成答案各自的重試加起來，也不會超過
     deadline = time.monotonic() + ANSWER_BUDGET_SECONDS
     # 每一段各記花多久，回答「問答慢在哪」（docs/decisions/010）
     # 問題只記字數、不記內容：使用者的問題可能是未發表的研究

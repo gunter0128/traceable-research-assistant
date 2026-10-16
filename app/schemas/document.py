@@ -1,9 +1,27 @@
 # document 相關的 API 進出資料形狀
-# 上傳沒有專屬的輸入 schema：FastAPI 的 UploadFile 直接當參數收檔案，不是走 JSON body
 
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
+
+
+# 上傳第 1 步：POST /workspaces/{id}/uploads 收這個（docs/decisions/013）
+class UploadStart(BaseModel):
+    filename: str
+    size_bytes: int
+
+
+# 上傳第 1 步的回應：瀏覽器拿 url + fields 直接把檔案傳到 S3，傳好之後帶著 key 通知 API
+class UploadTicketOut(BaseModel):
+    url: str
+    fields: dict[str, str]
+    key: str
+
+
+# 上傳第 3 步：POST /workspaces/{id}/documents 收這個，告訴 API「key 這個檔案傳好了」
+class UploadFinish(BaseModel):
+    key: str
+    filename: str
 
 
 class DocumentOut(BaseModel):

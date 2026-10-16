@@ -26,6 +26,13 @@ export type Document = {
   progress_total: number | null
 }
 
+// 上傳許可（docs/decisions/013）：url + fields 給瀏覽器直接傳到 S3，key 是傳好之後通知 API 時要帶回去的
+export type UploadTicket = {
+  url: string
+  fields: Record<string, string>
+  key: string
+}
+
 export type Citation = {
   document_id: number
   filename: string
@@ -119,12 +126,31 @@ export const api = {
   listDocuments: (workspaceId: number) =>
     request<Document[]>(`/workspaces/${workspaceId}/documents`),
 
-  uploadDocument: (workspaceId: number, file: File) => {
+  // 上傳分三步（docs/decisions/013）：檔案不經過 API，瀏覽器直接傳到 S3
+  // （API 跑在 Lambda 上，一次最多只能收 6 MB，我們的上限是 20 MB）
+  uploadDocument: async (workspaceId: number, file: File) => {
+    // 1. 跟 API 要上傳許可：API 先檢查是不是 PDF、大小、今天的用量
+    const ticket = await request<UploadTicket>(`/workspaces/${workspaceId}/uploads`, {
+      method: "POST",
+      body: JSON.stringify({ filename: file.name, size_bytes: file.size }),
+    })
+
+    // 2. 直接把檔案傳到 S3。許可裡的欄位（fields）要原封不動放進表單，而且 file 一定要放在最後面（S3 的規定）
+    // 不走 request()：這是傳給 S3 的，不能帶我們的登入 token，S3 回的錯誤格式也跟我們的 API 不一樣
     const form = new FormData()
+    for (const [name, value] of Object.entries(ticket.fields)) {
+      form.append(name, value)
+    }
     form.append("file", file)
+    const s3Response = await fetch(ticket.url, { method: "POST", body: form })
+    if (!s3Response.ok) {
+      throw new ApiError(s3Response.status, "檔案上傳失敗，請重試")
+    }
+
+    // 3. 告訴 API 傳好了：API 確認檔案在 S3 上，才建紀錄、交出去處理
     return request<Document>(`/workspaces/${workspaceId}/documents`, {
       method: "POST",
-      body: form,
+      body: JSON.stringify({ key: ticket.key, filename: file.name }),
     })
   },
 
