@@ -24,6 +24,8 @@ TAIWAN = timezone(timedelta(hours=8))
 
 # 今天的用量已經到上限了。scope：user = 這個人自己的上限、system = 全系統的上限
 class QuotaExceeded(Exception):
+    # 錯誤物件上多帶一個 scope，API 層看它決定回哪一句訊息
+    # super().__init__(scope)：先照一般 Exception 的方式建好（錯誤訊息就是 scope）
     def __init__(self, scope: str):
         super().__init__(scope)
         self.scope = scope

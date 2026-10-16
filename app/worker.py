@@ -76,6 +76,7 @@ def handle_process_message(event, context):
 def _probe_database():
     host = engine.url.host
 
+    # 從 start 到現在幾毫秒（縮短名字，下面用很多次）
     def ms(start):
         return log.elapsed_ms(start)
 
