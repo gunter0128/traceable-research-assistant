@@ -110,7 +110,27 @@ def retry_document(
         _document_error(exc)
     except document_service.DocumentNotRetryable:
         raise HTTPException(
-            status_code=409, detail="only failed documents can be retried"
+            status_code=409, detail="only failed or cancelled documents can be retried"
+        ) from None
+
+
+# 取消處理（docs/decisions/009）。不是排隊中 / 處理中的回 409：已經處理完或失敗了，沒有東西可以停
+@router.post("/documents/{document_id}/cancel", response_model=DocumentOut)
+def cancel_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        return document_service.cancel_document(db, document_id, current_user.id)
+    except (
+        document_service.DocumentNotFound,
+        document_service.NotDocumentOwner,
+    ) as exc:
+        _document_error(exc)
+    except document_service.DocumentNotCancellable:
+        raise HTTPException(
+            status_code=409, detail="only queued or processing documents can be cancelled"
         ) from None
 
 

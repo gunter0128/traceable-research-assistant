@@ -68,8 +68,13 @@ class RetryLater(Exception):
     pass
 
 
-# 只有失敗的文件可以手動重試（處理中、已完成的不行）
+# 只有失敗、或使用者自己取消的文件可以手動重試（排隊中、處理中、已完成的不行）
 class DocumentNotRetryable(Exception):
+    pass
+
+
+# 只有排隊中、處理中的文件可以取消（已完成、已失敗的沒有東西可以停）
+class DocumentNotCancellable(Exception):
     pass
 
 
@@ -154,13 +159,26 @@ def dispatch_document(db: Session, document: Document) -> Document:
     return document
 
 
-# 使用者手動按重試：只有失敗的文件可以，次數歸零後重新交出去
+# 使用者手動按重試：失敗或已取消的文件可以，次數歸零後重新交出去
 def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     document = get_owned_document(db, document_id, owner_id)
-    if document.status != "failed":
+    if document.status not in ("failed", "cancelled"):
         raise DocumentNotRetryable
     document_repo.reset_for_retry(db, document)
     return dispatch_document(db, document)
+
+
+# 使用者按「取消處理」（docs/decisions/009）：不想等了，先停下來，文件留著之後可以重試或刪掉
+# 跟刪除不一樣：刪除是整份文件不要了；取消是先停下來，等一下再說
+def cancel_document(db: Session, document_id: int, owner_id: int) -> Document:
+    get_owned_document(db, document_id, owner_id)
+    # 判斷「能不能取消」交給資料庫的有條件更新，不在這裡先查狀態再改：
+    # 查和改之間，Lambda 可能剛好處理完，先查再改會把「已完成」的文件誤改成「已取消」
+    if not document_repo.cancel(db, document_id):
+        raise DocumentNotCancellable
+    document = document_repo.get_by_id(db, document_id)
+    db.refresh(document)
+    return document
 
 
 # 定期掃描（每小時一次，由排程叫起來）：把卡住的文件標失敗

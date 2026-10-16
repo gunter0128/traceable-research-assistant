@@ -16,7 +16,7 @@ class Document(Base):
     filename = Column(String, nullable=False)
     storage_path = Column(String, nullable=False)
     # uploaded = 排隊中（等 Lambda 來處理 / 等下一回合重試）、processing = 某個 Lambda 正在處理
-    # processed = 完成、failed = 失敗（見 docs/decisions/008）
+    # processed = 完成、failed = 失敗（見 docs/decisions/008）、cancelled = 使用者取消（見 docs/decisions/009）
     status = Column(String, nullable=False, server_default="uploaded")
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     processed_at = Column(DateTime(timezone=True), nullable=True)

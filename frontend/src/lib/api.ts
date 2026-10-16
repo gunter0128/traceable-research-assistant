@@ -124,12 +124,18 @@ export const api = {
   retryDocument: (documentId: number) =>
     request<Document>(`/documents/${documentId}/retry`, { method: "POST" }),
 
+  // 取消處理（docs/decisions/009）：只有排隊中、處理中的文件可以
+  cancelDocument: (documentId: number) =>
+    request<Document>(`/documents/${documentId}/cancel`, { method: "POST" }),
+
   deleteDocument: (documentId: number) =>
     request<void>(`/documents/${documentId}`, { method: "DELETE" }),
 
-  ask: (workspaceId: number, question: string) =>
+  // signal：讓呼叫的人可以中途取消這個請求（AbortController 給的），取消時 fetch 會丟 AbortError
+  ask: (workspaceId: number, question: string, signal?: AbortSignal) =>
     request<AskResponse>(`/workspaces/${workspaceId}/ask`, {
       method: "POST",
       body: JSON.stringify({ question }),
+      signal,
     }),
 }

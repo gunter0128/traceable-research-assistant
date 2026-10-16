@@ -1,5 +1,5 @@
 import { type ChangeEvent, type FormEvent, useEffect, useRef, useState } from "react"
-import { ArrowLeft, FileText, RotateCw, Send, Trash2, Upload } from "lucide-react"
+import { ArrowLeft, FileText, RotateCw, Send, Trash2, Upload, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -27,6 +27,7 @@ const STATUS_LABELS: Record<string, string> = {
   processing: "處理中",
   processed: "完成",
   failed: "失敗",
+  cancelled: "已取消",
 }
 
 // 處理中而且知道總段數的話，顯示進度「處理中 200 / 330」
@@ -135,6 +136,16 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
     }
   }
 
+  // 取消處理：不想等了，先停下來，文件留著之後可以重試或刪掉
+  async function handleCancel(id: number) {
+    try {
+      const updated = await api.cancelDocument(id)
+      setDocuments((prev) => prev.map((d) => (d.id === id ? updated : d)))
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "取消失敗")
+    }
+  }
+
   async function handleDelete(id: number) {
     try {
       await api.deleteDocument(id)
@@ -209,7 +220,18 @@ function DocumentsPanel({ workspaceId }: { workspaceId: number }) {
                   >
                     {statusText(doc)}
                   </Badge>
-                  {doc.status === "failed" && (
+                  {/* 排隊中、處理中：可以取消；失敗、已取消：可以重試 */}
+                  {(doc.status === "uploaded" || doc.status === "processing") && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="取消處理"
+                      onClick={() => void handleCancel(doc.id)}
+                    >
+                      <X className="size-4" />
+                    </Button>
+                  )}
+                  {(doc.status === "failed" || doc.status === "cancelled") && (
                     <Button
                       variant="ghost"
                       size="icon"
@@ -240,6 +262,8 @@ function QaPanel({ workspaceId }: { workspaceId: number }) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [question, setQuestion] = useState("")
   const [asking, setAsking] = useState(false)
+  // 目前這次問答的「取消開關」。useRef：存一個不需要觸發畫面更新的值，取消按鈕按下時拿來用
+  const abortRef = useRef<AbortController | null>(null)
 
   async function handleAsk(e: FormEvent) {
     e.preventDefault()
@@ -248,19 +272,26 @@ function QaPanel({ workspaceId }: { workspaceId: number }) {
     setMessages((prev) => [...prev, { role: "user", content: q }])
     setQuestion("")
     setAsking(true)
+    // AbortController：瀏覽器內建的「取消開關」，把它的 signal 交給 fetch，之後 abort() 就能中途停掉這個請求
+    const controller = new AbortController()
+    abortRef.current = controller
     try {
-      const res = await api.ask(workspaceId, q)
+      const res = await api.ask(workspaceId, q, controller.signal)
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: res.answer, citations: res.citations },
       ])
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "問答失敗")
+      // 使用者自己按取消的，不用跳錯誤提示
+      if (!controller.signal.aborted) {
+        toast.error(err instanceof ApiError ? err.message : "問答失敗")
+      }
       setMessages((prev) => prev.slice(0, -1))
       // 失敗時把問題放回輸入框，使用者按一下就能重送，不用整句重打
       setQuestion(q)
     } finally {
       setAsking(false)
+      abortRef.current = null
     }
   }
 
@@ -304,7 +335,18 @@ function QaPanel({ workspaceId }: { workspaceId: number }) {
               {asking && (
                 <div className="flex flex-col gap-1.5">
                   <span className="text-muted-foreground text-xs font-medium">助理</span>
-                  <p className="text-muted-foreground animate-pulse text-sm">思考中…</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-muted-foreground animate-pulse text-sm">思考中…</p>
+                    {/* 前端停止等待，把問題放回輸入框。後端已經送出的 OpenAI 請求收不回來，會在背景跑完 */}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-xs"
+                      onClick={() => abortRef.current?.abort()}
+                    >
+                      取消
+                    </Button>
+                  </div>
                 </div>
               )}
             </div>

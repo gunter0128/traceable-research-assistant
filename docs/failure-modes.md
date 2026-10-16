@@ -40,6 +40,7 @@
 | 存 chunk | 中途任何錯誤 | rollback，一段都不留 | 測試（test_failed_processing_leaves_no_chunks） |
 | 整個執行 | Lambda 處理到一半被強制中斷（超時、記憶體不夠） | 沒 commit 的資料隨連線中斷自動丟棄；停止報平安，5 分鐘後標「處理中斷，請按重試」（decisions/008） | 測試（test_listing_marks_silent_document_interrupted）、雲端（演練 3 重做：上傳後 5.3 分鐘標中斷） |
 | 整個執行 | 在取得租約之前就被中斷 | 文件還在排隊中，15 分鐘後標「處理逾時」 | 雲端（演練 3 發現的，decisions/007），測試（test_listing_expires_overdue_document） |
+| 整個執行 | 使用者按「取消處理」 | 狀態改成已取消、收回租約；正在處理的 Lambda 下次報平安時發現代碼對不上，自己停下來，寫到一半的全部丟掉（decisions/009） | 測試（test_cancel_stops_running_worker、test_cancelled_document_is_skipped_by_worker） |
 | 整個執行 | 其實沒死只是很慢，被判定中斷後使用者按了重試 | 舊的 Lambda 報平安或存結果時發現租約不是自己的，放棄這次處理，不會存出兩份 | 測試（test_worker_gives_up_when_lease_is_taken、test_heartbeat_rejected_after_interrupted） |
 | 延後工單 | 沒有「延後」的權限 | 這次執行失敗，工單照預設 60 分鐘後重送（變慢，但不會遺失） | 雲端（演練 1 證明權限有效） |
 

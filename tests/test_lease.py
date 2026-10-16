@@ -183,3 +183,76 @@ def test_heartbeat_rejected_after_interrupted(client, db_session):
     assert document_repo.heartbeat(db_session, document_id, "slow") is False
     db_session.refresh(db_session.get(Document, document_id))
     assert db_session.get(Document, document_id).status == "failed"
+
+
+# ---------- 取消處理（docs/decisions/009）----------
+
+
+# 測試：Lambda 正在處理時，使用者按了取消 → Lambda 下次報平安時發現代碼對不上，自己停下來，
+# 寫到一半的 chunk 一段都不留，文件狀態是「已取消」
+def test_cancel_stops_running_worker(client, db_session, monkeypatch):
+    token, _, document_id = _upload(client, "kate@example.com")
+    document = _set(db_session, document_id, status="uploaded")
+    db_session.query(Chunk).filter(Chunk.document_id == document_id).delete()
+    db_session.commit()
+
+    # 假的 OpenAI：被呼叫時，模擬「使用者在這時候按了取消」（走真的 API，跟使用者做的事一樣）
+    def cancel_then_embed(texts, **kwargs):
+        response = client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+        assert response.status_code == 200
+        return [[0.1] * 1536 for _ in texts]
+
+    monkeypatch.setattr(openai_client, "embed_texts", cancel_then_embed)
+
+    document_service.process_document(db_session, document)
+
+    assert db_session.query(Chunk).filter(Chunk.document_id == document_id).count() == 0
+    db_session.refresh(document)
+    assert document.status == "cancelled"
+
+
+# 測試：還在排隊時取消 → 之後 Lambda 拿到工單，搶不到租約，完全不處理
+def test_cancelled_document_is_skipped_by_worker(client, db_session, monkeypatch):
+    token, _, document_id = _upload(client, "leo@example.com")
+    document = _set(db_session, document_id, status="uploaded")
+    client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+    calls = []
+    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: calls.append(texts))
+
+    document_service.process_document(db_session, document)
+
+    assert calls == []
+    db_session.refresh(document)
+    assert document.status == "cancelled"
+
+
+# 測試：已經處理完的文件不能取消（409），沒有東西可以停
+def test_cannot_cancel_processed_document(client):
+    token, _, document_id = _upload(client, "mia@example.com")  # 本機模式，上傳完就處理好了
+
+    response = client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+
+    assert response.status_code == 409
+
+
+# 測試：不能取消別人的文件（403）
+def test_cannot_cancel_others_document(client, db_session):
+    _, _, document_id = _upload(client, "nina@example.com")
+    _set(db_session, document_id, status="uploaded")
+    other = _register_and_login(client, "owen@example.com")
+
+    response = client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(other))
+
+    assert response.status_code == 403
+
+
+# 測試：取消之後可以按重試，重新處理完成
+def test_cancelled_document_can_be_retried(client, db_session):
+    token, _, document_id = _upload(client, "paul@example.com")
+    _set(db_session, document_id, status="uploaded")
+    client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+
+    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(token))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "processed"

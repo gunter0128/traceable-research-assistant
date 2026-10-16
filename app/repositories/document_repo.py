@@ -184,6 +184,26 @@ def defer_with_lease(db: Session, document_id: int, token: str, message: str) ->
     return updated == 1
 
 
+# 何時呼叫：使用者按「取消處理」（docs/decisions/009）
+# 條件不用對代碼：使用者手上沒有代碼，只要文件還在排隊中或處理中就可以取消
+# 收回租約（清掉代碼）就夠了，不用另外通知正在處理的 Lambda：
+#   它下次報平安、或要存結果時，代碼對不上，就會自己停下來、把寫到一半的全部丟掉
+#   還在排隊的，Lambda 拿到工單時搶不到租約（不是排隊中了），直接跳過
+# in_(...)：SQL 的 IN，「狀態是這幾個其中之一」
+def cancel(db: Session, document_id: int) -> bool:
+    updated = (
+        db.query(Document)
+        .filter(Document.id == document_id)
+        .filter(Document.status.in_(("uploaded", "processing")))
+        .update(
+            {Document.status: "cancelled", Document.claim_token: None, Document.error_message: None},
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return updated == 1
+
+
 # 何時呼叫：使用者查文件時、每小時的 sweeper。把卡住的文件標失敗，回傳標了幾份
 #   處理中，最後報平安在 heartbeat_before 之前 → interrupted_reason（程式死了）
 #   排隊中，最後送出工單在 queued_before 之前 → timed_out_reason（一直沒人來處理）
