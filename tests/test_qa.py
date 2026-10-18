@@ -7,6 +7,7 @@ from app.core import openai_client, s3_client
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
 
+
 # autouse=True 的意思是：「不用等有人在參數列表裡點名要你，這個檔案裡每一個測試開始前，自動先跑我」
 # 所以這個 fixture 不會看到有人呼叫他
 @pytest.fixture(autouse=True)

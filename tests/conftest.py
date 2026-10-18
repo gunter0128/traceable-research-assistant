@@ -7,16 +7,19 @@ import os
 
 from dotenv import dotenv_values
 
-# dotenv_values 只是讀檔案回傳一個 dict 不會自動生效
-_test_env = dotenv_values(".env.test")
-# os.environ 是代表這個程式環境變數的特殊 dict 寫進去 = 真的設一個環境變數
-# pydantic-settings 的規則：環境變數優先權比 .env 檔案高 所以等一下 Settings() 會撿到這裡設的值 不是 .env 裡的
-os.environ["DATABASE_URL"] = _test_env["DATABASE_URL"]
-os.environ["SECRET_KEY"] = _test_env["SECRET_KEY"]
+# 本機：從 .env.test 讀測試資料庫（Neon 的測試分支）
+# GitHub Actions（CI）：沒有 .env.test，改用 workflow 設好的環境變數，連臨時開的 PostgreSQL（docs/decisions/014）
+if os.path.exists(".env.test"):
+    # dotenv_values 只是讀檔案回傳一個 dict 不會自動生效
+    _test_env = dotenv_values(".env.test")
+    # os.environ 是代表這個程式環境變數的特殊 dict 寫進去 = 真的設一個環境變數
+    # pydantic-settings 的規則：環境變數優先權比 .env 檔案高 所以等一下 Settings() 會撿到這裡設的值 不是 .env 裡的
+    os.environ["DATABASE_URL"] = _test_env["DATABASE_URL"]
+    os.environ["SECRET_KEY"] = _test_env["SECRET_KEY"]
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base, get_db
@@ -24,6 +27,11 @@ from app.main import app
 
 engine = create_engine(os.environ["DATABASE_URL"])
 TestSessionLocal = sessionmaker(bind=engine)
+
+# 向量欄位要靠 pgvector 這個擴充功能。Neon 早就啟用了；CI 每次開的是全新的資料庫，要先啟用一次
+# （正式資料庫是在 migration 裡啟用的，測試不跑 migration，直接用 create_all 建表）
+with engine.begin() as _conn:
+    _conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
 
 
 # fixture：一個"準備測試需要的東西"的函式，pytest 自動幫你呼叫

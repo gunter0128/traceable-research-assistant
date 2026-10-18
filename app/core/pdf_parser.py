@@ -6,6 +6,7 @@ from typing import BinaryIO
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+
 class UnreadablePdf(Exception):
     pass
 

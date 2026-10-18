@@ -1,0 +1,217 @@
+# CI/CD（docs/decisions/014）
+# 每次 push：跑測試（CI）。main 分支而且測試全部通過：部署有改到的部分（CD）
+# GitHub 每次開一台全新的 Linux 臨時機器，照下面的步驟執行，做完就丟掉
+
+name: CI/CD
+
+on:
+  push:
+  # 在 GitHub 網頁上手動按按鈕也能執行（例如想重新部署一次）
+  workflow_dispatch:
+
+# 同一時間只跑一個：連續 push 兩次的話，第二次等第一次跑完，不會兩個部署同時改 Lambda
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+# id-token: write：允許向 GitHub 要一張「我是這個專案、這個分支」的證明，拿去跟 AWS 換臨時權限（OIDC）
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  AWS_ACCOUNT_ID: "416113247224"
+  ECR_REPOSITORY: traceable-research-assistant
+  FRONTEND_BUCKET: traceable-research-assistant-frontend-416113247224
+  CLOUDFRONT_DISTRIBUTION_ID: E2IPB9CUGG6K2W
+  SITE_URL: https://dpozdeau5nd0p.cloudfront.net
+
+jobs:
+  # ---------- 這次改了哪些部分 ----------
+  # 比對這次 push 前後的檔案，決定後面要部署後端、前端，還是都不用
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.diff.outputs.backend }}
+      frontend: ${{ steps.diff.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 拿完整的歷史，才比得出這次改了什麼
+      - id: diff
+        run: |
+          BEFORE="${{ github.event.before }}"
+          # 第一次 push、手動執行、或找不到上一次的 commit：當作全部都改了
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+          echo "這次改到的檔案："
+          echo "$CHANGED"
+          # grep -q：有找到就算成功（不印出來）
+          if echo "$CHANGED" | grep -qE '^(app/|alembic/|alembic\.ini|requirements\.txt|Dockerfile|\.dockerignore)'; then
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=false" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$CHANGED" | grep -qE '^frontend/'; then
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------- CI：後端測試 ----------
+  backend-test:
+    runs-on: ubuntu-latest
+    # service container：在這台臨時機器上，跟測試一起開一個 PostgreSQL（已經裝好 pgvector），跑完就丟掉
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        # 等資料庫真的準備好了，才開始跑測試
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    # 測試用的設定：都是假的值。測試裡呼叫 OpenAI、S3、SQS 的地方全部換成假的，不會真的連出去
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:test@localhost:5432/test
+      SECRET_KEY: ci-test-secret-key-that-is-long-enough-32
+      OPENAI_API_KEY: sk-ci-dummy
+      AWS_REGION: ap-southeast-1
+      S3_BUCKET_NAME: ci-test-bucket
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip # 套件下載過一次就存起來，下次不用重新下載
+      - run: pip install -r requirements.txt
+      - name: 檢查程式碼（ruff）
+        run: ruff check app tests
+      - name: 跑測試
+        run: pytest -q -p no:warnings
+
+  # ---------- CI：前端檢查 ----------
+  frontend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # npm ci：照 package-lock.json 裝一模一樣的版本（npm install 可能會裝到比較新的版本）
+      - run: npm ci
+      - name: 型別檢查 + build
+        run: npm run build
+
+  # ---------- CD：部署後端 ----------
+  deploy-backend:
+    needs: [changes, backend-test, frontend-test]
+    # 只有 main 分支、而且這次有改到後端，才部署
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 拿 AWS 的臨時權限：用 GitHub 給的證明，換一組幾分鐘就過期的憑證。GitHub 上不存任何 AWS 金鑰
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/trace-app-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build + push image
+        run: |
+          # 標籤用 commit 編號：看標籤就知道雲端跑的是哪一版程式，要退回上一版也知道指去哪
+          IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+          docker build --platform linux/amd64 --provenance=false -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+          echo "IMAGE=$IMAGE:${{ github.sha }}" >> "$GITHUB_ENV"
+
+      # 資料庫 migration：在更新 Lambda 之前跑。資料庫已經是最新版的話什麼都不做（幾秒就結束）
+      # 規則：migration 要讓舊版程式也能繼續跑（只新增、不直接刪），因為跑完到 Lambda 換好之間，還是舊程式在用
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Migration
+        env:
+          # alembic 載入設定時這幾個是必填，但 migration 用不到，給假的值就好
+          SECRET_KEY: unused
+          OPENAI_API_KEY: unused
+          S3_BUCKET_NAME: unused
+        run: |
+          # 資料庫網址從 Secrets Manager 讀，不放在 GitHub 上
+          DATABASE_URL=$(aws secretsmanager get-secret-value --secret-id trace-app/database-url --query SecretString --output text)
+          # add-mask：之後的輸出裡如果出現這串，GitHub 會換成 ***，不會把密碼印在紀錄裡
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          alembic upgrade head
+
+      - name: 更新三個 Lambda
+        run: |
+          for name in api worker sweeper; do
+            aws lambda update-function-code --function-name "trace-app-$name" --image-uri "$IMAGE" --query "LastUpdateStatus" --output text
+          done
+          # 等三個都更新完，才做下一步
+          for name in api worker sweeper; do
+            aws lambda wait function-updated-v2 --function-name "trace-app-$name"
+          done
+
+      # 熱身：新 image 第一次啟動要先下載，會超過 10 秒。自己先叫醒一次，使用者就不會是第一個
+      - name: 熱身 + 確認能用
+        run: |
+          # worker：用測量模式叫醒（不處理任何文件），順便確認連得到資料庫
+          echo '{"probe": true}' > probe.json
+          aws lambda invoke --function-name trace-app-worker --payload fileb://probe.json --cli-read-timeout 120 out.json
+          cat out.json
+          # API：經過 CloudFront 打一次，沒登入應該回 401。最多試 5 次（第一次可能剛好在冷啟動）
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$SITE_URL/auth/me" || true)
+            echo "第 $i 次：$STATUS"
+            if [ "$STATUS" = "401" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "API 沒有正常回應"
+          exit 1
+
+  # ---------- CD：部署前端 ----------
+  deploy-frontend:
+    needs: [changes, backend-test, frontend-test]
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/trace-app-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+      - name: 上傳到 S3 + 清掉 CloudFront 的快取
+        run: |
+          aws s3 sync dist "s3://$FRONTEND_BUCKET" --delete
+          aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --paths "/*" --query "Invalidation.Status" --output text

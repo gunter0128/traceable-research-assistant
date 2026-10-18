@@ -1,0 +1,66 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LoginToEcr",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PushImage",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:GetRepositoryPolicy",
+        "ecr:SetRepositoryPolicy"
+      ],
+      "Resource": "arn:aws:ecr:ap-southeast-1:416113247224:repository/traceable-research-assistant"
+    },
+    {
+      "Sid": "UpdateAndWarmLambdas",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:UpdateFunctionCode",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:InvokeFunction"
+      ],
+      "Resource": [
+        "arn:aws:lambda:ap-southeast-1:416113247224:function:trace-app-api",
+        "arn:aws:lambda:ap-southeast-1:416113247224:function:trace-app-worker",
+        "arn:aws:lambda:ap-southeast-1:416113247224:function:trace-app-sweeper"
+      ]
+    },
+    {
+      "Sid": "ReadDatabaseUrlForMigration",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:ap-southeast-1:416113247224:secret:trace-app/database-url-*"
+    },
+    {
+      "Sid": "UploadFrontend",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::traceable-research-assistant-frontend-416113247224/*"
+    },
+    {
+      "Sid": "ListFrontendForSync",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::traceable-research-assistant-frontend-416113247224"
+    },
+    {
+      "Sid": "ClearFrontendCache",
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateInvalidation",
+      "Resource": "arn:aws:cloudfront::416113247224:distribution/E2IPB9CUGG6K2W"
+    }
+  ]
+}

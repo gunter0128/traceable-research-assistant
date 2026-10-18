@@ -116,12 +116,12 @@ class _Lease:
 
     # done / total：順便更新進度。租約不是自己的了就丟 LeaseLost
     def beat(self, done: int | None = None, total: int | None = None) -> None:
-        # 每次報平安都記花多久：報平安要連到資料庫（在新加坡），想知道它在總處理時間裡佔多少
-        with log.timed("heartbeat", done=done):
-            # with SessionLocal() as db：開一條獨立的 session，區塊結束自動關掉
-            with SessionLocal() as db:
-                if not document_repo.heartbeat(db, self.document_id, self.token, done, total):
-                    raise LeaseLost
+        # 每次報平安都記花多久：報平安要連到資料庫，想知道它在總處理時間裡佔多少
+        # with SessionLocal() as db：開一條獨立的 session，區塊結束自動關掉
+        # 兩個 with 寫在同一行：效果跟一層包一層一樣，從左到右依序進入
+        with log.timed("heartbeat", done=done), SessionLocal() as db:
+            if not document_repo.heartbeat(db, self.document_id, self.token, done, total):
+                raise LeaseLost
 
 
 def list_documents(db: Session, workspace_id: int, owner_id: int) -> list[Document]:

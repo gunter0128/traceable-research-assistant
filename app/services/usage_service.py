@@ -16,7 +16,7 @@ from app.repositories import usage_repo
 USER_DAILY_LIMIT_USD = Decimal("0.5")
 # 全系統每天最多花多少美元：任何人都能註冊，只限制每人的話，註冊很多帳號就繞過了
 # 這是最後一道防線，保證一天的帳單最多就是這麼多
-SYSTEM_DAILY_LIMIT_USD = Decimal("5")
+SYSTEM_DAILY_LIMIT_USD = Decimal(5)
 # 「今天」用台灣時間算：使用者在台灣，「明天再試」指的是台灣的半夜 12 點之後
 # 台灣沒有日光節約時間，固定 +8 小時就好
 TAIWAN = timezone(timedelta(hours=8))

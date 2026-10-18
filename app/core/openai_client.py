@@ -26,7 +26,7 @@ GENERATION_MODEL = "gpt-4o-mini"
 # 每 100 萬個 token 多少美元：(輸入, 輸出)。embedding 只有輸入
 # 2026-10 OpenAI 官網的價格，OpenAI 調價時要跟著改（docs/decisions/012）
 PRICES_PER_MILLION = {
-    EMBEDDING_MODEL: (Decimal("0.02"), Decimal("0")),
+    EMBEDDING_MODEL: (Decimal("0.02"), Decimal(0)),
     GENERATION_MODEL: (Decimal("0.15"), Decimal("0.60")),
 }
 

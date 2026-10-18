@@ -221,7 +221,31 @@ Get-Content out.json
 
 ## 每次發布新版本
 
-改了程式之後要做的事。漏掉其中一步，各部分就會跑不同版本的程式碼（這是 C5 要自動化的東西）。
+**2026-10-18 起由 GitHub Actions 自動做**（[decisions/014](decisions/014-ci-cd.md)）：push 到 main，測試通過就自動部署有改到的部分。執行紀錄在 GitHub 專案的 **Actions** 分頁。
+
+### GitHub Actions 的 AWS 權限（只做一次）
+
+```powershell
+aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+aws iam create-role --role-name trace-app-deploy-role --assume-role-policy-document file://deploy/github-deploy-trust-policy.json --query "Role.Arn"
+aws iam put-role-policy --role-name trace-app-deploy-role --policy-name trace_app_deploy_permissions --policy-document file://deploy/github-deploy-permissions-policy.json
+```
+
+- 第 1 行：讓 AWS 信任 GitHub 發的證明（OIDC）。整個帳號只要建一次
+- 第 2 行：部署用的角色，只信任 `gunter0128/traceable-research-assistant` 的 main 分支
+- 第 3 行：只給部署需要的權限（推 image、更新和叫醒 Lambda、讀資料庫網址、上傳前端、清快取）
+
+### 退回上一版
+
+image 的標籤是 commit 編號。把三個 Lambda 指回上一個能用的版本：
+
+```powershell
+foreach ($name in "api", "worker", "sweeper") { aws lambda update-function-code --function-name "trace-app-$name" --image-uri "${REPO}:<上一個 commit 編號>" --region $REGION --query "LastUpdateStatus" }
+```
+
+### 手動部署（GitHub Actions 出問題時）
+
+下面是 CI/CD 之前手動發布的指令，GitHub Actions 做的就是這些。漏掉其中一步，各部分就會跑不同版本的程式碼。
 
 **後端**（改了 `app/`、`requirements.txt`、`Dockerfile`）：
 
