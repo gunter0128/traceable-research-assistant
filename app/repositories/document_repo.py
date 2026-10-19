@@ -128,10 +128,22 @@ def heartbeat(
     return updated == 1
 
 
+# 何時呼叫：處理文件時，檢查同一個 workspace 有沒有內容一模一樣、已經處理好的文件（docs/decisions/022）
+# 只比對處理成功的：失敗或取消的文件不算數，使用者把它刪掉重傳也不會被擋
+def find_duplicate(db: Session, workspace_id: int, content_hash: str, exclude_id: int) -> Document | None:
+    return (
+        db.query(Document)
+        .filter(Document.workspace_id == workspace_id, Document.content_hash == content_hash)
+        .filter(Document.status == "processed", Document.id != exclude_id)
+        .first()
+    )
+
+
 # 何時呼叫：全部處理完，要把「新的 chunk + 狀態改成完成」一起存進去
 # 先下 UPDATE 看租約還是不是自己的，是才 commit（chunk 跟狀態在同一個 transaction，一起生效）；
 # 不是就 rollback，這次寫的 chunk 全部丟掉，不會跟接手的 Lambda 存出兩份
-def finish_processed(db: Session, document_id: int, token: str) -> bool:
+# content_hash：檔案內容的指紋，處理成功時一起記下（docs/decisions/022）
+def finish_processed(db: Session, document_id: int, token: str, content_hash: str | None = None) -> bool:
     updated = (
         db.query(Document)
         .filter(Document.id == document_id, Document.claim_token == token)
@@ -142,6 +154,7 @@ def finish_processed(db: Session, document_id: int, token: str) -> bool:
                 Document.processed_at: datetime.now(timezone.utc),
                 Document.error_message: None,  # 之前失敗過、重試成功的話，把舊的失敗原因清掉
                 Document.claim_token: None,
+                Document.content_hash: content_hash,
             },
             synchronize_session=False,
         )

@@ -2,6 +2,7 @@
 # 不寫 SQL 不碰 HTTP
 
 import contextlib
+import hashlib
 import io
 import logging
 import sys
@@ -83,6 +84,13 @@ class UploadTicket:
 # PDF 讀得開，但一個字都抓不到（通常是掃描檔，整頁都是圖片）
 class NoExtractableText(Exception):
     pass
+
+
+# 同一個 workspace 已經有內容一模一樣的文件（docs/decisions/022）。filename：先上傳的那一份叫什麼，放進給使用者看的訊息
+class DuplicateDocument(Exception):
+    def __init__(self, filename: str):
+        super().__init__(filename)
+        self.filename = filename
 
 
 # OpenAI 暫時連不上、而且還有剩餘次數：這次先不處理，文件回到「排隊中」
@@ -312,6 +320,12 @@ def process_document(db: Session, document: Document) -> Document:
             content = s3_client.download_file(document.storage_path)
             # 執行完才知道檔案多大，中途補進這筆 log 的欄位
             fields["size_bytes"] = len(content)
+        # 重複文件（docs/decisions/022）：內容的指紋跟同一個 workspace 裡已經處理好的文件一樣，就不處理
+        # 放在解析、轉向量之前：重複的文件不花轉向量的錢，也不會在搜尋時佔掉名額
+        content_hash = hashlib.sha256(content).hexdigest()
+        duplicate = document_repo.find_duplicate(db, document.workspace_id, content_hash, document.id)
+        if duplicate:
+            raise DuplicateDocument(duplicate.filename)
         # pdf_parser.extract_text 要的是一個「檔案物件」，io.BytesIO 把一包 bytes 包裝成檔案物件，
         # 跟上傳那邊 file.file（UploadFile 的底層）是同一種東西
         with log.timed("parsed") as fields:
@@ -355,6 +369,8 @@ def process_document(db: Session, document: Document) -> Document:
         return _fail(db, document, lease, f"超過 {MAX_PAGES} 頁的上限")
     except NoExtractableText:
         return _fail(db, document, lease, "抓不到任何文字，可能是掃描檔（目前不支援）")
+    except DuplicateDocument as error:
+        return _fail(db, document, lease, f"跟「{error.filename}」的內容完全相同，不需要重複上傳")
     # OpenAI 的錯誤：先在 openai_client 裡分好類，這裡決定業務上怎麼處理
     # S3 的錯誤：一樣在 s3_client 裡分好類。檔案不見了重試也沒用，訊息要說清楚，不能叫使用者「稍後重試」
     except s3_client.FileMissing:
@@ -374,7 +390,7 @@ def process_document(db: Session, document: Document) -> Document:
         return _fail(db, document, lease, "處理時發生錯誤，可以稍後重試")
 
     # 「所有新 chunk + 狀態改成完成」在同一刻一起生效；租約已經不是自己的了，就整批丟掉
-    if document_repo.finish_processed(db, document.id, token):
+    if document_repo.finish_processed(db, document.id, token, content_hash):
         log.event("processed", chunks=len(pieces), total_ms=log.elapsed_ms(started))
     else:
         log.event("lease_lost", logging.WARNING, total_ms=log.elapsed_ms(started))

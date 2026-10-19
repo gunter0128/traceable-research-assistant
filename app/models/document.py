@@ -34,6 +34,9 @@ class Document(Base):
     # 進度：已處理幾段 / 總共幾段，前端顯示「處理中 200 / 330」
     progress_done = Column(Integer, nullable=True)
     progress_total = Column(Integer, nullable=True)
+    # 檔案內容的指紋（SHA-256，64 個十六進位字元），處理成功時才記下，用來擋同一個 workspace 的重複文件
+    # （docs/decisions/022）。內容只要差一個 byte，指紋就完全不同；這個欄位上線前處理的文件是空的
+    content_hash = Column(String(64), nullable=True, index=True)
 
     workspace = relationship("Workspace", back_populates="documents")
     chunks = relationship(
