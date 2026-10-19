@@ -1,9 +1,13 @@
 # /ask 端點的測試：問答 + ownership。真的打 OpenAI 的部分全部 mock 掉，不花錢、結果每次都一樣
 
 
+from datetime import date
+from types import SimpleNamespace
+
 import pytest
 
 from app.core import openai_client, s3_client
+from app.services import qa_service
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
 
@@ -82,9 +86,14 @@ def test_cannot_ask_others_workspace(client):
 # 測試：正常問答，answer 跟 citations 的形狀跟內容都對
 # generate_answer 也 mock 掉——這裡不測 LLM 答得好不好，只測我們自己寫的串接邏輯
 def test_ask_returns_answer_with_citations(client, monkeypatch):
-    monkeypatch.setattr(
-        openai_client, "generate_answer", lambda question, context, **kwargs: "這是生成的答案"
-    )
+    # 把丟給模型的資料記下來，最後檢查裡面有檔名和今天日期
+    sent = {}
+
+    def fake_generate(question, context, **kwargs):
+        sent["context"] = context
+        return "這是生成的答案"
+
+    monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
 
     # valid_pdf_bytes() 手刻的內容流只支援 latin-1，塞中文會編碼失敗，這裡故意用英文內容
     token = _register_and_login(client, "carol@example.com")
@@ -104,6 +113,46 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
     assert len(body["citations"]) == 1
     assert body["citations"][0]["filename"] == "thesis.pdf"
     assert "Multi-hop retrieval" in body["citations"][0]["content"]
+    assert "今天日期" in sent["context"]
+    assert "【文件 1】thesis.pdf" in sent["context"]
+
+
+# 測試：給模型的資料（docs/decisions/018）
+# 同一份文件的段落放在一起、照原文順序排；每份文件附上檔名和開頭；編號跨文件連續；最前面是今天日期
+# 用 SimpleNamespace 假造段落和文件：這裡只測「怎麼兜」，不需要真的資料庫
+def test_context_groups_chunks_by_document_with_header_and_date():
+    new = SimpleNamespace(id=1, filename="手冊_2026.pdf")
+    old = SimpleNamespace(id=2, filename="手冊_2025.pdf")
+    # 搜尋結果的順序：新版第 3 段最相關，其次是舊版第 1 段，再來是新版第 1 段
+    chunks = [
+        SimpleNamespace(document_id=1, document=new, chunk_index=3, content="新版第 3 段"),
+        SimpleNamespace(document_id=2, document=old, chunk_index=1, content="舊版第 1 段"),
+        SimpleNamespace(document_id=1, document=new, chunk_index=1, content="新版第 1 段"),
+    ]
+    headers = {1: "員工手冊（2026 年版）\n生效日期：2026 年 1 月 1 日", 2: "員工手冊（2025 年版）"}
+
+    groups = qa_service._group_by_document(chunks)
+    context = qa_service._build_context(groups, headers, date(2026, 10, 20))
+
+    assert context == (
+        "今天日期：2026 年 10 月 20 日\n\n"
+        "【文件 1】手冊_2026.pdf\n文件開頭：員工手冊（2026 年版） 生效日期：2026 年 1 月 1 日\n\n"
+        "[1] 新版第 1 段\n\n"
+        "[2] 新版第 3 段\n\n"
+        "【文件 2】手冊_2025.pdf\n文件開頭：員工手冊（2025 年版）\n\n"
+        "[3] 舊版第 1 段"
+    )
+
+
+# 測試：文件開頭只取前 200 個字，很長的第一段不會整段塞進去
+def test_context_header_is_truncated():
+    doc = SimpleNamespace(id=1, filename="a.pdf")
+    chunk = SimpleNamespace(document_id=1, document=doc, chunk_index=5, content="內容")
+
+    context = qa_service._build_context(qa_service._group_by_document([chunk]), {1: "字" * 500}, date(2026, 1, 1))
+
+    assert "文件開頭：" + "字" * qa_service.DOCUMENT_HEADER_CHARS + "\n" in context
+    assert "字" * (qa_service.DOCUMENT_HEADER_CHARS + 1) not in context
 
 
 # 測試：workspace 裡還沒有任何文件時問問題，不會噴錯，只是 citations 是空的

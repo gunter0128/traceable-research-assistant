@@ -27,6 +27,7 @@ os.environ["DATABASE_URL"] = os.environ.get(
 )
 
 import argparse
+import importlib
 import json
 import re
 import subprocess
@@ -133,11 +134,12 @@ def judge(client: OpenAI, domain: str, q: dict, response: str, cited: list[str])
 
 
 # ---------- 一輪：逐題問、評分 ----------
-def run_once(db, user, workspace, questions, client, domain) -> list[dict]:
+def run_once(db, user, workspace, questions, client, domain, today) -> list[dict]:
     rows = []
     for q in questions:
         started = time.perf_counter()
-        response = qa_service.ask(db, workspace.id, user.id, q["question"])
+        # 今天日期固定成知識庫設定的「現在」（2026-10-20），分數才不會因為哪天跑評估而變
+        response = qa_service.ask(db, workspace.id, user.id, q["question"], today=today)
         seconds = time.perf_counter() - started
         # 系統目前把搜到的 5 段全部當引用回傳，所以「引用的文件」就是「搜到的文件」
         retrieved = sorted({doc_code(c.filename) for c in response.citations})
@@ -237,7 +239,8 @@ def main():
     all_rows, summaries = [], []
     for i in range(args.runs):
         print(f"\n第 {i + 1} 輪")
-        rows = run_once(db, user, workspace, questions, client, corpus["domain"])
+        today = importlib.import_module(f"eval.{args.corpus}.rules").TODAY
+        rows = run_once(db, user, workspace, questions, client, corpus["domain"], today)
         all_rows.append(rows)
         summaries.append(summarize(rows))
 

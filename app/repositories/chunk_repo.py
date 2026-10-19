@@ -27,6 +27,17 @@ def delete_for_document(db: Session, document_id: int) -> None:
     db.query(Chunk).filter(Chunk.document_id == document_id).delete()
 
 
+# 每份文件的第一段（chunk_index = 0），回傳 {document_id: 內容}
+# 問答時拿它的開頭當文件的「身分」：規章、公告、合約的標題和日期通常寫在最前面（docs/decisions/018）
+def first_chunks(db: Session, document_ids: list[int]) -> dict[int, str]:
+    rows = (
+        db.query(Chunk.document_id, Chunk.content)
+        .filter(Chunk.document_id.in_(document_ids), Chunk.chunk_index == 0)
+        .all()
+    )
+    return {document_id: content for document_id, content in rows}
+
+
 # 給一個問題的向量 找出這個 workspace 底下最相近的幾個 chunk
 # chunks 表自己沒有 workspace_id 要 join 回 Document 才能用 workspace_id 篩選
 # cosine_distance 是 pgvector 提供的距離運算子（對應 SQL 的 <=>） 數字越小代表越相近
