@@ -586,6 +586,25 @@ filter ispresent(duration_ms)
 
 ---
 
+## 告警、帳單上限、儀表板（C7，2026-10-19）
+
+全部寫在 [deploy/setup_monitoring.py](../deploy/setup_monitoring.py)，在專案資料夾執行（用的是 AWS CLI 登入的帳號）：
+
+```powershell
+.venv\Scripts\python deploy/setup_monitoring.py 你的email
+```
+
+- 可以重複執行：已經有的會被更新，不會重複建立。改了腳本裡的設定，再執行一次就套用
+- 第一次執行後，信箱會收到 AWS 的確認信，**要點信裡的連結**才會開始收到告警
+- 儀表板：CloudWatch 主控台 → 儀表板 → `trace-app`
+- 告警：CloudWatch 主控台 → 告警
+- 帳單上限：Billing 主控台 → Budgets → `trace-app-monthly`
+- 收到告警、處理完之後，在 [operations-log.md](operations-log.md) 記一筆
+
+設計和每個告警的意思見 [decisions/015](decisions/015-告警與運作紀錄.md)。
+
+---
+
 ## 前端：本機開發環境建置
 
 `frontend/` 是獨立的 React 專案（Vite + TypeScript + Tailwind CSS v4 + shadcn/ui 風格的元件），跟 `app/` 的 Python 環境完全分開。新電腦要接手，裝好 Node.js 之後（見本文件最上面的前置工具表），跑：
