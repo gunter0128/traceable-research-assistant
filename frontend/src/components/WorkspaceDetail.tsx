@@ -350,15 +350,25 @@ function QaPanel({
                   <span className="text-muted-foreground text-xs font-medium">
                     {msg.role === "user" ? "你" : "助理"}
                   </span>
-                  <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+                  <p className="text-sm whitespace-pre-wrap">
+                    {msg.role === "assistant" ? withCitationMarks(msg.content) : msg.content}
+                  </p>
                   {msg.citations && msg.citations.length > 0 && (
                     <div className="mt-1 flex flex-col gap-1.5">
-                      {msg.citations.map((c, j) => (
+                      {/* 答案裡沒有 [n]：模型忘了標，後端退回列出搜到的全部段落，要讓使用者知道不一定都用到了 */}
+                      {!/\[\d+\]/.test(msg.content) && (
+                        <p className="text-muted-foreground text-xs">
+                          答案沒有逐句標註來源，以下是搜尋到的段落
+                        </p>
+                      )}
+                      {msg.citations.map((c) => (
                         <div
-                          key={j}
+                          key={c.number}
                           className="bg-muted rounded-md p-2 text-xs"
                         >
-                          <span className="font-medium">{c.filename}</span>
+                          <span className="font-medium">
+                            <CitationMark number={c.number} /> {c.filename}
+                          </span>
                           <p className="text-muted-foreground mt-0.5 line-clamp-2">
                             {c.content}
                           </p>
@@ -408,5 +418,21 @@ function QaPanel({
         </form>
       </CardContent>
     </Card>
+  )
+}
+
+// 逐句引用（docs/decisions/021）：答案裡的 [1] [2] 換成小標籤，跟下面引用卡片上的編號一樣
+// split 用的正規表示式有括號（捕捉群組），切出來的陣列會保留 [1] 這些標記本身，奇數位置就是標記
+function withCitationMarks(text: string) {
+  return text.split(/(\[\d+\])/).map((part, i) =>
+    i % 2 === 1 ? <CitationMark key={i} number={Number(part.slice(1, -1))} /> : part,
+  )
+}
+
+function CitationMark({ number }: { number: number }) {
+  return (
+    <span className="bg-primary/10 text-primary mx-0.5 rounded px-1 text-[0.7rem] font-medium">
+      {number}
+    </span>
   )
 }

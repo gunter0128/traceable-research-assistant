@@ -33,7 +33,9 @@ export type UploadTicket = {
   key: string
 }
 
+// 答案裡的 [number] 指的是哪一份文件的哪一段（docs/decisions/021）
 export type Citation = {
+  number: number
   document_id: number
   filename: string
   content: string

@@ -16,6 +16,7 @@
 #   → 逐題呼叫 qa_service.ask（跟線上同一份程式碼）→ 評分 → 報表
 # 評分：
 #   檢索（程式判斷）：該引用的文件有沒有在系統搜到的段落裡
+#   引用（程式判斷）：該引用的文件有沒有在答案標的 [1][2] 裡（逐句引用，docs/decisions/021）
 #   回答（gpt-4o 對清單）：一定要提到的有沒有提到、不能說的有沒有出現、該拒答的有沒有拒答
 # 花費：企業 58 題每跑一輪，系統回答約 0.04 美元、評審約 0.3 美元；學校 21 題約三分之一
 
@@ -34,6 +35,7 @@ import subprocess
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from openai import OpenAI
@@ -41,11 +43,11 @@ from sqlalchemy import text
 
 # 載入所有資料表的定義，create_all 才建得出來
 from app import models  # noqa: F401
-from app.core import s3_client
+from app.core import openai_client, s3_client
 from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
 from app.repositories import document_repo, workspace_repo
-from app.services import auth_service, document_service, qa_service
+from app.services import auth_service, document_service, qa_service, usage_service
 from eval.common import CORPORA, TYPE_NAMES
 
 EVAL = Path(__file__).parent
@@ -139,21 +141,25 @@ def run_once(db, user, workspace, questions, client, domain, today) -> list[dict
     for q in questions:
         started = time.perf_counter()
         # 今天日期固定成知識庫設定的「現在」（2026-10-20），分數才不會因為哪天跑評估而變
-        response = qa_service.ask(db, workspace.id, user.id, q["question"], today=today)
+        response, passages = qa_service.ask_with_passages(db, workspace.id, user.id, q["question"], today=today)
         seconds = time.perf_counter() - started
-        # 系統目前把搜到的段落全部當引用回傳，所以「引用的文件」就是「搜到的文件」
-        retrieved = sorted({doc_code(c.filename) for c in response.citations})
+        retrieved = sorted({doc_code(p.filename) for p in passages})
+        # 引用：自己從答案裡數 [n]，不看 response.citations（模型忘了標時，系統會退回列出全部搜到的段落，會灌水）
+        _, marked = qa_service._extract_citations(response.answer, len(passages))
+        cited = sorted({doc_code(p.filename) for p in passages if p.number in marked})
         required = sorted({doc_code(s) for s in q["sources"]})
-        verdict = judge(client, domain, q, response.answer, retrieved)
+        verdict = judge(client, domain, q, response.answer, cited)
 
         included = [v["present"] for v in verdict["must_include"]]
         violated = [v["present"] for v in verdict["must_not"]]
         refused = bool(verdict["refused"])
         row = {
             "id": q["id"], "type": q["type"], "question": q["question"], "response": response.answer,
-            "seconds": round(seconds, 2), "retrieved": retrieved, "required": required,
+            "seconds": round(seconds, 2), "retrieved": retrieved, "cited": cited, "required": required,
             # 檢索完整（Full Hit）：該引用的文件全部都搜到了。沒有答案的題目不算
             "full_hit": None if q["should_refuse"] else all(r in retrieved for r in required),
+            # 引用完整：該引用的文件，答案全部都有標出來。沒有答案的題目，要「一個都沒標」才算對
+            "cite_full": not cited if q["should_refuse"] else all(r in cited for r in required),
             "include_rate": sum(included) / len(included) if included else None,
             "misuse": any(violated),
             "refused": refused,
@@ -181,6 +187,7 @@ def summarize(rows: list[dict]) -> dict:
             "n": len(group),
             "correct": rate([r["correct"] for r in group]),
             "full_hit": rate([r["full_hit"] for r in group]),
+            "cite_full": rate([r.get("cite_full") for r in group]),
             "misuse": rate([r["misuse"] for r in group]),
             "include": rate([r["include_rate"] for r in group]),
             "refusal_ok": rate([r["refusal_ok"] for r in group]),
@@ -201,15 +208,16 @@ def pct(v):
 
 def report_markdown(summaries: list[dict], meta: dict) -> str:
     lines = [f"## {meta['time']}　{meta['title']}　{meta['note']}", "",
-             f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}", ""]
-    lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
-              "|---|---|---|---|---|---|---|---|"]
+             (f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜"
+              f"回答 {meta.get('model', 'gpt-4o-mini')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
+    lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
+              "|---|---|---|---|---|---|---|---|---|"]
     for key in ["all", *TYPE_NAMES]:
         if key not in summaries[0]:
             continue
         cells = []
-        for metric in ("correct", "full_hit", "misuse", "include", "refusal_ok"):
-            cells.append(" / ".join(pct(s[key][metric]) for s in summaries))
+        for metric in ("correct", "full_hit", "cite_full", "misuse", "include", "refusal_ok"):
+            cells.append(" / ".join(pct(s[key].get(metric)) for s in summaries))
         fails = " ； ".join(f"{s[key]['fail_acquisition']} / {s[key]['fail_usage']}" for s in summaries)
         name = "**全部**" if key == "all" else TYPE_NAMES[key]
         lines.append(f"| {name} | {summaries[0][key]['n']} | {' | '.join(cells)} | {fails} |")
@@ -222,6 +230,7 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="同樣的設定跑幾輪（看分數的隨機波動）")
     parser.add_argument("--note", default="", help="這次評估的說明，例如「基準」「改 prompt」")
     parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / school 學校")
+    parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
     parser.add_argument("--top-k", type=int,
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
     parser.add_argument("--split", choices=["dev", "test", "all"],
@@ -231,6 +240,12 @@ def main():
     corpus = CORPORA[args.corpus]
     if args.top_k:
         qa_service.SEARCH_LIMIT = args.top_k
+    if args.model:
+        openai_client.GENERATION_MODEL = args.model
+        # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
+        openai_client.PRICES_PER_MILLION.setdefault("gpt-4o", (Decimal("2.50"), Decimal(10)))
+    # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
+    usage_service.ensure_within_quota = lambda db, owner_id: None
 
     lines = (EVAL / args.corpus / "questions.jsonl").read_text(encoding="utf-8").splitlines()
     questions = [json.loads(line) for line in lines if line]
@@ -251,7 +266,7 @@ def main():
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
             "corpus": args.corpus, "title": corpus["title"],
-            "commit": commit, "chunks": chunks, "top_k": qa_service.SEARCH_LIMIT, "split": split}
+            "commit": commit, "chunks": chunks, "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split}
     RESULTS.mkdir(parents=True, exist_ok=True)
     out = RESULTS / f"{datetime.now(TAIWAN):%Y%m%d-%H%M}_{args.corpus}_{commit}.json"
     out.write_text(json.dumps({"meta": meta, "summaries": summaries, "runs": all_rows}, ensure_ascii=False, indent=1),

@@ -2,6 +2,7 @@
 # 不寫 SQL 不碰 HTTP
 
 import logging
+import re
 import time
 from datetime import date, datetime
 
@@ -36,6 +37,15 @@ class AIServiceMisconfigured(Exception):
 
 # today：給模型看的「今天日期」。線上不用給（用台灣當天）；評估時固定一個日期，分數才不會因為哪天跑而變
 def ask(db: Session, workspace_id: int, owner_id: int, question: str, today: date | None = None) -> AskResponse:
+    response, _ = ask_with_passages(db, workspace_id, owner_id, question, today)
+    return response
+
+
+# 跟 ask 一樣，另外回傳「這次給模型看的全部段落」
+# API 只需要答案引用到的；評估要分開看「搜到了哪些」（檢索）跟「答案引用了哪些」（引用）
+def ask_with_passages(
+    db: Session, workspace_id: int, owner_id: int, question: str, today: date | None = None
+) -> tuple[AskResponse, list[CitationOut]]:
     # 借用 workspace 的 ownership 檢查：先確認這個 workspace 是不是你的
     workspace_service.get_owned_workspace(db, workspace_id, owner_id)
     # 今天的用量到上限了就不回答（docs/decisions/012）。還沒到的話，這次會完整回答完，就算答完之後超過了也一樣
@@ -63,13 +73,13 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str, today: dat
         with log.timed("qa_generate") as fields:
             answer = openai_client.generate_answer(question, context, deadline=deadline, on_usage=record_usage)
             fields["answer_chars"] = len(answer or "")
-        # 簡單版 citation：這次搜到、丟給 LLM 的 chunk 全部算數 不檢查答案有沒有每段都真的用到
-        # 順序跟給模型看的編號 [1] [2]… 一樣（按文件分組），以後做逐句引用時才對得起來
+        # 給模型看的全部段落，number 就是給模型看的編號 [1] [2]…（順序跟 _build_context 一樣）
         # 放在 try 裡面：要在下面 finally 寫入用量（commit）之前讀完段落的內容
-        citations = [
-            CitationOut(document_id=chunk.document_id, filename=document.filename, content=chunk.content)
-            for document, group in groups
-            for chunk in group
+        passages = [
+            CitationOut(number=number, document_id=chunk.document_id, filename=document.filename, content=chunk.content)
+            for number, (document, chunk) in enumerate(
+                ((document, chunk) for document, group in groups for chunk in group), start=1
+            )
         ]
     # openai_client 已經做完秒級重試了，走到這裡代表重試也沒用
     # from None：不把 OpenAI 原本的錯誤接在後面，API 層只需要知道是哪一種
@@ -84,7 +94,44 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str, today: dat
         for usage in usages:
             usage_service.record(db, owner_id, "qa", usage)
 
-    return AskResponse(answer=answer, citations=citations)
+    # 逐句引用（docs/decisions/021）：只回傳答案裡真的標到的段落
+    answer, cited = _extract_citations(answer or "", len(passages))
+    if cited:
+        citations = [passage for passage in passages if passage.number in cited]
+    elif NOT_FOUND in answer:
+        # 說找不到的答案不附引用：不然會變成「答案說找不到，下面卻附了一份文件」
+        citations = []
+    else:
+        # 安全網：模型有回答、卻忘了標編號（評估時約三成），退回列出搜到的全部段落，至少看得到來源
+        # 前端看答案裡沒有 [n]，會註明「沒有逐句標註，以下是搜尋到的段落」
+        citations = passages
+    return AskResponse(answer=answer, citations=citations), passages
+
+
+# 資料裡找不到答案時，模型會說的話（跟 openai_client.ANSWER_RULES 第 7 條的說法一樣）
+NOT_FOUND = "文件中找不到相關資訊"
+
+
+# 答案裡的引用標記：[1]、[1][2]、[1, 2]、全形的［1］都算
+_MARKER = re.compile(r"[\[［]\s*(\d+(?:\s*[,，、]\s*\d+)*)\s*[\]］]")
+
+
+# 從答案裡找出引用了哪幾段，並把標記統一寫成 [1][2]
+# 同一個標記裡有幾個編號超出範圍的（例如只給 5 段，卻寫 [1, 9]），只留範圍內的 [1]
+# 整個標記都不在範圍內的，原文不動：那可能根本不是引用（例如「[2025]」）。
+#   也可能是模型編出來的編號，但這很少見，寧可留著，也不要誤刪原文
+def _extract_citations(answer: str, count: int) -> tuple[str, set[int]]:
+    cited = set()
+
+    def normalize(match: re.Match) -> str:
+        numbers = [int(n) for n in re.findall(r"\d+", match.group(1))]
+        valid = [n for n in dict.fromkeys(numbers) if 1 <= n <= count]
+        if not valid:
+            return match.group()
+        cited.update(valid)
+        return "".join(f"[{n}]" for n in valid)
+
+    return _MARKER.sub(normalize, answer), cited
 
 
 # 同一份文件的段落放在一起（docs/decisions/018）

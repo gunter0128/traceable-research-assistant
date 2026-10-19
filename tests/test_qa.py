@@ -91,7 +91,7 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
 
     def fake_generate(question, context, **kwargs):
         sent["context"] = context
-        return "這是生成的答案"
+        return "這是生成的答案[1]"
 
     monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
 
@@ -109,12 +109,66 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["answer"] == "這是生成的答案"
+    assert body["answer"] == "這是生成的答案[1]"
     assert len(body["citations"]) == 1
+    assert body["citations"][0]["number"] == 1
     assert body["citations"][0]["filename"] == "thesis.pdf"
     assert "Multi-hop retrieval" in body["citations"][0]["content"]
     assert "今天日期" in sent["context"]
     assert "【文件】thesis.pdf" in sent["context"]
+
+
+# 測試：答案沒有標任何來源（例如說找不到）時，不附引用（docs/decisions/021）
+# 以前會把搜到的段落全部當引用，變成「答案說找不到，下面卻附了一份文件」
+def test_answer_without_markers_has_no_citations(client, monkeypatch):
+    monkeypatch.setattr(
+        openai_client, "generate_answer", lambda question, context, **kwargs: "文件中找不到相關資訊"
+    )
+    token = _register_and_login(client, "erin@example.com")
+    ws_id = _create_workspace(client, token)
+    _upload_pdf(client, token, ws_id, text="Multi-hop retrieval is the core method")
+
+    response = client.post(
+        f"/workspaces/{ws_id}/ask",
+        json={"question": "法國的首都是哪裡？"},
+        headers=_auth_headers(token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["citations"] == []
+
+
+# 測試：模型有回答、卻忘了標編號時，退回列出搜到的段落（安全網，docs/decisions/021）
+def test_answer_without_markers_falls_back_to_retrieved_passages(client, monkeypatch):
+    monkeypatch.setattr(openai_client, "generate_answer", lambda question, context, **kwargs: "核心方法是多跳檢索")
+    token = _register_and_login(client, "frank@example.com")
+    ws_id = _create_workspace(client, token)
+    _upload_pdf(client, token, ws_id, text="Multi-hop retrieval is the core method")
+
+    response = client.post(
+        f"/workspaces/{ws_id}/ask",
+        json={"question": "這篇論文的方法是什麼？"},
+        headers=_auth_headers(token),
+    )
+
+    assert [c["number"] for c in response.json()["citations"]] == [1]
+
+
+# 測試：從答案裡找出引用標記（docs/decisions/021）
+# 各種寫法都認得、統一寫成 [1][2]；超出範圍的編號拿掉；整個都不在範圍內的（可能不是引用）原文不動
+@pytest.mark.parametrize(
+    ("answer", "expected_answer", "expected_cited"),
+    [
+        ("14 天[2]。", "14 天[2]。", {2}),
+        ("可以[1][3]，也可以［2］", "可以[1][3]，也可以[2]", {1, 2, 3}),
+        ("見[1, 2]、[2，3]", "見[1][2]、[2][3]", {1, 2, 3}),
+        ("見[1, 9]", "見[1]", {1}),
+        ("民國[2025]年", "民國[2025]年", set()),
+        ("文件中找不到相關資訊", "文件中找不到相關資訊", set()),
+    ],
+)
+def test_extract_citations(answer, expected_answer, expected_cited):
+    assert qa_service._extract_citations(answer, 3) == (expected_answer, expected_cited)
 
 
 # 測試：給模型的資料（docs/decisions/018）
