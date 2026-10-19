@@ -114,7 +114,7 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
     assert body["citations"][0]["filename"] == "thesis.pdf"
     assert "Multi-hop retrieval" in body["citations"][0]["content"]
     assert "今天日期" in sent["context"]
-    assert "【文件 1】thesis.pdf" in sent["context"]
+    assert "【文件】thesis.pdf" in sent["context"]
 
 
 # 測試：給模型的資料（docs/decisions/018）
@@ -136,10 +136,10 @@ def test_context_groups_chunks_by_document_with_header_and_date():
 
     assert context == (
         "今天日期：2026 年 10 月 20 日\n\n"
-        "【文件 1】手冊_2026.pdf\n文件開頭：員工手冊（2026 年版） 生效日期：2026 年 1 月 1 日\n\n"
+        "【文件】手冊_2026.pdf\n文件開頭：員工手冊（2026 年版） 生效日期：2026 年 1 月 1 日\n\n"
         "[1] 新版第 1 段\n\n"
         "[2] 新版第 3 段\n\n"
-        "【文件 2】手冊_2025.pdf\n文件開頭：員工手冊（2025 年版）\n\n"
+        "【文件】手冊_2025.pdf\n文件開頭：員工手冊（2025 年版）\n\n"
         "[3] 舊版第 1 段"
     )
 

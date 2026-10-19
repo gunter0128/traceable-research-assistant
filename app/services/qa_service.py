@@ -98,14 +98,15 @@ def _group_by_document(chunks) -> list[tuple]:
 #   今天日期：模型不知道今天幾號，就判斷不了「10 月起調整」生效了沒有
 #   每份文件附上檔名和開頭：一段文字切出來之後，常常看不出是哪份文件、哪個版本
 #     開頭直接給模型讀，不自己解析日期：民國年、西元年、學年度各種寫法，模型都讀得懂
+#   文件不編號、只標檔名：編了號，模型會寫「依據：文件 1」，使用者看不到文件 1 是哪一份
 #   段落編號 [1] [2]… 跨文件連續編，跟 citations 的順序一樣
 def _build_context(groups, headers: dict[int, str], today: date) -> str:
     blocks = [f"今天日期：{today.year} 年 {today.month} 月 {today.day} 日"]
     number = 0
-    for i, (document, group) in enumerate(groups, start=1):
+    for document, group in groups:
         # 把換行和連續空白壓成一個空格，開頭才不會佔太多行
         header = " ".join(headers.get(document.id, "").split())[:DOCUMENT_HEADER_CHARS]
-        blocks.append(f"【文件 {i}】{document.filename}\n文件開頭：{header}")
+        blocks.append(f"【文件】{document.filename}\n文件開頭：{header}")
         for chunk in group:
             number += 1
             blocks.append(f"[{number}] {chunk.content}")
