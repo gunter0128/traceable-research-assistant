@@ -20,6 +20,9 @@ ANSWER_BUDGET_SECONDS = 50
 # 每份文件附上開頭的幾個字，讓模型知道段落出自哪份文件、哪個版本（docs/decisions/018）
 DOCUMENT_HEADER_CHARS = 200
 
+# 每次問答搜幾段給模型看（docs/decisions/020）
+SEARCH_LIMIT = 5
+
 
 # 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
 # 暫時性的（重試過還是不行）跟永久性的（設定有誤）分開，給使用者的訊息不同
@@ -51,7 +54,7 @@ def ask(db: Session, workspace_id: int, owner_id: int, question: str, today: dat
         with log.timed("qa_embed", question_chars=len(question)):
             query_embedding = openai_client.embed_query(question, deadline=deadline, on_usage=record_usage)
         with log.timed("qa_search") as fields:
-            chunks = chunk_repo.search_similar(db, workspace_id, query_embedding)
+            chunks = chunk_repo.search_similar(db, workspace_id, query_embedding, limit=SEARCH_LIMIT)
             groups = _group_by_document(chunks)
             headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
             fields["chunks"] = len(chunks)

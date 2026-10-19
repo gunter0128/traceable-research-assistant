@@ -141,7 +141,7 @@ def run_once(db, user, workspace, questions, client, domain, today) -> list[dict
         # 今天日期固定成知識庫設定的「現在」（2026-10-20），分數才不會因為哪天跑評估而變
         response = qa_service.ask(db, workspace.id, user.id, q["question"], today=today)
         seconds = time.perf_counter() - started
-        # 系統目前把搜到的 5 段全部當引用回傳，所以「引用的文件」就是「搜到的文件」
+        # 系統目前把搜到的段落全部當引用回傳，所以「引用的文件」就是「搜到的文件」
         retrieved = sorted({doc_code(c.filename) for c in response.citations})
         required = sorted({doc_code(s) for s in q["sources"]})
         verdict = judge(client, domain, q, response.answer, retrieved)
@@ -222,11 +222,15 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="同樣的設定跑幾輪（看分數的隨機波動）")
     parser.add_argument("--note", default="", help="這次評估的說明，例如「基準」「改 prompt」")
     parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / school 學校")
+    parser.add_argument("--top-k", type=int,
+                        help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
     parser.add_argument("--split", choices=["dev", "test", "all"],
                         help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
                              "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
+    if args.top_k:
+        qa_service.SEARCH_LIMIT = args.top_k
 
     lines = (EVAL / args.corpus / "questions.jsonl").read_text(encoding="utf-8").splitlines()
     questions = [json.loads(line) for line in lines if line]
@@ -247,7 +251,7 @@ def main():
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
             "corpus": args.corpus, "title": corpus["title"],
-            "commit": commit, "chunks": chunks, "top_k": 5, "split": split}
+            "commit": commit, "chunks": chunks, "top_k": qa_service.SEARCH_LIMIT, "split": split}
     RESULTS.mkdir(parents=True, exist_ok=True)
     out = RESULTS / f"{datetime.now(TAIWAN):%Y%m%d-%H%M}_{args.corpus}_{commit}.json"
     out.write_text(json.dumps({"meta": meta, "summaries": summaries, "runs": all_rows}, ensure_ascii=False, indent=1),
