@@ -1,17 +1,22 @@
-# 把 docs/ 裡的 18 份文件（簡單的 Markdown）轉成 PDF，放到 pdfs/（B3）
-# 用法（專案資料夾）：.venv\Scripts\python -m eval.enterprise.build_pdfs
-# 做法：Markdown → HTML（公司規章的版面）→ 用 Edge 的無頭模式「列印成 PDF」
+# 把知識庫的文件（簡單的 Markdown）轉成 PDF（B3）
+# 用法（專案資料夾）：.venv\Scripts\python -m eval.build_pdfs --corpus enterprise（或 school）
+#   讀 eval/<corpus>/docs/，產生到 eval/<corpus>/pdfs/
+# 做法：Markdown → HTML（規章的版面）→ 用 Edge 的無頭模式「列印成 PDF」
 # 使用者上傳的就是 PDF，用 PDF 測才測得到解析（中文、表格）的問題
+# 產生完會用系統自己的解析程式讀回來，檢查規則表（rules.py 的 FACTS）裡的關鍵字都真的在對應的文件裡
 
+import argparse
 import html
+import importlib
 import re
 import subprocess
 import tempfile
 from pathlib import Path
 
-HERE = Path(__file__).parent
-DOCS = HERE / "docs"
-PDFS = HERE / "pdfs"
+from app.core import pdf_parser
+from eval.common import CORPORA
+
+EVAL = Path(__file__).parent
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
 CSS = """
@@ -27,15 +32,13 @@ th { background: #eee; }
 .footer { margin-top: 28px; font-size: 8.5pt; color: #666; border-top: 1px solid #ccc; padding-top: 6px; }
 """
 
-FOOTER = "本文件為虛構公司「青嶼科技」之測試資料，僅供系統評估使用，非真實公司規章。"
-
 
 def inline(text: str) -> str:
     # **粗體** → <b>粗體</b>
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(text))
 
 
-def to_html(markdown: str) -> str:
+def to_html(markdown: str, footer: str) -> str:
     out, table, items = [], [], []
 
     def flush():
@@ -69,23 +72,47 @@ def to_html(markdown: str) -> str:
         elif line:
             out.append(f"<p>{inline(line)}</p>")
     flush()
-    out.append(f'<div class="footer">{FOOTER}</div>')
+    out.append(f'<div class="footer">{footer}</div>')
     return f'<!doctype html><html><head><meta charset="utf-8"><style>{CSS}</style></head><body>{"".join(out)}</body></html>'
 
 
+def check_facts(corpus: str, pdfs: Path) -> None:
+    # 去掉所有空白再比對：PDF 解析出來的文字可能在任何地方斷行
+    rules = importlib.import_module(f"eval.{corpus}.rules")
+    facts = getattr(rules, "FACTS", [])
+    if not facts:
+        print("rules.py 沒有列 FACTS，跳過檢查")
+        return
+    texts = {pdf.name[:pdf.name.index("_")]: re.sub(r"\s", "", pdf_parser.extract_text(pdf))
+             for pdf in pdfs.glob("*.pdf")}
+    missing = [(code, fact) for code, fact in facts if re.sub(r"\s", "", fact) not in texts[code]]
+    for code, fact in missing:
+        print(f"  找不到：{code}「{fact}」")
+    print(f"檢查規則表的 {len(facts)} 個關鍵字：{'全部都在' if not missing else f'{len(missing)} 個找不到'}")
+    if missing:
+        raise SystemExit(1)
+
+
 def main():
-    PDFS.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--corpus", choices=CORPORA, required=True)
+    args = parser.parse_args()
+    docs, pdfs = EVAL / args.corpus / "docs", EVAL / args.corpus / "pdfs"
+    footer = CORPORA[args.corpus]["footer"]
+
+    pdfs.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
-        for md in sorted(DOCS.glob("*.md")):
+        for md in sorted(docs.glob("*.md")):
             page = Path(tmp) / f"{md.stem}.html"
-            page.write_text(to_html(md.read_text(encoding="utf-8")), encoding="utf-8")
-            pdf = PDFS / f"{md.stem}.pdf"
+            page.write_text(to_html(md.read_text(encoding="utf-8"), footer), encoding="utf-8")
+            pdf = pdfs / f"{md.stem}.pdf"
             subprocess.run(
                 [EDGE, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
                  f"--print-to-pdf={pdf}", page.as_uri()],
                 check=True, capture_output=True,
             )
             print(f"{pdf.name}")
+    check_facts(args.corpus, pdfs)
 
 
 if __name__ == "__main__":

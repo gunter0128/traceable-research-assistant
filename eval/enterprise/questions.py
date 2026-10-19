@@ -3,41 +3,16 @@
 # 產生 questions.jsonl（給評分程式用）和 questions.md（給人看）
 #
 # 標準答案裡的數字都用 rules.py 算出來，不是手寫的，所以跟文件一定一致
-# 每題的欄位：
-#   type          general 普通題 / conditional 條件題 / persona 身分題 / version 版本題 /
-#                 scope 範圍陷阱 / cross_doc 跨文件題 / no_answer 沒有答案
-#   question      使用者的問題（身分寫在問題裡，跟真實使用時一樣）
-#   answer        標準答案（給人看、也給評審參考）
-#   must_include  好的答案一定要提到的事實
-#   must_not      出現就算錯的說法（例如把正職的規定套到實習生身上）
-#   sources       應該引用的文件和條文
-#   should_refuse 文件裡沒有答案，應該說找不到
+# 欄位的意思見 eval/common.py
 
-import json
-from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 
+from eval.common import Question, assign_splits, money, write_question_files
 from eval.enterprise import rules as R
 from eval.enterprise.rules import Person
 
 HERE = Path(__file__).parent
-
-
-@dataclass
-class Question:
-    id: str
-    type: str
-    question: str
-    answer: str
-    must_include: list[str]
-    sources: list[str]
-    must_not: list[str] = field(default_factory=list)
-    should_refuse: bool = False
-
-
-def money(n: int) -> str:
-    return f"{n:,} 元"
 
 
 # 常用的身分
@@ -248,27 +223,8 @@ QUESTIONS = [
 
 
 def main():
-    ids = [q.id for q in QUESTIONS]
-    assert len(ids) == len(set(ids)), "題號重複"
-    (HERE / "questions.jsonl").write_text(
-        "\n".join(json.dumps(asdict(q), ensure_ascii=False) for q in QUESTIONS) + "\n", encoding="utf-8")
-    titles = {"general": "普通題", "conditional": "條件題", "persona": "身分題", "version": "版本題",
-              "scope": "範圍陷阱", "cross_doc": "跨文件題", "no_answer": "沒有答案"}
-    lines = ["# 青嶼科技知識庫評估題目", "", "由 `python -m eval.enterprise.questions` 產生，標準答案的數字來自 `rules.py`。", ""]
-    for qtype, title in titles.items():
-        group = [q for q in QUESTIONS if q.type == qtype]
-        lines += [f"## {title}（{len(group)} 題）", ""]
-        for q in group:
-            lines.append(f"**{q.id}　{q.question}**")
-            lines.append(f"- 標準答案：{q.answer}")
-            if q.sources:
-                lines.append(f"- 應該引用：{'、'.join(q.sources)}")
-            if q.must_not:
-                lines.append(f"- 不能說：{'；'.join(q.must_not)}")
-            lines.append("")
-    (HERE / "questions.md").write_text("\n".join(lines), encoding="utf-8")
-    counts = {titles[t]: sum(1 for q in QUESTIONS if q.type == t) for t in titles}
-    print(f"共 {len(QUESTIONS)} 題：{counts}")
+    assign_splits(QUESTIONS)
+    write_question_files(QUESTIONS, HERE, "青嶼科技知識庫評估題目", "python -m eval.enterprise.questions")
 
 
 if __name__ == "__main__":
