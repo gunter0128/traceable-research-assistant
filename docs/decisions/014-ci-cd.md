@@ -46,6 +46,8 @@ GitHub Actions 可以在那台臨時機器上，跟測試一起開一個資料�
 
 不把 AWS 金鑰存在 GitHub：長期有效的金鑰多放一個地方，就多一個外流的機會。這跟 Lambda 用角色、不放金鑰是同一個原則。
 
+第一次部署時被 AWS 拒絕：GitHub 發的證明上，身分寫的是 `repo:gunter0128@106064208/traceable-research-assistant@1360211986:ref:refs/heads/main`，**名字後面多了帳號和專案的編號**，跟信任條件裡只寫名字的字串對不上。從 AWS CloudTrail 的紀錄查到 GitHub 實際送來的值，照著改信任條件就好了。GitHub 加上編號是為了防冒充：專案改名或刪掉之後，別人可以註冊同名的帳號和專案，只比對名字的話，他的證明也會符合；編號不會重複，冒充不了。
+
 部署用的角色 `trace-app-deploy-role` 只給部署需要的權限：推 image 到這一個 ECR 倉庫、更新和叫醒這三個 Lambda、讀資料庫網址（migration 用）、上傳前端到這一個 bucket、清這一個 CloudFront 的快取。而且只信任 main 分支，別的分支就算改了設定檔也拿不到權限。
 
 ### 3. migration 自動跑

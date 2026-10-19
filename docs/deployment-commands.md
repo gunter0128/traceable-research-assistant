@@ -233,6 +233,7 @@ aws iam put-role-policy --role-name trace-app-deploy-role --policy-name trace_ap
 
 - 第 1 行：讓 AWS 信任 GitHub 發的證明（OIDC）。整個帳號只要建一次
 - 第 2 行：部署用的角色，只信任 `gunter0128/traceable-research-assistant` 的 main 分支
+  - 信任條件要寫 GitHub 實際送來的格式：`repo:帳號@帳號編號/專案@專案編號:ref:refs/heads/main`。不確定的話，先部署一次讓它失敗，到 CloudTrail 查 `AssumeRoleWithWebIdentity` 的紀錄，`userIdentity` 裡就是實際的值
 - 第 3 行：只給部署需要的權限（推 image、更新和叫醒 Lambda、讀資料庫網址、上傳前端、清快取）
 
 ### 退回上一版

@@ -10,7 +10,7 @@
       "Condition": {
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:gunter0128/traceable-research-assistant:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:gunter0128@106064208/traceable-research-assistant@1360211986:ref:refs/heads/main"
         }
       }
     }
