@@ -130,7 +130,7 @@ client  POST /workspaces/3/documents  (multipart, PDF 檔案)
 **兩個設計決定**：
 
 1. **處理流程同步觸發**：PDF 解析 → chunking → embedding 這段，寫在 upload 那個 request 裡面做完，request 沒回應前就處理完成，直接把 `status` 改成 `processed`（或失敗時改成 `failed`）。沒有另外開 background task 或 process 端點。好處是簡單、跟 `status` 欄位設計一致；代價是檔案大或 embedding API 慢的時候，使用者要等比較久 —— 這是刻意先不處理的最佳化，之後真的需要再拆成非同步。
-2. **Embedding 和生成都用 OpenAI**：embedding 用 `text-embedding-3-small`（1536 維），生成答案用 `gpt-4o-mini`。
+2. **Embedding 和生成都用 OpenAI**：embedding 用 `text-embedding-3-small`（1536 維），生成答案用 `gpt-4o`（一開始是 `gpt-4o-mini`，2026-10 換掉，見 decisions/023）。
 
 ### 分工圖（V1 新增部分）
 

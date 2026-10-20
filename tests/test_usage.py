@@ -76,9 +76,9 @@ def _spend(db_session, user_id, cost, created_at=None):
     db_session.commit()
 
 
-# 測試：價格換算。gpt-4o-mini 輸入 100 萬個 token 0.15、輸出 100 萬個 0.60
+# 測試：價格換算。gpt-4o 輸入 100 萬個 token 2.50、輸出 100 萬個 10
 def test_cost_calculation():
-    assert Usage(openai_client.GENERATION_MODEL, 1_000_000, 1_000_000).cost_usd() == Decimal("0.75")
+    assert Usage(openai_client.GENERATION_MODEL, 1_000_000, 1_000_000).cost_usd() == Decimal("12.50")
     assert Usage(openai_client.EMBEDDING_MODEL, 1_000_000).cost_usd() == Decimal("0.02")
 
 
@@ -93,7 +93,7 @@ def test_ask_records_usage(client, db_session):
     assert sorted(r.model for r in records) == sorted([openai_client.EMBEDDING_MODEL, openai_client.GENERATION_MODEL])
     generate = next(r for r in records if r.model == openai_client.GENERATION_MODEL)
     assert (generate.input_tokens, generate.output_tokens) == (2500, 300)
-    assert generate.cost_usd == Decimal("0.000555")
+    assert generate.cost_usd == Decimal("0.00925")
 
 
 # 測試：處理文件的用量算在上傳的人身上，記下是哪份文件

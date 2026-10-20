@@ -21,13 +21,14 @@ from app.core.config import settings
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 # 負責生成答案用的模型 跟上面 embedding 用的是不同任務 分開一個常數
-GENERATION_MODEL = "gpt-4o-mini"
+# 2026-10 從 gpt-4o-mini 換成 gpt-4o：「適不適用於問的人」的題目答得好很多，每題成本約 16 倍（docs/decisions/023）
+GENERATION_MODEL = "gpt-4o"
 
 # 每 100 萬個 token 多少美元：(輸入, 輸出)。embedding 只有輸入
 # 2026-10 OpenAI 官網的價格，OpenAI 調價時要跟著改（docs/decisions/012）
 PRICES_PER_MILLION = {
     EMBEDDING_MODEL: (Decimal("0.02"), Decimal(0)),
-    GENERATION_MODEL: (Decimal("0.15"), Decimal("0.60")),
+    GENERATION_MODEL: (Decimal("2.50"), Decimal(10)),
 }
 
 

@@ -209,7 +209,7 @@ def pct(v):
 def report_markdown(summaries: list[dict], meta: dict) -> str:
     lines = [f"## {meta['time']}　{meta['title']}　{meta['note']}", "",
              (f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜"
-              f"回答 {meta.get('model', 'gpt-4o-mini')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
+              f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
     for key in ["all", *TYPE_NAMES]:
@@ -243,7 +243,7 @@ def main():
     if args.model:
         openai_client.GENERATION_MODEL = args.model
         # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
-        openai_client.PRICES_PER_MILLION.setdefault("gpt-4o", (Decimal("2.50"), Decimal(10)))
+        openai_client.PRICES_PER_MILLION.setdefault("gpt-4o-mini", (Decimal("0.15"), Decimal("0.60")))
     # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
     usage_service.ensure_within_quota = lambda db, owner_id: None
 

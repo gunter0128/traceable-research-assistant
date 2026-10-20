@@ -20,7 +20,7 @@
 
 上傳 PDF 時，系統會在同一個 request 裡同步跑完整個處理流程：解析出文字（pypdf）→ 依 token 數切成一段一段、段落間保留重疊避免關鍵字被切斷（tiktoken）→ 每段轉成向量（OpenAI `text-embedding-3-small`）→ 存進 Postgres（pgvector 存向量，一個 chunk 屬於一份 document）。
 
-問問題時（`POST /workspaces/{id}/ask`）：先確認這個 workspace 是你的 → 把問題也轉成向量 → 用 pgvector 的向量相似度搜尋，只在**這個 workspace 底下**找出最相關的幾段（不會搜到別的 workspace，即使是自己的其他 workspace 也不會）→ 把搜到的內容連同問題一起丟給 LLM（`gpt-4o-mini`），system prompt 強制「只能照給的資料回答，資料不夠就明說，不能編答案」→ 回傳答案，附上這次參考的來源（文件名 + 內容片段）。
+問問題時（`POST /workspaces/{id}/ask`）：先確認這個 workspace 是你的 → 把問題也轉成向量 → 用 pgvector 的向量相似度搜尋，只在**這個 workspace 底下**找出最相關的幾段（不會搜到別的 workspace，即使是自己的其他 workspace 也不會）→ 把搜到的內容連同問題一起丟給 LLM（`gpt-4o`），system prompt 強制「只能照給的資料回答，資料不夠就明說，不能編答案」→ 回傳答案，附上這次參考的來源（文件名 + 內容片段）。
 
 ## Tech Stack
 
