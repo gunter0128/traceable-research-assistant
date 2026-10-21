@@ -1,88 +1,174 @@
 # Traceable Research Assistant
 
-這個專案的起點是我的碩士論文（multi-hop / trace-aware RAG），目標是把論文裡的檢索概念做成一個真的能部署、能被別人操作的文件問答系統——不只是回答問題，還要讓使用者看見答案是怎麼一步步被找出來的。
+A question-answering service over your own PDFs. Every sentence in an answer cites the passage it came from, and the system is built to keep running on AWS when things go wrong.
 
-目前完成了 V0（後端地基）、V1（RAG 問答），V2（部署到 AWS）進行中：使用者能註冊登入、建立自己的研究工作區（workspace）、上傳 PDF 文件，並且針對 workspace 裡的文件提問，系統會回傳答案，並附上答案是從哪份文件、哪一段找到的（citation）。每個人只看得到自己的東西。Multi-hop 檢索視覺化是後面版本才會加上去；極簡前端已經提前動工，細節見 [`docs/architecture.md`](docs/architecture.md)。
+> **中文摘要**　把碩士論文（多跳問答的 RAG 失敗分析）做成可以實際使用的知識問答服務：上傳 PDF 後提問，回答逐句附上出處。重點不在功能數量，而在可靠性與可驗證性：背景處理與自動重試、雲端故障演練、延遲與成本量測、CI/CD、告警，以及用評估資料集決定設計取捨。所有設計決策記錄在 [`docs/decisions/`](docs/decisions/)（中文）。
 
-## V0：後端地基
+## What it does
 
-系統分三塊功能，每一塊都走完整的一套：使用者驗證、資源的建立/查詢/修改/刪除，而且每個操作都會檢查「這是不是你的東西」——不存在回 404，存在但不是你的回 403。
+- **Upload PDFs** into a private workspace. Files are parsed, chunked, embedded and indexed in the background.
+- **Ask questions** about those documents. Answers mark each sentence with `[1]`, `[2]`… and return only the passages that were actually cited.
+- **Say "not found"** instead of guessing when the documents do not contain the answer.
+- **Reject duplicate uploads** by content hash, and let users **retry or cancel** anything they are waiting on.
 
-- **Auth**：註冊、登入（bcrypt 雜湊密碼、JWT 簽發）、查自己的資料
-- **Workspace**：使用者可以建立多個工作區，CRUD 齊全，只看得到自己名下的
-- **Document**：在 workspace 底下上傳 PDF（存在 AWS S3），列表、查詢、刪除。文件本身沒有自己的擁有者欄位——擁有權是透過它所屬的 workspace 判斷的，這是刻意的設計：擁有者只有一個來源，不會兩邊資料不一致
+## Why this project
 
-後端分四層：`api`（收發 HTTP）→ `services`（業務規則，包括上面講的 ownership 檢查）→ `repositories`（唯一碰資料庫查詢的地方）→ `models`（資料表定義）。這樣分是因為每一層會因為不同的原因被修改——換資料庫只動 `repositories`，改規則只動 `services`，不會互相波及。細節看 [`docs/architecture.md`](docs/architecture.md)。
+My master's thesis studied why RAG systems answer multi-hop questions incorrectly, and split failures into *evidence not retrieved* versus *evidence retrieved but misused*. This project takes that research out of the notebook: it is a deployed service where reliability, cost and answer quality are measured rather than assumed.
 
-資料庫從一開始就用 PostgreSQL（開發環境是 [Neon](https://neon.tech)），沒有用 SQLite 過渡，因為 V1 要用到 Postgres 專屬的 pgvector 做向量檢索。
+## Architecture
 
-## V1：RAG 問答
+```
+                         CloudFront (fixed HTTPS URL)
+                   ┌───────────────┴───────────────┐
+            static frontend                    API requests
+            (S3, React)                 Lambda: FastAPI via Mangum
+                                                   │
+   browser ── presigned upload ──▶ S3 (PDFs)       │
+                                                   ▼
+                                   SQS ──▶ Lambda: worker ──▶ OpenAI
+                                    │                         (embeddings, answers)
+                                   DLQ
+                 hourly schedule ──▶ Lambda: sweeper
+                                                   │
+                                   PostgreSQL + pgvector (Neon)
+```
 
-上傳 PDF 時，系統會在同一個 request 裡同步跑完整個處理流程：解析出文字（pypdf）→ 依 token 數切成一段一段、段落間保留重疊避免關鍵字被切斷（tiktoken）→ 每段轉成向量（OpenAI `text-embedding-3-small`）→ 存進 Postgres（pgvector 存向量，一個 chunk 屬於一份 document）。
+| Component | Role |
+|---|---|
+| API Lambda | FastAPI app (auth, workspaces, documents, Q&A) behind CloudFront |
+| S3 | PDFs are uploaded directly from the browser with a presigned POST, so large files never pass through the API |
+| SQS + worker Lambda | Background processing: parse → chunk → embed → store |
+| Sweeper Lambda | Hourly: marks stuck documents as failed and removes orphaned S3 files |
+| PostgreSQL + pgvector | Data and vector search, always scoped to one workspace |
+| Secrets Manager / CloudWatch | Secrets loaded at cold start; structured JSON logs and alarms |
 
-問問題時（`POST /workspaces/{id}/ask`）：先確認這個 workspace 是你的 → 把問題也轉成向量 → 用 pgvector 的向量相似度搜尋，只在**這個 workspace 底下**找出最相關的幾段（不會搜到別的 workspace，即使是自己的其他 workspace 也不會）→ 把搜到的內容連同問題一起丟給 LLM（`gpt-4o`），system prompt 強制「只能照給的資料回答，資料不夠就明說，不能編答案」→ 回傳答案，附上這次參考的來源（文件名 + 內容片段）。
+All three Lambdas run from one Docker image. Nothing runs when nobody is using it, so idle cost is close to zero.
 
-## Tech Stack
+The backend uses four layers, `api → services → repositories → models`, so ownership rules live in one place and only repositories touch the database.
 
-Python 3.11、FastAPI、PostgreSQL + pgvector + SQLAlchemy 2.0 + Alembic、bcrypt + JWT、OpenAI API（embedding + 生成）、pypdf、tiktoken、pytest、Docker、AWS（S3 + ECR + ECS/Fargate + Secrets Manager + IAM）。前端：React + Vite + TypeScript + Tailwind CSS。
+## Engineering highlights
 
-## 本地啟動
+### Background processing that recovers on its own
+- Uploads return immediately. Processing happens in a worker fed by SQS.
+- OpenAI errors are classified as temporary or permanent. Temporary failures are retried in seconds, then deferred for 2 minutes, for up to 3 rounds.
+- A worker holds a **lease with heartbeats**. If it dies mid-document, the document is marked *interrupted* within 5 minutes and can be retried, instead of staying "processing" forever.
+- Each document is processed in one transaction, so a failure never leaves half its chunks behind.
+
+### Failures tested on purpose
+About 30 failure modes are listed in [`docs/failure-modes.md`](docs/failure-modes.md), each with its evidence. Several were reproduced in the cloud. For example, pointing the worker at an unreachable OpenAI endpoint, or killing it mid-run. One drill showed that a worker crashing at the wrong moment left a document stuck forever, which led to the lease and heartbeat design above.
+
+### Measured, not guessed
+Structured logs carry a request ID from the API through SQS to the worker. Per-step timings showed that a 170 ms round trip between the Sydney Lambdas and the Singapore database dominated processing time. Moving everything to Singapore cut upload-to-ready time from about 23 s to about 11.5 s.
+
+### Cost control
+Token usage and cost are recorded for every call. Daily limits apply per user (USD 0.50) and across the whole system (USD 5). Limits are checked before work starts, and work that has started is allowed to finish.
+
+### CI/CD
+GitHub Actions ([`ci-cd.yml`](.github/workflows/ci-cd.yml)) runs on every push:
+- Lint (ruff) and 135 tests against a real PostgreSQL + pgvector service container, plus a frontend type check and build.
+- On `main`, it deploys only what changed. AWS access uses short-lived OIDC credentials, so no keys are stored in GitHub.
+- Database migrations run before the Lambdas are updated, and must stay compatible with the previous version.
+- After deploying, it warms up the new image and checks that the API responds, failing the run if it does not.
+
+### Alerts
+Email alarms cover only the problems that need a person: error logs, an invalid or exhausted OpenAI key, the system-wide limit being reached, a sweeper that has not run, and messages in the dead-letter queue. Alarms fire on state changes, so a week-long issue sends one email, not hundreds.
+
+### Answer quality, evaluated
+I built two evaluation sets: a fictional company knowledge base (18 documents, 58 questions) and a fictional school (21 questions, a different domain used only for held-out checks). The questions focus on whether a rule actually *applies to the person asking*, for example a policy that differs by seniority, an outdated version, or a regional exception.
+
+- Retrieval is scored by code. Answers are scored by an LLM judge against per-question checklists of required facts and forbidden claims.
+- Wrong answers are split into *not retrieved* versus *retrieved but misused*, the same two-layer analysis as my thesis.
+- Each change is kept only if it measurably helps. Rejected ideas are recorded with the reason.
+
+Comparing answer models (2 runs each, same prompt):
+
+| Question set | gpt-4o-mini | gpt-4o |
+|---|---|---|
+| Company, practice (41) | 76% / 73% | 80% / 80% |
+| Company, unseen exam (17) | 76% / 65% | 76% / 82% |
+| School, other domain (21) | 86% / 90% | 95% / 95% |
+
+The biggest gap was on questions where a rule does *not* apply to the asker (73% → 95% across all sets), so answers now use gpt-4o. Details: [`docs/eval-results.md`](docs/eval-results.md).
+
+## Design decisions
+
+Every non-trivial choice has a short decision record in [`docs/decisions/`](docs/decisions/) (24 so far, in Chinese), covering the context, the options considered and why one was chosen. A few examples:
+
+| # | Decision |
+|---|---|
+| 001 | Go deeper on reliability, cost and quality instead of adding features |
+| 003 | Background processing with SQS + Lambda |
+| 008 | Heartbeats and leases to detect dead workers |
+| 011 | Move all AWS resources to Singapore, next to the database |
+| 013 | Fixed HTTPS URL: API on Lambda behind CloudFront |
+| 014 | CI/CD with GitHub Actions and OIDC |
+| 017 | Evaluation method and how to avoid overfitting prompts to the test set |
+| 023 | Answer model comparison: gpt-4o-mini vs gpt-4o |
+
+## Tech stack
+
+**Backend:** Python 3.11, FastAPI, SQLAlchemy 2.0, Alembic, PostgreSQL + pgvector, pytest, ruff
+**AI:** OpenAI `text-embedding-3-small` (embeddings), gpt-4o (answers), pypdf, tiktoken
+**Cloud:** AWS Lambda, SQS, S3, CloudFront, ECR, Secrets Manager, CloudWatch, EventBridge, IAM; Docker
+**CI/CD:** GitHub Actions
+**Frontend:** React, Vite, TypeScript, Tailwind CSS
+
+## Run locally
 
 ```bash
 git clone https://github.com/gunter0128/traceable-research-assistant.git
 cd traceable-research-assistant
 python -m venv .venv
-.venv\Scripts\activate        # Windows，macOS/Linux 用 source .venv/bin/activate
+.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-複製 `.env.example` 成 `.env`，填入你的 Postgres 連線字串、一組密鑰（`python -c "import secrets; print(secrets.token_urlsafe(32))"` 可以生一組）、和 OpenAI API key，然後：
+Copy `.env.example` to `.env` and fill in a PostgreSQL connection string (with pgvector), a secret key (`python -c "import secrets; print(secrets.token_urlsafe(32))"`), an OpenAI API key and an S3 bucket. Without `SQS_QUEUE_URL`, documents are processed inline in the upload request, so no queue is needed for local development.
 
 ```bash
 alembic upgrade head
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload     # API docs at http://localhost:8000/docs
 ```
 
-打開 `http://localhost:8000/docs` 用 Swagger UI 直接試，或是啟動前端（見下方「前端」一節）用網頁介面操作。
-
-## API
-
-| 方法 | 路徑 | 說明 | 需要登入 |
-|---|---|---|---|
-| POST | `/auth/register` | 註冊 | |
-| POST | `/auth/login` | 登入，拿 JWT | |
-| GET | `/auth/me` | 查自己的資料 | ✓ |
-| POST | `/workspaces` | 建立 workspace | ✓ |
-| GET | `/workspaces` | 列出自己的 workspace | ✓ |
-| GET | `/workspaces/{id}` | 查一個 workspace | ✓ |
-| PUT | `/workspaces/{id}` | 改名 | ✓ |
-| DELETE | `/workspaces/{id}` | 刪除 | ✓ |
-| POST | `/workspaces/{id}/documents` | 上傳 PDF（自動解析、切段、embedding） | ✓ |
-| GET | `/workspaces/{id}/documents` | 列出 workspace 裡的文件 | ✓ |
-| GET | `/documents/{id}` | 查一份文件 | ✓ |
-| DELETE | `/documents/{id}` | 刪除文件 | ✓ |
-| POST | `/workspaces/{id}/ask` | 針對這個 workspace 的文件提問，回傳答案 + 引用來源 | ✓ |
-
-## 前端
-
-`frontend/` 是獨立的 React + Vite + TypeScript 專案（極簡介面，不是這個專案要練習的重點，細節見 `docs/architecture.md`）。需要先裝 [Node.js](https://nodejs.org)（LTS 版本），裝完要開一個新的終端機：
+Frontend (needs Node.js LTS):
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev                       # http://localhost:5173, proxies API calls to :8000
 ```
 
-打開 `http://localhost:5173`。開發時後端要另外用 `uvicorn app.main:app --reload` 開著（8000），前端會自動把 API 請求轉過去，不用額外設定。
-
-## 測試
+## Tests
 
 ```bash
-pytest tests/ -v
+pytest
 ```
 
-36 個測試，涵蓋 V0 三個功能的正常流程、錯誤處理、跨使用者 ownership 檢查，以及 V1 的 RAG pipeline：`/ask` 的 ownership 檢查、向量搜尋只在指定 workspace 範圍內、PDF 解析/切段的純函式測試。**測試不會真的呼叫 OpenAI**（embedding、生成都用假的固定回應取代）——不花錢、跑起來快、結果每次都一樣，不需要自己的 OpenAI key 也能跑通整個測試套件。測試連的是另一個獨立的 Neon 分支，不會碰到開發用的資料，設定方式見 `.env.test.example`。
+135 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
 
-## 接下來
+## API
 
-V2（部署到 AWS）進行中，進度跟每個決定的理由記在 [`docs/architecture.md`](docs/architecture.md)。極簡前端已經提前動工（原計畫 V4），還沒整合進部署流程。再之後是 multi-hop trace 視覺化（V3，論文的核心差異化特色）。
+| Method | Path | Description |
+|---|---|---|
+| POST | `/auth/register` · `/auth/login` | Sign up, get a JWT |
+| GET | `/auth/me` | Current user |
+| POST / GET | `/workspaces` | Create / list workspaces |
+| GET / PUT / DELETE | `/workspaces/{id}` | Read / rename / delete a workspace (and its files) |
+| POST | `/workspaces/{id}/uploads` | Get a presigned S3 upload ticket |
+| POST / GET | `/workspaces/{id}/documents` | Register an uploaded file / list documents |
+| GET / DELETE | `/documents/{id}` | Read / delete a document |
+| POST | `/documents/{id}/retry` · `/documents/{id}/cancel` | Retry a failed document / cancel one in progress |
+| POST | `/workspaces/{id}/ask` | Ask a question, get an answer with citations |
+| GET | `/usage/today` | Today's usage against the daily limit |
+
+## Known limitations
+
+- Cross-lingual retrieval is weak: a Chinese question about an English document matches noticeably worse than the same question in English.
+- Summary questions ("what is this paper about?") are a poor fit for top-5 passage retrieval.
+- The free-tier database sleeps after 5 minutes idle, so the first request afterwards takes about 2 s longer.
+- Evaluation is run manually when Q&A code changes. It is not in CI because it costs money and its results vary between runs.
+
+## What's next
+
+- Multi-hop retrieval with a visible reasoning trace, which is the core idea of my thesis.
+- A load test following the same pattern as the rest of the project: write down the expected bottleneck, measure, change, measure again.
