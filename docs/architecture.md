@@ -404,6 +404,7 @@ qa_service.ask(db, workspace_id, owner_id, question)
   │       文件開頭：……生效日期：2026 年 1 月 1 日……
   │       [1] ……
   │       [2] ……
+  │       評估時可以在開頭下面標文件狀態（DOC_STATUS，029）。量過沒有效果，線上沒開
   │  6. 呼叫模型：system prompt 是 7 條通用的閱讀原則（019），問題後面再提醒一次標引用（021）
   │  7. 從答案裡抓出 [n]，只回傳被標到的段落（021）
   │       說找不到 → 不附引用；有回答但忘了標 → 退回列出搜到的段落，前端會註明
@@ -426,5 +427,6 @@ AskResponse { answer: "……14 天[1]。", citations: [ { number: 1, filename, 
 | `eval/run.py` | 用臨時資料庫跑評估：檢索、引用用程式判斷，回答用 gpt-4o 評審逐項對清單 |
 | `eval/retrieval.py` | 只比檢索（不生成答案），用來便宜地篩選搜尋的做法（028） |
 | `eval/openai_baseline.py` | 對照：OpenAI 現成的 file search（025、027） |
+| `eval/doc_status.py` | 每份文件狀態的標準答案（現行、舊版…），用來量標籤的上限和小模型判斷的準確率（029） |
 
 結果寫在 `docs/eval-results.md`。改到問答相關的程式時手動跑（不接 CI 的原因見 docs/decisions/024）。

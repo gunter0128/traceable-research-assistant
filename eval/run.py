@@ -49,6 +49,7 @@ from app.core.db import Base, SessionLocal, engine
 from app.repositories import document_repo, workspace_repo
 from app.services import auth_service, document_service, qa_service, usage_service
 from eval.common import CORPORA, TYPE_NAMES
+from eval.doc_status import gold_status
 
 EVAL = Path(__file__).parent
 RESULTS = EVAL / "data" / "results"
@@ -216,6 +217,7 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
              (f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜"
               # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
               + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
+              + (f"文件狀態 {meta['doc_status']}｜" if meta.get("doc_status", "none") != "none" else "")
               + f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
@@ -242,6 +244,9 @@ def main():
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
     parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog"],
                         help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）")
+    parser.add_argument("--doc-status", choices=["none", "llm", "oracle"],
+                        help="回答前判斷文件是否有效（docs/decisions/029）：llm 小模型判斷；"
+                             "oracle 直接用標準答案（eval/doc_status.py），量「標籤完全正確時」的上限")
     parser.add_argument("--split", choices=["dev", "test", "all"],
                         help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
                              "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
@@ -251,6 +256,11 @@ def main():
         qa_service.SEARCH_LIMIT = args.top_k
     if args.planner:
         qa_service.PLANNER = args.planner
+    if args.doc_status == "oracle":
+        qa_service.DOC_STATUS = "oracle"
+        qa_service._label_documents = oracle_labels(args.corpus)
+    elif args.doc_status:
+        qa_service.DOC_STATUS = args.doc_status
     if args.model:
         openai_client.GENERATION_MODEL = args.model
         # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
@@ -273,9 +283,21 @@ def main():
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
             "corpus": args.corpus, "title": corpus["title"], "commit": current_commit(), "chunks": chunks,
             "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split,
-            "planner": qa_service.PLANNER}
+            "planner": qa_service.PLANNER, "doc_status": qa_service.DOC_STATUS}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
+
+
+# 標準答案當標籤（docs/decisions/029）：換掉 qa_service._label_documents，參數跟它一樣
+def oracle_labels(corpus: str):
+    def label(db, workspace, groups, headers, today, deadline, on_usage):
+        statuses = {}
+        for document, _ in groups:
+            status = gold_status(corpus, doc_code(document.filename))
+            if status != "現行":
+                statuses[document.id] = (status, None)
+        return statuses
+    return label
 
 
 # 讀題目：不指定 split 的話，有練習題就只跑練習題，沒有（學校）就全部跑

@@ -368,6 +368,84 @@ ANSWER_RULES = """你是一個根據使用者提供的文件回答問題的助�
 7. 資料完全沒有相關資訊時，才說「文件中找不到相關資訊」；只有一部分資訊時，回答有的部分，並說明缺什麼。"""
 
 
+# 判斷文件現在是否有效（docs/decisions/029）
+# 搜到的文件裡常常混著舊版、還沒生效的公告、草案、別的單位（例如子公司）的規定，
+# 回答的模型雖然看得到文件開頭，還是會拿它們當答案（028 的錯誤分析裡最多的一種）
+# 先用小模型逐份判斷，把結果標在資料上，回答的模型就不用自己從開頭推
+# 一樣只放通用的判斷原則，不放任何領域的詞（docs/decisions/019）
+STATUS_MODEL = PLANNER_MODEL
+DOC_STATUSES = ("現行", "舊版", "尚未生效", "草案", "其他單位")
+STATUS_RULES = """你負責判斷文件現在是否有效。使用者會給你：今天日期、知識庫的名稱、知識庫裡所有文件的清單（檔名和開頭），以及這次要判斷的幾份文件。
+
+逐份判斷要判斷的文件屬於哪一種：
+- 現行：現在有效的正式規定或文件
+- 舊版：已經有較新的版本取代，或已經廢止
+- 尚未生效：生效日期在今天之後
+- 草案：草案、提案、預告，還沒有正式通過或定案
+- 其他單位：別的組織的規定，不是這個知識庫所屬的單位的
+
+判斷原則：
+1. 根據清單和文件開頭寫的名稱、版本、日期判斷；看不出來的就判斷為「現行」。
+2. 同一份規定有好幾個版本時，今天已經生效的版本裡最新的那一個是「現行」，比它舊的是「舊版」。
+3. 修訂公告只修改原本規定的一部分時，原本的規定仍然是「現行」。
+4. 上級機關訂的、這個單位也要遵守的規定，是「現行」，不是「其他單位」。
+
+只輸出 JSON：{"documents": [{"file": "檔名", "status": "舊版", "reason": "一句話說明，例如：已有 2026 年版"}]}"""
+
+
+# 何時呼叫：qa_service 搜完、回答之前
+# catalog：知識庫裡所有文件 [(檔名, 開頭)]；targets：這次搜到、要判斷的文件 [(檔名, 開頭)]
+# 回傳 {檔名: (狀態, 理由)}；模型回的格式不對、狀態不在 DOC_STATUSES 裡的，就當作沒判斷
+def label_documents(
+    knowledge_base: str,
+    today_text: str,
+    catalog: list[tuple[str, str]],
+    targets: list[tuple[str, str]],
+    deadline: float | None = None,
+    on_usage: Callable[[Usage], None] | None = None,
+) -> dict[str, tuple[str, str | None]]:
+    listing = "\n".join(f"- {filename}｜{header}" for filename, header in catalog)
+    target_listing = "\n".join(f"- {filename}｜{header}" for filename, header in targets)
+    content = (f"今天日期：{today_text}\n知識庫名稱：{knowledge_base}\n\n"
+               f"知識庫裡的所有文件：\n{listing}\n\n要判斷的文件：\n{target_listing}")
+
+    def call(timeout: float):
+        return client.with_options(timeout=timeout).chat.completions.create(
+            model=STATUS_MODEL,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": STATUS_RULES}, {"role": "user", "content": content}],
+        )
+
+    response = _with_retries(
+        call,
+        attempts=QA_ATTEMPTS,
+        timeout=QA_TIMEOUT,
+        max_wait=QA_MAX_WAIT,
+        give_up_on_long_wait=True,
+        deadline=deadline,
+    )
+    if on_usage is not None:
+        on_usage(Usage(STATUS_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens))
+    return _parse_statuses(response.choices[0].message.content, {filename for filename, _ in targets})
+
+
+# 從判斷的 JSON 取出 {檔名: (狀態, 理由)}，只留要判斷的檔名和認得的狀態
+def _parse_statuses(content: str | None, filenames: set[str]) -> dict[str, tuple[str, str | None]]:
+    try:
+        items = json.loads(content or "").get("documents", [])
+    except (ValueError, AttributeError):
+        return {}
+    statuses = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        filename, status, reason = item.get("file"), item.get("status"), item.get("reason")
+        if filename in filenames and status in DOC_STATUSES:
+            statuses[filename] = (status, reason.strip() if isinstance(reason, str) and reason.strip() else None)
+    return statuses
+
+
 # 放在問題後面的提醒：模型對離問題最近的指示比較會照做
 CITATION_REMINDER = "（回答時，用到資料的句子，句尾要標上依據的段落編號，例如 [1]。）"
 
