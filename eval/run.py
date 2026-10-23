@@ -147,32 +147,37 @@ def run_once(db, user, workspace, questions, client, domain, today) -> list[dict
         # 引用：自己從答案裡數 [n]，不看 response.citations（模型忘了標時，系統會退回列出全部搜到的段落，會灌水）
         _, marked = qa_service._extract_citations(response.answer, len(passages))
         cited = sorted({doc_code(p.filename) for p in passages if p.number in marked})
-        required = sorted({doc_code(s) for s in q["sources"]})
-        verdict = judge(client, domain, q, response.answer, cited)
-
-        included = [v["present"] for v in verdict["must_include"]]
-        violated = [v["present"] for v in verdict["must_not"]]
-        refused = bool(verdict["refused"])
-        row = {
-            "id": q["id"], "type": q["type"], "question": q["question"], "response": response.answer,
-            "seconds": round(seconds, 2), "retrieved": retrieved, "cited": cited, "required": required,
-            # 檢索完整（Full Hit）：該引用的文件全部都搜到了。沒有答案的題目不算
-            "full_hit": None if q["should_refuse"] else all(r in retrieved for r in required),
-            # 引用完整：該引用的文件，答案全部都有標出來。沒有答案的題目，要「一個都沒標」才算對
-            "cite_full": not cited if q["should_refuse"] else all(r in cited for r in required),
-            "include_rate": sum(included) / len(included) if included else None,
-            "misuse": any(violated),
-            "refused": refused,
-            "refusal_ok": refused == q["should_refuse"],
-            "verdict": verdict,
-        }
-        # 全對：重點全提到、沒有錯誤說法、拒答正確
-        row["correct"] = row["refusal_ok"] and not row["misuse"] and (row["include_rate"] in (None, 1.0))
-        rows.append(row)
-        mark = "✓" if row["correct"] else "✗"
-        print(f"  {mark} {q['id']} {q['question'][:30]:32} 檢索 {'完整' if row['full_hit'] else ('—' if row['full_hit'] is None else '缺')}"
-              f"{'  誤用' if row['misuse'] else ''}{'  拒答' if refused else ''}")
+        rows.append(score(client, domain, q, response.answer, retrieved, cited, seconds))
     return rows
+
+
+# 評一題：retrieved 是搜到的文件代號，cited 是答案標出來的文件代號
+# 抽出來是為了讓別的比較對象（例如 OpenAI 的 file search，eval/openai_baseline.py）用同一套標準打分
+def score(client, domain, q, answer, retrieved, cited, seconds) -> dict:
+    required = sorted({doc_code(s) for s in q["sources"]})
+    verdict = judge(client, domain, q, answer, cited)
+    included = [v["present"] for v in verdict["must_include"]]
+    violated = [v["present"] for v in verdict["must_not"]]
+    refused = bool(verdict["refused"])
+    row = {
+        "id": q["id"], "type": q["type"], "question": q["question"], "response": answer,
+        "seconds": round(seconds, 2), "retrieved": retrieved, "cited": cited, "required": required,
+        # 檢索完整（Full Hit）：該引用的文件全部都搜到了。沒有答案的題目不算
+        "full_hit": None if q["should_refuse"] else all(r in retrieved for r in required),
+        # 引用完整：該引用的文件，答案全部都有標出來。沒有答案的題目，要「一個都沒標」才算對
+        "cite_full": not cited if q["should_refuse"] else all(r in cited for r in required),
+        "include_rate": sum(included) / len(included) if included else None,
+        "misuse": any(violated),
+        "refused": refused,
+        "refusal_ok": refused == q["should_refuse"],
+        "verdict": verdict,
+    }
+    # 全對：重點全提到、沒有錯誤說法、拒答正確
+    row["correct"] = row["refusal_ok"] and not row["misuse"] and (row["include_rate"] in (None, 1.0))
+    mark = "✓" if row["correct"] else "✗"
+    print(f"  {mark} {q['id']} {q['question'][:30]:32} 檢索 {'完整' if row['full_hit'] else ('—' if row['full_hit'] is None else '缺')}"
+          f"{'  誤用' if row['misuse'] else ''}{'  拒答' if refused else ''}")
+    return row
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -247,11 +252,7 @@ def main():
     # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
     usage_service.ensure_within_quota = lambda db, owner_id: None
 
-    lines = (EVAL / args.corpus / "questions.jsonl").read_text(encoding="utf-8").splitlines()
-    questions = [json.loads(line) for line in lines if line]
-    split = args.split or ("dev" if any(q["split"] == "dev" for q in questions) else "all")
-    if split != "all":
-        questions = [q for q in questions if q["split"] == split]
+    questions, split = load_questions(args.corpus, args.split)
     client = OpenAI(api_key=settings.openai_api_key)
     db, user, workspace, chunks = setup_knowledge_base(args.corpus)
 
@@ -263,22 +264,39 @@ def main():
         all_rows.append(rows)
         summaries.append(summarize(rows))
 
-    commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
-            "corpus": args.corpus, "title": corpus["title"],
-            "commit": commit, "chunks": chunks, "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split}
+            "corpus": args.corpus, "title": corpus["title"], "commit": current_commit(), "chunks": chunks,
+            "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split}
+    save_results(meta, summaries, all_rows, tag=meta["commit"])
+    db.close()
+
+
+# 讀題目：不指定 split 的話，有練習題就只跑練習題，沒有（學校）就全部跑
+def load_questions(corpus: str, split: str | None) -> tuple[list[dict], str]:
+    lines = (EVAL / corpus / "questions.jsonl").read_text(encoding="utf-8").splitlines()
+    questions = [json.loads(line) for line in lines if line]
+    split = split or ("dev" if any(q["split"] == "dev" for q in questions) else "all")
+    if split != "all":
+        questions = [q for q in questions if q["split"] == split]
+    return questions, split
+
+
+def current_commit() -> str:
+    return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+
+
+# 存逐題明細（eval/data/results/，不進 git），並把摘要加到 docs/eval-results.md 最上面
+def save_results(meta: dict, summaries: list[dict], all_rows: list[list[dict]], tag: str) -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
-    out = RESULTS / f"{datetime.now(TAIWAN):%Y%m%d-%H%M}_{args.corpus}_{commit}.json"
+    out = RESULTS / f"{datetime.now(TAIWAN):%Y%m%d-%H%M}_{meta['corpus']}_{tag}.json"
     out.write_text(json.dumps({"meta": meta, "summaries": summaries, "runs": all_rows}, ensure_ascii=False, indent=1),
                    encoding="utf-8")
-
     markdown = report_markdown(summaries, meta)
     header = "# 評估結果\n\n每次評估的結果。題目和評分方式見 docs/decisions/016、017；逐題的明細在 eval/data/results/（不進 git）。\n\n"
     old = REPORT.read_text(encoding="utf-8").removeprefix(header) if REPORT.exists() else ""
     REPORT.write_text(header + markdown + "\n" + old, encoding="utf-8")
     print("\n" + markdown)
     print(f"逐題明細：{out}")
-    db.close()
 
 
 if __name__ == "__main__":
