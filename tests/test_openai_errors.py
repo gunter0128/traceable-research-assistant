@@ -188,7 +188,7 @@ def test_embeddings_sent_in_batches(client, db_session, monkeypatch):
         return [[0.1] * 1536 for _ in texts]
 
     monkeypatch.setattr(openai_client, "embed_texts", fake_embed)
-    monkeypatch.setattr(document_service.chunker, "chunk_text", lambda text: [f"段落 {i}" for i in range(250)])
+    monkeypatch.setattr(document_service.chunker, "chunk", lambda text: [f"段落 {i}" for i in range(250)])
 
     _, _, document_id = _upload(client, "frank@example.com")
 

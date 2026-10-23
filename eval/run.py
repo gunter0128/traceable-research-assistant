@@ -30,6 +30,7 @@ os.environ["DATABASE_URL"] = os.environ.get(
 import argparse
 import importlib
 import json
+import random
 import re
 import subprocess
 import time
@@ -43,7 +44,7 @@ from sqlalchemy import text
 
 # 載入所有資料表的定義，create_all 才建得出來
 from app import models  # noqa: F401
-from app.core import openai_client, s3_client
+from app.core import chunker, openai_client, s3_client
 from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
 from app.repositories import chunk_repo, document_repo, workspace_repo
@@ -251,6 +252,7 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
               # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
               + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
               + (f"文件狀態 {meta['doc_status']}｜" if meta.get("doc_status", "none") != "none" else "")
+              + (f"切段 {meta['chunker']}｜" if meta.get("chunker", "fixed") != "fixed" else "")
               + f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
@@ -281,6 +283,12 @@ def main():
     parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog", "oracle"],
                         help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）；"
                              "oracle 直接用題目的標準答案指定要去哪幾份文件找，量「找文件做到完美時」的上限（031）")
+    parser.add_argument("--oracle-recall", type=float, default=1.0,
+                        help="搭配 --planner oracle：每份該用的文件被選到的機率，模擬不完美的規劃器（docs/decisions/033）")
+    parser.add_argument("--oracle-wrong", type=int, default=0,
+                        help="搭配 --planner oracle：另外多選幾份不相關的文件")
+    parser.add_argument("--chunker", choices=["fixed", "structured"],
+                        help="切段的方式（不指定就用系統現在的設定 chunker.STRATEGY，docs/decisions/032）")
     parser.add_argument("--doc-status", choices=["none", "llm", "oracle"],
                         help="回答前判斷文件是否有效（docs/decisions/029）：llm 小模型判斷；"
                              "oracle 直接用標準答案（eval/doc_status.py），量「標籤完全正確時」的上限")
@@ -291,6 +299,8 @@ def main():
     corpus = CORPORA[args.corpus]
     if args.top_k:
         qa_service.SEARCH_LIMIT = args.top_k
+    if args.chunker:
+        chunker.STRATEGY = args.chunker
     if args.planner:
         qa_service.PLANNER = args.planner
     if args.doc_status == "oracle":
@@ -307,7 +317,7 @@ def main():
 
     questions, split = load_questions(args.corpus, args.split)
     if args.planner == "oracle":
-        qa_service._plan = oracle_plan(questions)
+        qa_service._plan = oracle_plan(questions, args.oracle_recall, args.oracle_wrong)
     client = OpenAI(api_key=settings.openai_api_key)
     db, user, workspace, chunks = setup_knowledge_base(args.corpus)
 
@@ -322,7 +332,9 @@ def main():
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
             "corpus": args.corpus, "title": corpus["title"], "commit": current_commit(), "chunks": chunks,
             "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split,
-            "planner": qa_service.PLANNER, "doc_status": qa_service.DOC_STATUS}
+            "planner": qa_service.PLANNER if args.planner != "oracle" or args.oracle_recall == 1 and not args.oracle_wrong
+            else f"oracle（選對 {args.oracle_recall:.0%}、多選 {args.oracle_wrong} 份）",
+            "doc_status": qa_service.DOC_STATUS, "chunker": chunker.STRATEGY}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
 
@@ -342,12 +354,27 @@ def oracle_labels(corpus: str):
 # 完美的規劃器（docs/decisions/031）：換掉 qa_service._plan，參數跟它一樣
 # 照題目標準答案的出處（sources），每一份該用的文件各搜一次（只在那份文件裡搜），再跟原本的問題輪流合併
 # 量的是「該用的文件一定找得到時，答案最多能好多少」
-def oracle_plan(questions: list[dict]):
-    required = {q["question"]: sorted({doc_code(s) for s in q["sources"]}) for q in questions}
+#
+# recall、wrong：模擬「不完美的規劃器」（docs/decisions/033）
+#   全部題目該用的文件合起來，剛好拿掉 (1 - recall) 的份數（題目不多，逐份擲骰子會偏離設定的比例），
+#   另外每題多選 wrong 份不相關的文件
+#   量的是「模型要準到幾成，才換得到分數」。隨機種子固定，每次跑選到的文件都一樣
+def oracle_plan(questions: list[dict], recall: float = 1.0, wrong: int = 0):
+    by_question = {q["question"]: q for q in questions}
+    pairs = sorted((q["id"], code) for q in questions for code in {doc_code(s) for s in q["sources"]})
+    random.Random(f"drop-{recall}").shuffle(pairs)
+    dropped = set(pairs[:round(len(pairs) * (1 - recall))])
 
     def plan(db, workspace_id, question, deadline, on_usage):
         filenames = {doc_code(f): f for f, _ in chunk_repo.document_headers(db, workspace_id, 10_000)}
-        return [openai_client.PlannedSearch(question, filenames[code]) for code in required.get(question, [])]
+        q = by_question.get(question)
+        if q is None:
+            return []
+        required = sorted({doc_code(s) for s in q["sources"]})
+        picked = [code for code in required if (q["id"], code) not in dropped]
+        others = sorted(code for code in filenames if code not in required)
+        picked += random.Random(f"{q['id']}-wrong-{wrong}").sample(others, min(wrong, len(others)))
+        return [openai_client.PlannedSearch(question, filenames[code]) for code in picked]
     return plan
 
 

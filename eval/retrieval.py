@@ -23,7 +23,7 @@ from eval.run import (REPORT, RESULTS, TAIWAN, current_commit, doc_code, load_ev
                       setup_knowledge_base)
 # isort: on
 
-from app.core import openai_client
+from app.core import chunker, openai_client
 from app.services import qa_service
 from eval.common import CORPORA, TYPE_NAMES, evidence_rate
 
@@ -36,9 +36,12 @@ def main():
     parser.add_argument("--split", choices=["dev", "test", "all"], help="不指定的話跟 eval/run.py 一樣")
     parser.add_argument("--planners", nargs="+", choices=PLANNERS, default=PLANNERS)
     parser.add_argument("--top-k", nargs="+", type=int, default=[5, 8], help="合併之後留幾段")
+    parser.add_argument("--chunker", choices=["fixed", "structured"], default=chunker.STRATEGY,
+                        help="切段的方式（docs/decisions/032）")
     parser.add_argument("--note", default="")
     args = parser.parse_args()
 
+    chunker.STRATEGY = args.chunker
     questions, split = load_questions(args.corpus, args.split)
     evidence = load_evidence(args.corpus)
     # 沒有答案的題目沒有「該用的文件」，不算檢索
@@ -69,6 +72,8 @@ def main():
                     "queries": [vars(s) for s in searches], "retrieved": retrieved, "required": required,
                     "full_hit": len(found) == len(required), "recall": len(found) / len(required),
                     "evidence_rate": quote_rate, "evidence_full": None if quote_rate is None else quote_rate == 1,
+                    # 這題送給模型的段落有多少 token：不同的切法段落大小不同，要比「同樣的量」時看這個
+                    "context_tokens": sum(len(chunker.ENCODING.encode(c.content)) for c in merged),
                     "plan_seconds": round(plan_seconds, 2),
                     "plan_cost": float(sum((u.cost_usd() for u in usages), Decimal(0))),
                 })
@@ -78,7 +83,7 @@ def main():
 
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "corpus": args.corpus,
             "title": CORPORA[args.corpus]["title"], "split": split, "commit": current_commit(), "chunks": chunks,
-            "questions": len(questions), "note": args.note or "只比檢索：規劃方式 × 段數"}
+            "questions": len(questions), "note": args.note or "只比檢索：規劃方式 × 段數", "chunker": args.chunker}
     save(meta, rows, args.planners, args.top_k)
     db.close()
 
@@ -95,6 +100,7 @@ def summarize(rows: list[dict]) -> dict:
         "recall": mean([r["recall"] for r in rows]),
         "evidence_full": mean([r["evidence_full"] for r in rows if r["evidence_full"] is not None]),
         "queries": mean([len(r["queries"]) for r in rows]),
+        "context_tokens": mean([r["context_tokens"] for r in rows]),
         "plan_seconds": mean([r["plan_seconds"] for r in rows]),
         "plan_cost": sum(r["plan_cost"] for r in rows),
         "by_type": {t: mean([r["full_hit"] for r in by_type[t]]) for t in TYPE_NAMES if t in by_type},
@@ -112,16 +118,17 @@ def save(meta: dict, rows: list[dict], planners: list[str], top_ks: list[int]) -
     types = list(next(iter(summaries.values()))["by_type"])
     with_evidence = next(iter(summaries.values()))["evidence_full"] is not None
     lines = [f"## {meta['time']}　{meta['title']}　{meta['note']}", "",
-             f"題目 {meta['split']}（有答案的 {meta['questions']} 題）｜commit `{meta['commit']}`｜{meta['chunks']} 段｜只看檢索，不生成答案", "",
+             (f"題目 {meta['split']}（有答案的 {meta['questions']} 題）｜commit `{meta['commit']}`｜切段 {meta['chunker']}｜"
+             f"{meta['chunks']} 段｜只看檢索，不生成答案"), "",
              "| 規劃 | 段數 | 檢索完整 | 文件找回率 | " + ("原文全部找到 | " if with_evidence else "")
-             + " | ".join(TYPE_NAMES[t] for t in types) + " | 平均幾句 | 規劃秒數 | 規劃花費 |",
-             "|---|---|---|---|" + ("---|" if with_evidence else "") + "---|" * len(types) + "---|---|---|"]
+             + " | ".join(TYPE_NAMES[t] for t in types) + " | 平均幾句 | 送給模型的 token | 規劃秒數 | 規劃花費 |",
+             "|---|---|---|---|" + ("---|" if with_evidence else "") + "---|" * len(types) + "---|---|---|---|"]
     for key, s in summaries.items():
         planner, k = key.split("@")
         cells = [f"{s['full_hit'] * 100:.0f}%", f"{s['recall'] * 100:.0f}%",
                  *([f"{s['evidence_full'] * 100:.0f}%"] if with_evidence else []),
                  *(f"{s['by_type'][t] * 100:.0f}%" for t in types),
-                 f"{s['queries']:.1f}", f"{s['plan_seconds']:.1f}", f"${s['plan_cost']:.4f}"]
+                 f"{s['queries']:.1f}", f"{s['context_tokens']:,.0f}", f"{s['plan_seconds']:.1f}", f"${s['plan_cost']:.4f}"]
         lines.append(f"| {planner} | {k} | " + " | ".join(cells) + " |")
     lines += ["", "文件找回率：該用的文件平均找到幾成（檢索完整要全部找到才算）。"
               + ("原文全部找到：答案依據的條文原文都在找到的段落裡（docs/decisions/031）。" if with_evidence else ""), ""]
