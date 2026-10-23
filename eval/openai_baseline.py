@@ -19,6 +19,7 @@ from datetime import datetime
 
 from openai import OpenAI
 
+from app.core import openai_client
 from app.core.config import settings
 from eval.common import CORPORA
 from eval.run import (
@@ -33,6 +34,8 @@ from eval.run import (
 )
 
 INSTRUCTIONS = "你是一個根據使用者提供的文件回答問題的助手。今天日期：{today}。"
+# --rules：改用我們系統的 7 條回答原則（docs/decisions/019）當指示，排除「只是 prompt 寫得比較好」的可能（027）
+RULES_INSTRUCTIONS = "{rules}\n\n今天日期：{today}。"
 
 
 def upload(client: OpenAI, corpus: str):
@@ -74,11 +77,14 @@ def main():
     parser.add_argument("--split", choices=["dev", "test", "all"])
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--model", default="gpt-4o", help="回答用的模型，預設跟我們的系統一樣用 gpt-4o，才公平")
+    parser.add_argument("--rules", action="store_true", help="給它跟我們系統一樣的 7 條回答原則")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
     questions, split = load_questions(args.corpus, args.split)
     today = importlib.import_module(f"eval.{args.corpus}.rules").TODAY
-    instructions = INSTRUCTIONS.format(today=f"{today.year} 年 {today.month} 月 {today.day} 日")
+    today_text = f"{today.year} 年 {today.month} 月 {today.day} 日"
+    instructions = (RULES_INSTRUCTIONS.format(rules=openai_client.ANSWER_RULES, today=today_text) if args.rules
+                    else INSTRUCTIONS.format(today=today_text))
     client = OpenAI(api_key=settings.openai_api_key)
 
     store, file_ids = upload(client, args.corpus)
@@ -100,10 +106,11 @@ def main():
             client.files.delete(file_id)
         print("已刪除 OpenAI 上的 vector store 和檔案")
 
-    meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": "對照：OpenAI 現成的 file search",
+    note = "對照：OpenAI file search，給同樣的 7 條回答原則" if args.rules else "對照：OpenAI 現成的 file search"
+    meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": note,
             "corpus": args.corpus, "title": f"{corpus['title']}（OpenAI file search）", "commit": current_commit(),
             "chunks": "OpenAI 自己切", "top_k": "OpenAI 預設", "model": f"{args.model}（file search）", "split": split}
-    save_results(meta, summaries, all_rows, tag="openai-file-search")
+    save_results(meta, summaries, all_rows, tag="openai-file-search" + ("-rules" if args.rules else ""))
 
 
 if __name__ == "__main__":
