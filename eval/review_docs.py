@@ -11,6 +11,9 @@
 #     answers_unanswerable  讓「沒有答案」的題目有了答案：問題
 #   not_applicable 的段落另外寫出「粗心的人會怎麼答錯」，拿來補進題目的「不能說」
 # 結果存在 eval/data/review_<corpus>.json
+#
+# --all-docs：拿全部文件來比，不只新加的文件（docs/decisions/031：新增題目時用）
+#   這時候題目自己「應該引用」的文件會被排除，不然它當然會「重講答案」
 
 import argparse
 import importlib
@@ -53,17 +56,21 @@ PROMPT = """你在檢查一份問答評估資料集。知識庫裡原本就有�
 TOP = 6
 
 
-def new_doc_chunks(corpus):
-    catalog = importlib.import_module(f"eval.{corpus}.catalog")
+def new_doc_chunks(corpus, all_docs=False):
+    if all_docs:
+        codes = [path.name.split("_")[0] for path in sorted((EVAL / corpus / "docs").glob("*.md"))]
+    else:
+        catalog = importlib.import_module(f"eval.{corpus}.catalog")
+        codes = [spec["code"] for spec in catalog.GENERATED + catalog.DERIVED]
     chunks = []
-    for spec in catalog.GENERATED + catalog.DERIVED:
-        path = find_doc(corpus, spec["code"])
+    for code in codes:
+        path = find_doc(corpus, code)
         text = path.read_text(encoding="utf-8")
         title = text.splitlines()[0].removeprefix("# ")
         # 跟系統一樣切段；切之前去掉 Markdown 的符號，比較接近 PDF 抽出來的文字
         plain = re.sub(r"[#*|>]", " ", text)
         for piece in chunker.chunk_text(plain):
-            chunks.append({"code": spec["code"], "title": title, "text": piece})
+            chunks.append({"code": code, "title": title, "text": piece})
     return chunks
 
 
@@ -84,21 +91,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", required=True, choices=["enterprise", "school"])
     parser.add_argument("--only", nargs="*", help="只檢查這幾題（題號）")
+    parser.add_argument("--all-docs", action="store_true", help="拿全部文件來比（排除題目自己的出處），新增題目時用")
     args = parser.parse_args()
     client = OpenAI(api_key=settings.openai_api_key)
 
     questions = [json.loads(line) for line in (EVAL / args.corpus / "questions.jsonl").read_text(encoding="utf-8").splitlines() if line]
     if args.only:
         questions = [q for q in questions if q["id"] in args.only]
-    chunks = new_doc_chunks(args.corpus)
+    chunks = new_doc_chunks(args.corpus, args.all_docs)
     chunk_vectors = embed(client, [c["text"] for c in chunks])
     question_vectors = embed(client, [q["question"] for q in questions])
     print(f"新文件切成 {len(chunks)} 段，檢查 {len(questions)} 題")
 
     results, problems, traps = [], [], []
     for q, qv in zip(questions, question_vectors, strict=True):
+        own = {source.split(" ")[0] for source in q["sources"]} if args.all_docs else set()
         scores = [dot(cv, qv) for cv in chunk_vectors]
-        top = sorted(range(len(chunks)), key=lambda j: -scores[j])[:TOP]
+        candidates = [j for j in range(len(chunks)) if chunks[j]["code"] not in own]
+        top = sorted(candidates, key=lambda j: -scores[j])[:TOP]
         passages = "\n\n".join(f"[{i + 1}] {chunks[j]['code']}（{chunks[j]['title']}）：{chunks[j]['text']}" for i, j in enumerate(top))
         refuse_note = "\n（這題的文件裡沒有答案，正確的回應是說文件中找不到）" if q["should_refuse"] else ""
         response = client.chat.completions.create(

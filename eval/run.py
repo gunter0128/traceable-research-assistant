@@ -46,9 +46,9 @@ from app import models  # noqa: F401
 from app.core import openai_client, s3_client
 from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
-from app.repositories import document_repo, workspace_repo
+from app.repositories import chunk_repo, document_repo, workspace_repo
 from app.services import auth_service, document_service, qa_service, usage_service
-from eval.common import CORPORA, TYPE_NAMES
+from eval.common import CORPORA, TYPE_NAMES, evidence_rate
 from eval.doc_status import gold_status
 
 EVAL = Path(__file__).parent
@@ -143,7 +143,13 @@ def judge(client: OpenAI, domain: str, q: dict, response: str, cited: list[str])
 
 
 # ---------- 一輪：逐題問、評分 ----------
-def run_once(db, user, workspace, questions, client, domain, today) -> list[dict]:
+# 題目附的依據原文（目前只有勞動法規有）：{題號: [原文, ...]}，用來算「依據的原文有沒有找到」（docs/decisions/031）
+def load_evidence(corpus: str) -> dict[str, list[str]]:
+    module = importlib.import_module(f"eval.{corpus}.questions")
+    return {qid: [quote for _, _, quote in items] for qid, items in getattr(module, "EVIDENCE", {}).items()}
+
+
+def run_once(db, user, workspace, questions, client, domain, today, evidence=None) -> list[dict]:
     rows = []
     for q in questions:
         started = time.perf_counter()
@@ -154,13 +160,16 @@ def run_once(db, user, workspace, questions, client, domain, today) -> list[dict
         # 引用：自己從答案裡數 [n]，不看 response.citations（模型忘了標時，系統會退回列出全部搜到的段落，會灌水）
         _, marked = qa_service._extract_citations(response.answer, len(passages))
         cited = sorted({doc_code(p.filename) for p in passages if p.number in marked})
-        rows.append(score(client, domain, q, response.answer, retrieved, cited, seconds))
+        quotes = (evidence or {}).get(q["id"], [])
+        rows.append(score(client, domain, q, response.answer, retrieved, cited, seconds,
+                          evidence_rate(quotes, [p.content for p in passages])))
     return rows
 
 
 # 評一題：retrieved 是搜到的文件代號，cited 是答案標出來的文件代號
 # 抽出來是為了讓別的比較對象（例如 OpenAI 的 file search，eval/openai_baseline.py）用同一套標準打分
-def score(client, domain, q, answer, retrieved, cited, seconds) -> dict:
+# evidence：依據的原文找到了幾成（0～1），題目沒有附原文的是 None
+def score(client, domain, q, answer, retrieved, cited, seconds, evidence=None) -> dict:
     required = sorted({doc_code(s) for s in q["sources"]})
     verdict = judge(client, domain, q, answer, cited)
     included = _align(q["must_include"], verdict.get("must_include", []))
@@ -172,6 +181,9 @@ def score(client, domain, q, answer, retrieved, cited, seconds) -> dict:
         "seconds": round(seconds, 2), "retrieved": retrieved, "cited": cited, "required": required,
         # 檢索完整（Full Hit）：該引用的文件全部都搜到了。沒有答案的題目不算
         "full_hit": None if q["should_refuse"] else all(r in retrieved for r in required),
+        # 依據的原文全部找到：長文件上，找到那份文件不代表找到答案的那一條（docs/decisions/031）
+        "evidence_rate": evidence,
+        "evidence_full": None if evidence is None else evidence == 1,
         # 引用完整：該引用的文件，答案全部都有標出來。沒有答案的題目，要「一個都沒標」才算對
         "cite_full": not cited if q["should_refuse"] else all(r in cited for r in required),
         "include_rate": sum(included) / len(included) if included else None,
@@ -213,6 +225,7 @@ def summarize(rows: list[dict]) -> dict:
             "n": len(group),
             "correct": rate([r["correct"] for r in group]),
             "full_hit": rate([r["full_hit"] for r in group]),
+            "evidence_full": rate([r.get("evidence_full") for r in group]),
             "cite_full": rate([r.get("cite_full") for r in group]),
             "misuse": rate([r["misuse"] for r in group]),
             "include": rate([r["include_rate"] for r in group]),
@@ -250,6 +263,9 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
         fails = " ； ".join(f"{s[key]['fail_acquisition']} / {s[key]['fail_usage']}" for s in summaries)
         name = "**全部**" if key == "all" else TYPE_NAMES[key]
         lines.append(f"| {name} | {summaries[0][key]['n']} | {' | '.join(cells)} | {fails} |")
+    if summaries[0]["all"].get("evidence_full") is not None:
+        lines += ["", "依據的原文全部找到：" + " / ".join(pct(s["all"]["evidence_full"]) for s in summaries)
+                  + "（「檢索完整」只看找到那份文件；長文件要看有沒有找到答案的那一條）"]
     lines += ["", "跑了多輪時，每格依序是每一輪的結果（用來看隨機造成的波動）。", ""]
     return "\n".join(lines)
 
@@ -262,8 +278,9 @@ def main():
     parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
     parser.add_argument("--top-k", type=int,
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
-    parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog"],
-                        help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）")
+    parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog", "oracle"],
+                        help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）；"
+                             "oracle 直接用題目的標準答案指定要去哪幾份文件找，量「找文件做到完美時」的上限（031）")
     parser.add_argument("--doc-status", choices=["none", "llm", "oracle"],
                         help="回答前判斷文件是否有效（docs/decisions/029）：llm 小模型判斷；"
                              "oracle 直接用標準答案（eval/doc_status.py），量「標籤完全正確時」的上限")
@@ -289,6 +306,8 @@ def main():
     usage_service.ensure_within_quota = lambda db, owner_id: None
 
     questions, split = load_questions(args.corpus, args.split)
+    if args.planner == "oracle":
+        qa_service._plan = oracle_plan(questions)
     client = OpenAI(api_key=settings.openai_api_key)
     db, user, workspace, chunks = setup_knowledge_base(args.corpus)
 
@@ -296,7 +315,7 @@ def main():
     for i in range(args.runs):
         print(f"\n第 {i + 1} 輪")
         today = importlib.import_module(f"eval.{args.corpus}.rules").TODAY
-        rows = run_once(db, user, workspace, questions, client, corpus["domain"], today)
+        rows = run_once(db, user, workspace, questions, client, corpus["domain"], today, load_evidence(args.corpus))
         all_rows.append(rows)
         summaries.append(summarize(rows))
 
@@ -318,6 +337,18 @@ def oracle_labels(corpus: str):
                 statuses[document.id] = (status, None)
         return statuses
     return label
+
+
+# 完美的規劃器（docs/decisions/031）：換掉 qa_service._plan，參數跟它一樣
+# 照題目標準答案的出處（sources），每一份該用的文件各搜一次（只在那份文件裡搜），再跟原本的問題輪流合併
+# 量的是「該用的文件一定找得到時，答案最多能好多少」
+def oracle_plan(questions: list[dict]):
+    required = {q["question"]: sorted({doc_code(s) for s in q["sources"]}) for q in questions}
+
+    def plan(db, workspace_id, question, deadline, on_usage):
+        filenames = {doc_code(f): f for f, _ in chunk_repo.document_headers(db, workspace_id, 10_000)}
+        return [openai_client.PlannedSearch(question, filenames[code]) for code in required.get(question, [])]
+    return plan
 
 
 # 讀題目：不指定 split 的話，有練習題就只跑練習題，沒有（學校）就全部跑

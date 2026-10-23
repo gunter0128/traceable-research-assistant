@@ -19,12 +19,13 @@ from decimal import Decimal
 # eval.run 一定要比 app 先 import：它一 import 就把資料庫換成臨時的，順序反過來會連到正式資料庫
 # 下面的 isort: off / on 是叫排序工具不要把它排到 app 後面
 # isort: off
-from eval.run import REPORT, RESULTS, TAIWAN, current_commit, doc_code, load_questions, setup_knowledge_base
+from eval.run import (REPORT, RESULTS, TAIWAN, current_commit, doc_code, load_evidence, load_questions,
+                      setup_knowledge_base)
 # isort: on
 
 from app.core import openai_client
 from app.services import qa_service
-from eval.common import CORPORA, TYPE_NAMES
+from eval.common import CORPORA, TYPE_NAMES, evidence_rate
 
 PLANNERS = ["none", "rewrite", "checklist", "catalog"]
 
@@ -39,6 +40,7 @@ def main():
     args = parser.parse_args()
 
     questions, split = load_questions(args.corpus, args.split)
+    evidence = load_evidence(args.corpus)
     # 沒有答案的題目沒有「該用的文件」，不算檢索
     questions = [q for q in questions if not q["should_refuse"]]
     db, _, workspace, chunks = setup_knowledge_base(args.corpus)
@@ -60,10 +62,13 @@ def main():
                 merged = qa_service._search(db, workspace.id, searches, embeddings, k)
                 retrieved = sorted({doc_code(chunk.document.filename) for chunk in merged})
                 found = [r for r in required if r in retrieved]
+                quotes = evidence.get(q["id"], [])
+                quote_rate = evidence_rate(quotes, [chunk.content for chunk in merged])
                 rows.append({
                     "planner": planner, "top_k": k, "id": q["id"], "type": q["type"], "question": q["question"],
                     "queries": [vars(s) for s in searches], "retrieved": retrieved, "required": required,
                     "full_hit": len(found) == len(required), "recall": len(found) / len(required),
+                    "evidence_rate": quote_rate, "evidence_full": None if quote_rate is None else quote_rate == 1,
                     "plan_seconds": round(plan_seconds, 2),
                     "plan_cost": float(sum((u.cost_usd() for u in usages), Decimal(0))),
                 })
@@ -88,6 +93,7 @@ def summarize(rows: list[dict]) -> dict:
     return {
         "full_hit": mean([r["full_hit"] for r in rows]),
         "recall": mean([r["recall"] for r in rows]),
+        "evidence_full": mean([r["evidence_full"] for r in rows if r["evidence_full"] is not None]),
         "queries": mean([len(r["queries"]) for r in rows]),
         "plan_seconds": mean([r["plan_seconds"] for r in rows]),
         "plan_cost": sum(r["plan_cost"] for r in rows),
@@ -104,17 +110,21 @@ def save(meta: dict, rows: list[dict], planners: list[str], top_ks: list[int]) -
                    encoding="utf-8")
 
     types = list(next(iter(summaries.values()))["by_type"])
+    with_evidence = next(iter(summaries.values()))["evidence_full"] is not None
     lines = [f"## {meta['time']}　{meta['title']}　{meta['note']}", "",
              f"題目 {meta['split']}（有答案的 {meta['questions']} 題）｜commit `{meta['commit']}`｜{meta['chunks']} 段｜只看檢索，不生成答案", "",
-             "| 規劃 | 段數 | 檢索完整 | 文件找回率 | " + " | ".join(TYPE_NAMES[t] for t in types) + " | 平均幾句 | 規劃秒數 | 規劃花費 |",
-             "|---|---|---|---|" + "---|" * len(types) + "---|---|---|"]
+             "| 規劃 | 段數 | 檢索完整 | 文件找回率 | " + ("原文全部找到 | " if with_evidence else "")
+             + " | ".join(TYPE_NAMES[t] for t in types) + " | 平均幾句 | 規劃秒數 | 規劃花費 |",
+             "|---|---|---|---|" + ("---|" if with_evidence else "") + "---|" * len(types) + "---|---|---|"]
     for key, s in summaries.items():
         planner, k = key.split("@")
         cells = [f"{s['full_hit'] * 100:.0f}%", f"{s['recall'] * 100:.0f}%",
+                 *([f"{s['evidence_full'] * 100:.0f}%"] if with_evidence else []),
                  *(f"{s['by_type'][t] * 100:.0f}%" for t in types),
                  f"{s['queries']:.1f}", f"{s['plan_seconds']:.1f}", f"${s['plan_cost']:.4f}"]
         lines.append(f"| {planner} | {k} | " + " | ".join(cells) + " |")
-    lines += ["", "文件找回率：該用的文件平均找到幾成（檢索完整要全部找到才算）。", ""]
+    lines += ["", "文件找回率：該用的文件平均找到幾成（檢索完整要全部找到才算）。"
+              + ("原文全部找到：答案依據的條文原文都在找到的段落裡（docs/decisions/031）。" if with_evidence else ""), ""]
     markdown = "\n".join(lines)
 
     header = "# 評估結果\n\n每次評估的結果。題目和評分方式見 docs/decisions/016、017；逐題的明細在 eval/data/results/（不進 git）。\n\n"

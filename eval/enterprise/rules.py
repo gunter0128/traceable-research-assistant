@@ -169,6 +169,13 @@ def taipei_parking_eligible(person: Person, pregnant: bool = False, disabled: bo
     return person.site == "台北" and (person.level in ("M1", "M2", "M3") or pregnant or disabled)
 
 
+# ---------- 題目調整成每種題型 10 題時，新題目用到的規定（docs/decisions/031）----------
+BIRTHDAY_GIFT = 1000  # GEN-03 第 3 條：正職及約聘人員，生日當月發給
+JOB_POSTING_WORKDAYS = 10  # HR-09 第 3 條：職缺至少公告 10 個工作天
+TAXI_NIGHT_FROM = {2024: "晚上 10 點", 2022: "晚上 11 點"}  # FIN-01 / FIN-12 第 3 條：幾點以後到隔日早上 6 點可以搭計程車
+MANAGER_COMP_LEAVE_CAP_HOURS = 16  # HR-05 第 5 條：主管職不支給加班費，每月補休上限
+
+
 # ---------- 干擾文件裡的數字（docs/decisions/026）----------
 # 擴大知識庫時加進來的「相關但不適用」的文件：舊版、子公司、草案、還沒生效的公告
 # 這些數字都「不是」現在對青嶼科技員工有效的答案，寫在這裡是為了：

@@ -40,6 +40,12 @@ QUESTIONS = [
              ["研發部", "業務部", "人力資源部", "財務部", "資訊部", "行政部"], ["GEN-01"]),
     Question("g07", "general", "每個月加班最多可以加幾個小時？",
              f"每月合計不得超過 {R.OVERTIME_MONTHLY_CAP_HOURS} 小時。", ["46 小時"], ["HR-05 第 7 條"]),
+    Question("g09", "general", "員工生日有禮金嗎？多少？",
+             f"有，正職員工和約聘人員每年生日當月發給 {money(R.BIRTHDAY_GIFT)}。",
+             [money(R.BIRTHDAY_GIFT)], ["GEN-03 第 3 條"]),
+    Question("g10", "general", "公司的職缺要公告多久？",
+             f"公告在公司網站和人力銀行，公告期間至少 {R.JOB_POSTING_WORKDAYS} 個工作天。",
+             [f"{R.JOB_POSTING_WORKDAYS} 個工作天"], ["HR-09 第 3 條"]),
     Question("g08", "general", "公司筆電不見了，要在多久之內通報？",
              "發現後 24 小時內通報資訊部服務台（分機 1234）。", ["24 小時"], ["IT-01 第 5 條"]),
 
@@ -66,10 +72,6 @@ QUESTIONS = [
     Question("c04", "conditional", "出國出差可以坐商務艙嗎？",
              "原則是經濟艙。要同時符合兩個條件才能坐商務艙：單程表定飛行 8 小時以上，而且職級是 M2（經理）以上。",
              ["經濟艙", "8 小時以上", "M2"], ["FIN-02 第 2 條"]),
-    Question("c05", "conditional", "健康檢查有補助多少錢？",
-             f"正職員工每年 {money(R.health_check_subsidy(staff(age=30)))}，年滿 40 歲以上 {money(R.health_check_subsidy(staff(age=45)))}；"
-             f"約聘人員每年 {money(R.health_check_subsidy(staff(employment='約聘')))}；實習生沒有。",
-             ["3,000", "5,000", "40 歲", "2,000"], ["GEN-03 第 2 條", "HR-03 第 7 條"]),
     Question("c06", "conditional", "外部課程的教育訓練補助上限是多少？",
              "限到職滿 1 年的正職：P1–P3 每年 15,000 元、P4–P5 25,000 元、M1–M3 40,000 元。約聘和實習生不適用。",
              ["到職滿 1 年", "15,000", "25,000", "40,000"], ["GEN-04 第 2、3 條"]),
@@ -77,16 +79,9 @@ QUESTIONS = [
              "一般職（P1–P5）可以選加班費或 1:1 補休；主管職（M1–M3）不給加班費，只能補休（每月上限 16 小時）；"
              "約聘比照一般職；實習生不得加班。",
              ["一般職", "主管職不支給加班費", "補休", "實習生不得加班"], ["HR-05 第 4、5 條", "HR-03 第 4、5 條"]),
-    Question("c08", "conditional", "出差搭計程車可以報公帳嗎？",
-             "原則上搭高鐵、台鐵或客運。只有三種情況可以搭計程車：晚上 10 點到早上 6 點之間、攜帶 10 公斤以上公務設備、"
-             "經直屬主管核准的急迫情形。",
-             ["晚上 10 點", "10 公斤", "主管核准"], ["FIN-01 第 3 條"]),
     Question("c09", "conditional", "公司配的筆電多久可以換？",
              "研發部高效能筆電 2 年可以申請更換；其他部門標準筆電 3 年。實習生用公用借用機，不配發。",
              ["研發部 2 年", "其他部門 3 年"], ["IT-01 第 2、4 條"]),
-    Question("c10", "conditional", "加班的餐費補助多少？",
-             f"平日加班到晚上 8 點以後，每次 {money(R.overtime_meal(staff()))}；台中分公司是 {money(R.overtime_meal(staff(site='台中')))}。",
-             ["晚上 8 點", "150", "台中", "200"], ["HR-05 第 6 條", "HR-04 第 3 條"]),
     Question("c11", "conditional", "可以申請公司的停車位嗎？",
              "台北總部的汽車位限主管職 M1 以上、懷孕或領有身心障礙證明的同仁申請，其他人可以登記候補；機車位免申請。"
              "台中分公司和高雄研發中心依各據點規定（文件中沒有）。",
@@ -94,9 +89,6 @@ QUESTIONS = [
     Question("c12", "conditional", "報銷超過期限怎麼辦？",
              "支出後 30 天內正常報銷；超過 30 天要附直屬主管加簽說明；超過 60 天不受理。",
              ["30 日", "主管加簽", "60 日", "不予受理"], ["FIN-03 第 2 條"]),
-    Question("c13", "conditional", "可以用自己的手機收公司的信嗎？",
-             "可以，安裝公司核可的郵件 App 收發信，但不能存取其他內部系統。研發部同仁例外：個人裝置不能連任何公司系統，包括郵件。",
-             ["核可", "研發部", "不得"], ["IT-02 第 4 條"]),
     Question("c14", "conditional", "外接螢幕可以申請幾台？",
              "研發部每人 2 台，其他部門每人 1 台。", ["研發部 2", "其他部門 1"], ["IT-01 第 3 條"]),
 
@@ -159,6 +151,27 @@ QUESTIONS = [
     Question("v06", "version", "員工手冊 2025 年版現在還有效嗎？",
              "沒有。2026 年版員工手冊第 12 條規定，2025 年版自 2026 年 1 月 1 日起廢止。",
              ["廢止", "2026 年 1 月 1 日"], ["HR-02 第 12 條"]),
+    # 反過來的版本題：問的是明年的出差，還沒生效的公告反而是答案
+    Question("v07", "version", "我是 P2，明年 2 月要去台北出差，住宿每晚上限多少？",
+             f"{money(R.LODGING_2027['P1-P3'][0])}。2027 年 1 月 1 日起依新公告的住宿上限；"
+             f"2026 年 12 月 31 日以前的住宿才適用現行的 {money(L['P1-P3'][0])}。",
+             [money(R.LODGING_2027["P1-P3"][0])], ["FIN-14"],
+             must_not=[f"明年 2 月也是 {money(L['P1-P3'][0])}（那是 2026 年的標準）"]),
+    Question("v08", "version", "聽說健康檢查補助要調高了，我是 30 歲的正職，現在可以領多少？",
+             f"現在是每年 {money(R.health_check_subsidy(staff(age=30)))}。調高到 {money(R.DRAFT_HEALTH_CHECK[0])}的是員工福利辦法的修正草案，"
+             "還在徵詢意見，還沒生效。",
+             [money(R.health_check_subsidy(staff(age=30)))], ["GEN-03 第 2 條"],
+             must_not=[f"現在可以領 {money(R.DRAFT_HEALTH_CHECK[0])}（那是草案，還沒生效）"], nice_to_have=["草案"]),
+    Question("v09", "version", "聽說加班餐費要調到 180 元，現在是多少？",
+             f"現在還是每次 {money(R.overtime_meal(staff()))}（台中分公司 {money(R.overtime_meal(staff(site='台中')))}）。"
+             f"調到 {money(R.MEAL_PROPOSAL_REJECTED)}是勞資會議的提案，決議暫緩、現行標準不調整。",
+             [money(R.overtime_meal(staff()))], ["HR-05 第 6 條"],
+             must_not=[f"現在是 {money(R.MEAL_PROPOSAL_REJECTED)}（那是沒有通過的提案）"], nice_to_have=["暫緩", "台中 200"]),
+    Question("v10", "version", f"2022 年版的差旅辦法寫{R.TAXI_NIGHT_FROM[2022]}以後才能搭計程車，現在還是嗎？",
+             f"已經改了。現行的國內差旅辦法是{R.TAXI_NIGHT_FROM[2024]}到隔日早上 6 點之間可以搭；"
+             "另外攜帶 10 公斤以上公務設備、經直屬主管核准的急迫情形也可以。",
+             [R.TAXI_NIGHT_FROM[2024]], ["FIN-01 第 3 條"],
+             must_not=[f"對，現在還是{R.TAXI_NIGHT_FROM[2022]}以後"]),
 
     # ---------- 範圍陷阱：規定不適用於問的人，不能把別人的規定套上去 ----------
     Question("s01", "scope", "我是實習生，特休有幾天？",
@@ -181,6 +194,14 @@ QUESTIONS = [
              ["不行", "研發部"], ["IT-02 第 4 條"], must_not=["可以安裝郵件 App"]),
     Question("s07", "scope", "我是約聘人員，可以申請教育訓練補助嗎？",
              "不行。教育訓練補助限到職滿 1 年的正職員工。", ["不行"], ["GEN-04 第 2 條", "HR-03 第 8 條"]),
+    Question("s09", "scope", "我是子公司青嶼雲端服務的員工，平日加班到晚上 9 點，餐費補助多少？",
+             f"每次 {money(R.SUB_OVERTIME_MEAL)}（青嶼雲端服務加班管理要點）。",
+             [money(R.SUB_OVERTIME_MEAL)], ["SUB-04 第 6 條"],
+             must_not=[f"{money(R.overtime_meal(staff()))}（那是母公司青嶼科技的規定）"]),
+    Question("s10", "scope", "我是子公司青嶼雲端服務的員工，每週可以遠距工作幾天？",
+             f"每週最多 {R.SUB_REMOTE_DAYS} 天，不分部門（青嶼雲端服務遠距工作規定）。",
+             [f"{R.SUB_REMOTE_DAYS} 天"], ["SUB-03 第 3 條"],
+             must_not=["研發部 3 天、業務部 2 天（那是母公司青嶼科技的規定）"]),
     Question("s08", "scope", "我是實習生，主管想派我去日本出差，可以嗎？",
              "不行。實習生不得派赴國外出差。", ["不行"], ["FIN-02 第 6 條"]),
 
@@ -207,6 +228,27 @@ QUESTIONS = [
     Question("x06", "cross_doc", "在家遠距工作時，要怎麼連公司的內部系統？",
              "一律透過公司 VPN 連線，並遵守資訊安全規範。",
              ["VPN"], ["HR-06 第 5 條", "IT-02 第 3 條"]),
+    Question("x07", "cross_doc", "我是 P3，下週要去台北出差，晚上 11 點開完會搭計程車回飯店，住宿和計程車都可以報嗎？",
+             f"都可以。住宿每晚上限 {money(R.domestic_lodging('P3', '台北'))}（修訂公告的 P1–P3 台北標準）；"
+             f"{R.TAXI_NIGHT_FROM[2024]}到隔日早上 6 點之間可以搭計程車，晚上 11 點在這個時段內。",
+             [money(R.domestic_lodging("P3", "台北")), "可以搭計程車"], ["FIN-04", "FIN-01 第 3 條"],
+             must_not=[f"住宿上限 {money(OLD['P1-P3'][0])}（那是修訂前的標準）"]),
+    Question("x08", "cross_doc", "實習生被派去高雄出差，住宿每晚上限多少？",
+             f"實習生經主管指派因公出差，準用 P1 職級的標準；修訂公告後 P1–P3 其他縣市是每晚 "
+             f"{money(R.domestic_lodging('P1', '高雄'))}。",
+             ["準用 P1", money(R.domestic_lodging("P1", "高雄"))], ["FIN-01 第 2 條", "FIN-04"],
+             must_not=["實習生不能報住宿費"]),
+    Question("x09", "cross_doc", "我是台中分公司的 M1 組長，平日加班到晚上 9 點，有加班費嗎？餐費補助多少？",
+             f"沒有加班費：主管職不支給加班費，只能申請 1 比 1 補休，每月補休上限 {R.MANAGER_COMP_LEAVE_CAP_HOURS} 小時。"
+             f"餐費補助每次 {money(R.overtime_meal(staff(site='台中')))}（台中分公司補充規定）。",
+             ["沒有加班費", "補休", money(R.overtime_meal(staff(site="台中")))], ["HR-05 第 5 條", "HR-04 第 3 條"],
+             must_not=["可以選加班費或補休", f"餐費 {money(R.overtime_meal(staff()))}"],
+             nice_to_have=[f"每月補休上限 {R.MANAGER_COMP_LEAVE_CAP_HOURS} 小時"]),
+    Question("x10", "cross_doc", "我是研發部的約聘人員，可以用自己的手機收公司的信嗎？外接螢幕可以申請幾台？",
+             f"手機不行：研發部同仁的個人裝置不能連接公司任何系統，包括電子郵件。外接螢幕 {R.monitors(staff(employment='約聘'))} 台："
+             "約聘人員的設備比照所屬部門的正職，研發部每人 2 台。",
+             ["手機不行", f"{R.monitors(staff(employment='約聘'))} 台"], ["IT-02 第 4 條", "IT-01 第 3、4 條"],
+             must_not=["可以安裝郵件 App", "1 台"]),
 
     # ---------- 沒有答案：文件裡沒有寫，要老實說找不到 ----------
     Question("n01", "no_answer", "年終獎金發幾個月？", "文件中沒有年終獎金的規定。", [], [], should_refuse=True),
@@ -219,6 +261,10 @@ QUESTIONS = [
     Question("n06", "no_answer", "試用期滿之後薪水會調整嗎？",
              "文件中沒有。員工手冊只寫試用期 3 個月、滿了經考核轉正，沒有提到調薪。",
              [], ["HR-02 第 3 條"], must_not=["試用期滿會調薪"], should_refuse=True),
+    Question("n07", "no_answer", "公司有員工健身房嗎？", "文件中沒有員工健身房的資訊。", [], [], should_refuse=True),
+    Question("n08", "no_answer", "公司有托兒補助嗎？", "文件中沒有托兒補助的規定。", [], [], should_refuse=True),
+    Question("n09", "no_answer", "可以帶寵物來上班嗎？", "文件中沒有寵物的相關規定。", [], [], should_refuse=True),
+    Question("n10", "no_answer", "公司有發員工制服嗎？", "文件中沒有員工制服的規定。", [], [], should_refuse=True),
 ]
 
 
@@ -240,9 +286,6 @@ EXTRA_MUST_NOT = {
     "c02": [f"P1–P3 台北目前是 {money(L27['P1-P3'][0])}（{FUTURE}）", f"P1–P3 台北目前是 {money(L22['P1-P3'][0])}（{OLD22}）",
             f"P1–P3 台北目前是 {money(LS['P1-P3'][0])}（{SUB}）"],
     "c03": [f"每週 {R.SUB_REMOTE_DAYS} 天（{SUB}）"],
-    "c05": [f"未滿 40 歲補助 {money(R.DRAFT_HEALTH_CHECK[0])}（{DRAFT}）"],
-    "c08": ["晚上 11 點以後才能搭計程車（那是 2022 年的舊版）"],
-    "c10": [f"每次 {money(R.MEAL_PROPOSAL_REJECTED)}（那是勞資會議的提案，沒有通過）", f"每次 {money(R.SUB_OVERTIME_MEAL)}（{SUB}）"],
     "p01": [f"特休 {OLD24[12]} 天（那是 2024 年版）", f"特休 {SUBL[12]} 天（{SUB}）"],
     "p02": [f"{SUBL[120]} 天（{SUB}）"],
     "p03": [f"{money(L22['P4-P5'][0])}（{OLD22}）", f"{money(L27['P4-P5'][0])}（{FUTURE}）", f"{money(LS['P4-P5'][0])}（{SUB}）"],
@@ -266,6 +309,15 @@ EXTRA_MUST_NOT = {
     "x06": [f"使用遠端桌面服務（{SUB}）"],
 }
 _ids = {q.id for q in QUESTIONS}
+# 新增的題目（docs/decisions/031）一樣跑過衝突檢查（eval/review_docs.py --all-docs），補上它找到的陷阱
+EXTRA_MUST_NOT |= {
+    "v07": [f"{money(OLD['P1-P3'][0])}（那是修訂前的標準）", f"{money(LS['P1-P3'][0])}（{SUB}）"],
+    "v09": [f"每次 {money(R.SUB_OVERTIME_MEAL)}（{SUB}）"],
+    "s09": [f"每次 {money(R.MEAL_PROPOSAL_REJECTED)}（那是沒有通過的提案）"],
+    "x07": [f"住宿 {money(LS['P1-P3'][0])}（{SUB}）"],
+    "x08": [f"{money(L27['P1-P3'][1])}（{FUTURE}）", f"{money(LS['P1-P3'][1])}（{SUB}）"],
+    "x09": [f"餐費 {money(R.SUB_OVERTIME_MEAL)}（{SUB}）"],
+}
 assert set(EXTRA_MUST_NOT) <= _ids, set(EXTRA_MUST_NOT) - _ids
 for _q in QUESTIONS:
     _q.must_not = _q.must_not + EXTRA_MUST_NOT.get(_q.id, [])
@@ -290,7 +342,7 @@ for _q in QUESTIONS:
 
 
 def main():
-    assign_splits(QUESTIONS)
+    assign_splits(QUESTIONS, previous=HERE / "questions.jsonl")
     write_question_files(QUESTIONS, HERE, "青嶼科技知識庫評估題目", "python -m eval.enterprise.questions")
 
 
