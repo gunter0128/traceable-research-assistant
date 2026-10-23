@@ -5,6 +5,7 @@
 #      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法在重試之間報平安、也沒辦法控制總時間
 # 分類完怎麼處理（延後、標失敗、回 503）由呼叫的 service 決定，這裡不管
 
+import json
 import logging
 import random
 import time
@@ -23,12 +24,15 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 # 負責生成答案用的模型 跟上面 embedding 用的是不同任務 分開一個常數
 # 2026-10 從 gpt-4o-mini 換成 gpt-4o：「適不適用於問的人」的題目答得好很多，每題成本約 16 倍（docs/decisions/023）
 GENERATION_MODEL = "gpt-4o"
+# 搜尋前規劃要查什麼用的模型（docs/decisions/028）：只是把問題寫成幾句搜尋句子，小模型就夠，便宜又快
+PLANNER_MODEL = "gpt-4o-mini"
 
 # 每 100 萬個 token 多少美元：(輸入, 輸出)。embedding 只有輸入
 # 2026-10 OpenAI 官網的價格，OpenAI 調價時要跟著改（docs/decisions/012）
 PRICES_PER_MILLION = {
     EMBEDDING_MODEL: (Decimal("0.02"), Decimal(0)),
     GENERATION_MODEL: (Decimal("2.50"), Decimal(10)),
+    PLANNER_MODEL: (Decimal("0.15"), Decimal("0.60")),
 }
 
 
@@ -200,16 +204,17 @@ def embed_texts(
     return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
 
-# 何時呼叫：qa_service 把使用者的問題轉成向量，拿去跟 chunk 比相似度
+# 何時呼叫：qa_service 把使用者的問題（和規劃出來的搜尋句子）轉成向量，拿去跟 chunk 比相似度
+# 幾句一起送，只呼叫一次：規劃出 4 句搜尋句子的話，不用多等 4 次來回
 # deadline：整個問答共用的截止時間（qa_service 算好傳進來）
-def embed_query(
-    text: str,
+def embed_queries(
+    texts: list[str],
     deadline: float | None = None,
     on_usage: Callable[[Usage], None] | None = None,
-) -> list[float]:
+) -> list[list[float]]:
     def call(timeout: float):
         return client.with_options(timeout=timeout).embeddings.create(
-            model=EMBEDDING_MODEL, input=text
+            model=EMBEDDING_MODEL, input=texts
         )
 
     response = _with_retries(
@@ -221,7 +226,130 @@ def embed_query(
         deadline=deadline,
     )
     _report_embedding_usage(response, on_usage)
-    return response.data[0].embedding
+    return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+
+
+# 搜尋前的規劃（docs/decisions/028）：先想清楚回答這個問題要找哪些資料，每一種各寫一句搜尋句子
+# 只拿問題直接搜，常常只搜到主要的規定，漏掉「誰不適用」「後來改了」這些在別份文件裡的資料
+# 三種寫法，評估比較用：
+#   rewrite：自由改寫成幾句（OpenAI 的 file search 也是這樣做）
+#   checklist：照四種常見的資料逐項檢查要不要找（來自我的論文：先拆出需要的證據，再分別搜尋）
+#   catalog：checklist 再加上文件清單，可以指定「去哪一份文件找」
+#     只看問題的話，規劃不知道有哪些文件，想不到要去查「約聘人員管理辦法」「分公司補充規定」這種
+#     講某一群人、某個地點的文件，可是答案常常就差在這裡
+# 一樣只放通用的說法，不放任何領域的詞（跟 ANSWER_RULES 同一個原則，docs/decisions/019）
+PLAN_REWRITE = """你負責幫文件搜尋系統寫搜尋句子。系統會拿你寫的每一句，分別去搜尋使用者上傳的文件。
+
+把使用者的問題改寫成 1～4 句搜尋句子，涵蓋回答這個問題需要找的資料。每一句要能單獨拿去搜尋。
+
+只輸出 JSON：{"queries": ["搜尋句子", ...]}"""
+
+PLAN_CHECKLIST = """你負責幫文件搜尋系統規劃要找哪些資料。系統會拿你寫的每一句，分別去搜尋使用者上傳的文件。
+
+回答規定、辦法、合約這類文件的問題，常常不只需要一段資料。逐項判斷下面四種資料，這個問題需不需要：
+1. 主要規定：直接回答這個問題的規定。一定需要。
+2. 例外與不適用：這條規定有沒有不適用的人或情況、特別的對象，或是另外適用的規定。問題提到特定的身分、對象或情況時需要。
+3. 新版與修訂：這條規定有沒有修訂、新版本、調整的公告，或是還沒生效、已經廢止的版本。問題問到數字、金額、期限，或是現在的規定時需要。
+4. 補充規定：別的文件有沒有補充的細節，例如申請流程、附表、配套的辦法。問題問到怎麼做、要準備什麼時需要。
+
+需要的每一種資料各寫一句搜尋句子，用文件裡可能出現的寫法；不需要的不要寫。
+
+只輸出 JSON：{"queries": [{"item": "主要規定", "query": "搜尋句子"}, ...]}"""
+
+PLAN_CATALOG = """你負責幫文件搜尋系統規劃要找哪些資料。使用者會給你問題和他上傳的文件清單，系統會照你的規劃去搜尋。
+
+回答規定、辦法、合約這類文件的問題，常常不只需要一段資料。看過文件清單，逐項判斷下面四種資料需不需要、可能在哪一份文件：
+1. 主要規定：直接回答這個問題的規定。
+2. 例外與不適用：有沒有文件對某些人、某些地點或情況另外規定，或寫明不適用。問題沒有說是誰的話，各種人的規定都可能影響答案，也要查。
+3. 新版與修訂：有沒有比主要規定更新的修訂、調整的公告。
+4. 補充規定：有沒有別的文件補充細節，例如申請流程、附表、配套的辦法。
+
+每一筆寫：要找的是哪一項、去哪一份文件找（照清單抄檔名；不確定在哪一份就寫 null）、搜尋句子（用文件裡可能出現的寫法）。
+最多 4 筆，挑最可能影響答案的。問題跟清單裡的文件都無關時，回傳空的清單。
+
+只輸出 JSON：{"searches": [{"item": "例外與不適用", "document": "檔名", "query": "搜尋句子"}, ...]}"""
+
+PLAN_PROMPTS = {"rewrite": PLAN_REWRITE, "checklist": PLAN_CHECKLIST, "catalog": PLAN_CATALOG}
+# 最多幾句：兩種寫法一樣多，比較才公平
+PLAN_MAX_QUERIES = 4
+
+
+# 規劃出來的一筆搜尋
+@dataclass
+class PlannedSearch:
+    query: str
+    # 只在這份文件裡搜（檔名）；None = 所有文件都搜
+    document: str | None = None
+    # 清單的哪一項（主要規定、例外與不適用…），之後可以拿來跟使用者說明為什麼查這份
+    item: str | None = None
+
+
+# 何時呼叫：qa_service 搜尋之前。回傳規劃出來的搜尋（不含原本的問題）
+# catalog：文件清單 [(檔名, 文件開頭)]，只有 catalog 這種規劃會用到
+# 模型回的格式不對，就當作沒有規劃（回傳空的），由 qa_service 只用原本的問題搜
+def plan_queries(
+    question: str,
+    mode: str,
+    catalog: list[tuple[str, str]] | None = None,
+    deadline: float | None = None,
+    on_usage: Callable[[Usage], None] | None = None,
+) -> list[PlannedSearch]:
+    content = question
+    if mode == "catalog":
+        listing = "\n".join(f"- {filename}｜{header}" for filename, header in catalog or [])
+        content = f"文件清單：\n{listing}\n\n問題：{question}"
+
+    def call(timeout: float):
+        return client.with_options(timeout=timeout).chat.completions.create(
+            model=PLANNER_MODEL,
+            # temperature=0：同一個問題盡量規劃出一樣的搜尋句子，答案才不會因為搜到的東西不同而忽好忽壞
+            temperature=0,
+            # json_object：保證回傳的是合法的 JSON
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": PLAN_PROMPTS[mode]},
+                {"role": "user", "content": content},
+            ],
+        )
+
+    response = _with_retries(
+        call,
+        attempts=QA_ATTEMPTS,
+        timeout=QA_TIMEOUT,
+        max_wait=QA_MAX_WAIT,
+        give_up_on_long_wait=True,
+        deadline=deadline,
+    )
+    if on_usage is not None:
+        on_usage(Usage(PLANNER_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens))
+    return _parse_plan(response.choices[0].message.content)
+
+
+# 從規劃的 JSON 取出搜尋：三種寫法的格式不同，都接受
+#   {"queries": ["句子"]}、{"queries": [{"item", "query"}]}、{"searches": [{"item", "document", "query"}]}
+# 去掉空白和重複的，最多留 PLAN_MAX_QUERIES 筆
+def _parse_plan(content: str | None) -> list[PlannedSearch]:
+    try:
+        data = json.loads(content or "")
+        items = data.get("searches", data.get("queries", []))
+    except (ValueError, AttributeError):
+        return []
+    if not isinstance(items, list):
+        return []
+    searches = []
+    for item in items:
+        fields = item if isinstance(item, dict) else {"query": item}
+        query, document, label = (fields.get(key) for key in ("query", "document", "item"))
+        if not isinstance(query, str) or not query.strip():
+            continue
+        search = PlannedSearch(
+            query.strip(),
+            document.strip() if isinstance(document, str) and document.strip() else None,
+            label if isinstance(label, str) else None,
+        )
+        if all((s.query, s.document) != (search.query, search.document) for s in searches):
+            searches.append(search)
+    return searches[:PLAN_MAX_QUERIES]
 
 
 # 給模型的回答原則（system prompt，docs/decisions/019）

@@ -29,7 +29,7 @@ def _fake_s3(monkeypatch):
 @pytest.fixture(autouse=True)
 def _fake_embeddings(monkeypatch):
     monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
-    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_queries", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
 
 
 # 切換成雲端模式（有 SQS），送出去的工單記在 list 裡
@@ -215,7 +215,7 @@ def test_ask_returns_503_when_ai_unavailable(client, monkeypatch):
 # 測試：問答時遇到永久性錯誤 → 503，訊息不同
 def test_ask_returns_503_when_misconfigured(client, monkeypatch):
     token, ws_id, _ = _upload(client, "henry@example.com")
-    monkeypatch.setattr(openai_client, "embed_query", _raise(openai_client.OpenAIPermanentError()))
+    monkeypatch.setattr(openai_client, "embed_queries", _raise(openai_client.OpenAIPermanentError()))
 
     response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "?"}, headers=_auth_headers(token))
 

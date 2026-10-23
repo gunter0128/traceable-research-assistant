@@ -395,6 +395,7 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 qa_service.ask(db, workspace_id, owner_id, question)
   │  1. ownership 檢查、每日用量檢查
   │  2. 問題轉向量 → 搜最像的 5 段（SEARCH_LIMIT，020）
+  │       評估時可以先規劃再搜（PLANNER，028）：多幾筆搜尋各搜一次、輪流合併成 5 段。線上沒開
   │  3. 按文件分組：同一份文件的段落放在一起、照原文順序排（018）
   │  4. 查這幾份文件的第 0 段，取開頭 200 字（標題、生效日期通常在這裡，018）
   │  5. 組給模型看的資料：
@@ -418,9 +419,12 @@ AskResponse { answer: "……14 天[1]。", citations: [ { number: 1, filename, 
 
 | 檔案 | 用途 |
 |---|---|
-| `eval/enterprise/` | 虛構公司「青嶼科技」：18 份規章、58 題（練習題 41、考試題 17） |
-| `eval/school/` | 虛構國小「澄溪國小」：8 份文件、21 題，只拿來驗證改進是不是只對企業文件有效 |
+| `eval/enterprise/` | 虛構公司「青嶼科技」：78 份文件（026 擴大）、58 題（練習題 41、考試題 17） |
+| `eval/school/` | 虛構國小「澄溪國小」：41 份文件、21 題，只拿來驗證改進是不是只對企業文件有效 |
+| `eval/expand_docs.py`、`eval/review_docs.py` | 擴大知識庫：產生干擾文件、檢查會不會改變答案（026） |
 | `eval/build_pdfs.py` | 文件轉成 PDF，自動檢查規則表的關鍵字都在文件裡 |
 | `eval/run.py` | 用臨時資料庫跑評估：檢索、引用用程式判斷，回答用 gpt-4o 評審逐項對清單 |
+| `eval/retrieval.py` | 只比檢索（不生成答案），用來便宜地篩選搜尋的做法（028） |
+| `eval/openai_baseline.py` | 對照：OpenAI 現成的 file search（025、027） |
 
 結果寫在 `docs/eval-results.md`。改到問答相關的程式時手動跑（不接 CI 的原因見 docs/decisions/024）。

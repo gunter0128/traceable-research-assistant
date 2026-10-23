@@ -30,10 +30,10 @@ def _fakes(monkeypatch):
             on_usage(Usage(openai_client.EMBEDDING_MODEL, 1000 * len(texts)))
         return [[0.1] * 1536 for _ in texts]
 
-    def embed_query(text, deadline=None, on_usage=None):
+    def embed_queries(texts, deadline=None, on_usage=None):
         if on_usage:
-            on_usage(Usage(openai_client.EMBEDDING_MODEL, 20))
-        return [0.1] * 1536
+            on_usage(Usage(openai_client.EMBEDDING_MODEL, 20 * len(texts)))
+        return [[0.1] * 1536 for _ in texts]
 
     def generate_answer(question, context, deadline=None, on_usage=None):
         if on_usage:
@@ -41,7 +41,7 @@ def _fakes(monkeypatch):
         return "答案"
 
     monkeypatch.setattr(openai_client, "embed_texts", embed_texts)
-    monkeypatch.setattr(openai_client, "embed_query", embed_query)
+    monkeypatch.setattr(openai_client, "embed_queries", embed_queries)
     monkeypatch.setattr(openai_client, "generate_answer", generate_answer)
 
 

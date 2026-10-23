@@ -135,7 +135,7 @@ def test_queue_message_carries_request_id(client, logs, monkeypatch):
 
 # 測試：log 裡沒有使用者的檔名和問題內容
 def test_no_user_content_in_logs(client, logs, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_queries", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
     monkeypatch.setattr(openai_client, "generate_answer", lambda question, context, **kwargs: "答案")
     headers = _login(client)
     ws_id = _upload(client, headers).json()["workspace_id"]

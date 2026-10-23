@@ -214,7 +214,9 @@ def pct(v):
 def report_markdown(summaries: list[dict], meta: dict) -> str:
     lines = [f"## {meta['time']}　{meta['title']}　{meta['note']}", "",
              (f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜"
-              f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
+              # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
+              + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
+              + f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
     for key in ["all", *TYPE_NAMES]:
@@ -238,6 +240,8 @@ def main():
     parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
     parser.add_argument("--top-k", type=int,
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
+    parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog"],
+                        help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）")
     parser.add_argument("--split", choices=["dev", "test", "all"],
                         help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
                              "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
@@ -245,6 +249,8 @@ def main():
     corpus = CORPORA[args.corpus]
     if args.top_k:
         qa_service.SEARCH_LIMIT = args.top_k
+    if args.planner:
+        qa_service.PLANNER = args.planner
     if args.model:
         openai_client.GENERATION_MODEL = args.model
         # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
@@ -266,7 +272,8 @@ def main():
 
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
             "corpus": args.corpus, "title": corpus["title"], "commit": current_commit(), "chunks": chunks,
-            "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split}
+            "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split,
+            "planner": qa_service.PLANNER}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
 
