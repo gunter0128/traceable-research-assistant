@@ -125,6 +125,30 @@ QUESTIONS = [
 ]
 
 
+# ---------- 擴大知識庫之後補的「不能說」（docs/decisions/026）----------
+# 新加的舊學年度版本、下學年度的預告，裡面的數字都不是現在有效的答案
+# 衝突檢查（eval/review_docs.py）找出「粗心的人會怎麼答錯」，補進題目。只補「不能說」，題目和標準答案都不改
+OLD = "那是 {} 學年度的舊版"
+EXTRA_MUST_NOT = {
+    "g01": [f"出發前 {R.CONSENT_DAYS_BEFORE_111} 日（{OLD.format(111)}）"],
+    "g02": [f"連續 {R.SICK_PROOF_DAYS_114} 日以上就要附證明（{OLD.format(114)}）"],
+    "c02": [f"不分年級每 {R.STUDENTS_PER_CHAPERONE_111} 名學生 1 名（{OLD.format(111)}）"],
+    "c03": [f"三到六年級定期、平時各占 {R.GRADE_WEIGHTS_114['三到六年級定期評量']}%（{OLD.format(114)}）",
+            f"一、二年級定期評量占 {R.GRADE_WEIGHTS_114['一二年級定期評量']}%（{OLD.format(114)}）"],
+    "p03": [f"要付 {money(R.AFTER_SCHOOL_FEE_114)}（那是 114 學年度的收費）", f"要付 {money(R.AFTER_SCHOOL_FEE_116)}（那是 116 學年度才調整的收費）"],
+    "v01": [f"{R.NOTICE_SCHOOL_DAYS[113]} 個上課日前（{OLD.format(113)}）"],
+    "v02": [f"上限是 {money(R.TRIP_FEE_CAP_111['全日'])}（{OLD.format(111)}）"],
+    "v03": [f"現在是 {money(R.AFTER_SCHOOL_FEE_114)}（那是 114 學年度的收費）", f"現在是 {money(R.AFTER_SCHOOL_FEE_116)}（那是 116 學年度才調整的收費）"],
+    "s03": [f"一年級的期末考（定期評量）占 {R.GRADE_WEIGHTS_114['一二年級定期評量']}%（{OLD.format(114)}）"],
+    "x01": [f"上限 {money(R.TRIP_FEE_CAP_111['全日'])}（{OLD.format(111)}）"],
+    "x02": [f"{money(R.AFTER_SCHOOL_FEE_114 // 2)}（那是 114 學年度收費的半價）", f"{money(R.AFTER_SCHOOL_FEE_116 // 2)}（那是 116 學年度才調整的收費）"],
+}
+_ids = {q.id for q in QUESTIONS}
+assert set(EXTRA_MUST_NOT) <= _ids, set(EXTRA_MUST_NOT) - _ids
+for _q in QUESTIONS:
+    _q.must_not = _q.must_not + EXTRA_MUST_NOT.get(_q.id, [])
+
+
 def main():
     for q in QUESTIONS:
         q.split = "test"

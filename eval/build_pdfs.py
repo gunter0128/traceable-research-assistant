@@ -79,16 +79,22 @@ def to_html(markdown: str, footer: str) -> str:
 def check_facts(corpus: str, pdfs: Path) -> None:
     # 去掉所有空白再比對：PDF 解析出來的文字可能在任何地方斷行
     rules = importlib.import_module(f"eval.{corpus}.rules")
-    facts = getattr(rules, "FACTS", [])
+    facts = list(getattr(rules, "FACTS", []))
+    # 擴大知識庫時加的新文件（catalog.py），每份文件大綱裡規定一定要出現的字也一起檢查（docs/decisions/026）
+    try:
+        catalog = importlib.import_module(f"eval.{corpus}.catalog")
+        facts += [(spec["code"], fact) for spec in catalog.GENERATED + catalog.DERIVED for fact in spec["facts"]]
+    except ModuleNotFoundError:
+        pass
     if not facts:
-        print("rules.py 沒有列 FACTS，跳過檢查")
+        print("沒有要檢查的關鍵字，跳過")
         return
     texts = {pdf.name[:pdf.name.index("_")]: re.sub(r"\s", "", pdf_parser.extract_text(pdf))
              for pdf in pdfs.glob("*.pdf")}
     missing = [(code, fact) for code, fact in facts if re.sub(r"\s", "", fact) not in texts[code]]
     for code, fact in missing:
         print(f"  找不到：{code}「{fact}」")
-    print(f"檢查規則表的 {len(facts)} 個關鍵字：{'全部都在' if not missing else f'{len(missing)} 個找不到'}")
+    print(f"檢查 {len(facts)} 個關鍵字：{'全部都在' if not missing else f'{len(missing)} 個找不到'}")
     if missing:
         raise SystemExit(1)
 

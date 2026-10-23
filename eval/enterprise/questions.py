@@ -222,6 +222,55 @@ QUESTIONS = [
 ]
 
 
+# ---------- 擴大知識庫之後補的「不能說」（docs/decisions/026）----------
+# 新加的舊版、子公司、草案、還沒生效的公告，裡面的數字都不是現在對青嶼科技員工有效的答案
+# 衝突檢查（eval/review_docs.py）找出「粗心的人會怎麼答錯」，補進題目，抓出把干擾文件當成答案的錯
+# 只補「不能說」，題目和標準答案都不改
+SUB = "那是子公司青嶼雲端服務的規定"
+OLD24 = {months: days for months, days in R.LEAVE_TABLE_2024}
+SUBL = {months: days for months, days in R.SUB_LEAVE_TABLE}
+L22, L27, LS = R.LODGING_2022, R.LODGING_2027, R.SUB_LODGING
+DRAFT = "那是草案，還沒生效"
+FUTURE = "那是 2027 年 1 月 1 日才生效的標準"
+OLD22 = "那是 2022 年的舊版"
+EXTRA_MUST_NOT = {
+    "g07": [f"每月最多 {R.SUB_OVERTIME_CAP_HOURS} 小時（{SUB}）"],
+    "g08": ["1 小時內通報（那是資安事件的分級通報，不是設備遺失）"],
+    "c01": [f"正職年資 1～5 年是 {OLD24[12]} 天（那是 2024 年版）", f"正職年資 1～5 年是 {SUBL[12]} 天（{SUB}）"],
+    "c02": [f"P1–P3 台北目前是 {money(L27['P1-P3'][0])}（{FUTURE}）", f"P1–P3 台北目前是 {money(L22['P1-P3'][0])}（{OLD22}）",
+            f"P1–P3 台北目前是 {money(LS['P1-P3'][0])}（{SUB}）"],
+    "c03": [f"每週 {R.SUB_REMOTE_DAYS} 天（{SUB}）"],
+    "c05": [f"未滿 40 歲補助 {money(R.DRAFT_HEALTH_CHECK[0])}（{DRAFT}）"],
+    "c08": ["晚上 11 點以後才能搭計程車（那是 2022 年的舊版）"],
+    "c10": [f"每次 {money(R.MEAL_PROPOSAL_REJECTED)}（那是勞資會議的提案，沒有通過）", f"每次 {money(R.SUB_OVERTIME_MEAL)}（{SUB}）"],
+    "p01": [f"特休 {OLD24[12]} 天（那是 2024 年版）", f"特休 {SUBL[12]} 天（{SUB}）"],
+    "p02": [f"{SUBL[120]} 天（{SUB}）"],
+    "p03": [f"{money(L22['P4-P5'][0])}（{OLD22}）", f"{money(L27['P4-P5'][0])}（{FUTURE}）", f"{money(LS['P4-P5'][0])}（{SUB}）"],
+    "p04": [f"每週 {R.SUB_REMOTE_DAYS} 天（{SUB}）"],
+    "p05": [f"可以遠距，每週 {R.SUB_REMOTE_DAYS} 天（{SUB}）"],
+    "p08": [f"{money(R.DRAFT_HEALTH_CHECK[1])}（{DRAFT}）"],
+    "p09": [f"餐費 {money(R.MEAL_PROPOSAL_REJECTED)}（那是沒有通過的提案）", f"餐費 {money(R.SUB_OVERTIME_MEAL)}（{SUB}）"],
+    "v01": [f"特休是 {OLD24[12]} 天（那是 2024 年版）"],
+    "v03": [f"業務部每週 {R.SUB_REMOTE_DAYS} 天（{SUB}）"],
+    "v04": [f"現在是 {money(L27['P1-P3'][0])}（{FUTURE}）", f"現在是 {money(L22['P1-P3'][0])}（{OLD22}）",
+            f"現在是 {money(LS['P1-P3'][0])}（{SUB}）"],
+    "v05": [f"住宿上限 {money(L27['P1-P3'][0])}（{FUTURE}）", f"住宿上限 {money(L22['P1-P3'][0])}（{OLD22}）",
+            f"住宿上限 {money(LS['P1-P3'][0])}（{SUB}）"],
+    "s02": [f"可以領 {money(R.DRAFT_CONTRACT_WEDDING_GIFT)}（{DRAFT}）"],
+    "s08": ["可以派去國外出差（國內差旅辦法說實習生準用 P1 的標準，那是國內出差）"],
+    "x01": [f"特休 {OLD24[60]} 天（那是 2024 年版）", f"特休 {SUBL[60]} 天（{SUB}）"],
+    "x02": [f"住宿 {money(L27['P4-P5'][1])}（{FUTURE}）", f"住宿 {money(LS['P4-P5'][1])}（{SUB}）",
+            f"住宿 {money(L22['P4-P5'][1])}（{OLD22}）", f"膳雜費每天 {money(R.DOMESTIC_MEAL_2022)}（{OLD22}）"],
+    "x03": [f"{money(R.SUB_OVERTIME_MEAL)}（{SUB}）", f"{money(R.MEAL_PROPOSAL_REJECTED)}（那是沒有通過的提案）"],
+    "x05": ["採購要財務長核准（那是一般採購作業辦法，軟體採購不適用）"],
+    "x06": [f"使用遠端桌面服務（{SUB}）"],
+}
+_ids = {q.id for q in QUESTIONS}
+assert set(EXTRA_MUST_NOT) <= _ids, set(EXTRA_MUST_NOT) - _ids
+for _q in QUESTIONS:
+    _q.must_not = _q.must_not + EXTRA_MUST_NOT.get(_q.id, [])
+
+
 def main():
     assign_splits(QUESTIONS)
     write_question_files(QUESTIONS, HERE, "青嶼科技知識庫評估題目", "python -m eval.enterprise.questions")

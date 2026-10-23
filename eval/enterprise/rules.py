@@ -167,3 +167,46 @@ def training_cap(person: Person) -> int:
 
 def taipei_parking_eligible(person: Person, pregnant: bool = False, disabled: bool = False) -> bool:
     return person.site == "台北" and (person.level in ("M1", "M2", "M3") or pregnant or disabled)
+
+
+# ---------- 干擾文件裡的數字（docs/decisions/026）----------
+# 擴大知識庫時加進來的「相關但不適用」的文件：舊版、子公司、草案、還沒生效的公告
+# 這些數字都「不是」現在對青嶼科技員工有效的答案，寫在這裡是為了：
+#   1. 文件照這裡寫，數字有唯一的來源
+#   2. 題目的「不能說」用這裡的數字算，抓出把干擾文件當成答案的錯
+SUBSIDIARY = "青嶼雲端服務股份有限公司"
+
+# HR-08 員工手冊 2024 年版（被 2025、2026 年版取代）
+LEAVE_TABLE_2024 = [(120, 15), (60, 13), (12, 10), (6, 3), (0, 0)]
+
+# SUB-01 子公司員工手冊（只適用子公司員工）
+SUB_LEAVE_TABLE = [(120, 17), (60, 15), (12, 13), (6, 3), (0, 0)]
+SUB_FLEX_START = ("09:00", "10:30")
+
+# SUB-02 子公司國內出差旅費要點
+SUB_LODGING = {"P1-P3": (2600, 2200), "P4-P5": (3200, 2600), "M": (4000, 3300)}
+
+# SUB-03 子公司遠距工作規定：不分部門每週 4 日
+SUB_REMOTE_DAYS = 4
+
+# SUB-04 子公司加班管理要點
+SUB_OVERTIME_MEAL = 170
+SUB_OVERTIME_CAP_HOURS = 40
+
+# FIN-12 國內差旅辦法 2022 年版（被 FIN-01 2024 年版取代）
+LODGING_2022 = {"P1-P3": (2000, 1800), "P4-P5": (2600, 2200), "M": (3300, 2800)}
+DOMESTIC_MEAL_2022 = 500
+
+# FIN-14 公告：2027 年 1 月 1 日起的住宿費上限（已公告、還沒生效）
+LODGING_2027 = {"P1-P3": (3000, 2500), "P4-P5": (3600, 3000), "M": (4500, 3800)}
+LODGING_2027_EFFECTIVE = date(2027, 1, 1)
+
+# HR-22 勞資會議紀錄：加班餐費提高到 180 元的提案，決議暫緩（沒有通過）
+MEAL_PROPOSAL_REJECTED = 180
+
+# HR-23 員工福利辦法修正草案（徵詢意見中，還沒生效）
+DRAFT_HEALTH_CHECK = (4000, 6000)  # 未滿 40 歲、40 歲以上
+DRAFT_CONTRACT_WEDDING_GIFT = 3000
+
+# FIN-05 一般採購作業辦法：一般物品單筆 1 萬元以上要總經理核准；軟體不適用，依 IT-03
+GENERAL_PURCHASE_GM_THRESHOLD = 10000
