@@ -270,6 +270,24 @@ assert set(EXTRA_MUST_NOT) <= _ids, set(EXTRA_MUST_NOT) - _ids
 for _q in QUESTIONS:
     _q.must_not = _q.must_not + EXTRA_MUST_NOT.get(_q.id, [])
 
+# ---------- 「一定要提到」裡太嚴的項目，改成加分項（docs/decisions/030）----------
+# 原則：少了這一點，使用者會不會做錯事、或問題根本沒被回答？不會的話就是加分項
+# 抽查評審時發現三類太嚴的項目，在全部題目裡找出同一類的：
+#   已經生效的修改的日期（問的是現在的規定時）、條文的用語、替代的做法
+NICE_TO_HAVE = {
+    "v03": ["2026 年 4 月 1 日"],   # 已經生效的修改日期：知道現在是 2 天就能照做
+    "v04": ["2026 年 1 月 1 日"],
+    "v06": ["2026 年 1 月 1 日"],
+    "x04": ["準用", "一般職"],       # 條文用語：答出「可以選加班費或補休」就夠了
+    "s01": ["事假", "2 日"],         # 替代的做法：「實習生沒有特休」已經答對
+    "c11": ["候補"],
+}
+assert set(NICE_TO_HAVE) <= _ids, set(NICE_TO_HAVE) - _ids
+for _q in QUESTIONS:
+    for _item in NICE_TO_HAVE.get(_q.id, []):
+        _q.must_include.remove(_item)
+        _q.nice_to_have.append(_item)
+
 
 def main():
     assign_splits(QUESTIONS)

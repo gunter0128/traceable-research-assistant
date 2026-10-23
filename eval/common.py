@@ -46,6 +46,8 @@ class Question:
     must_include: list[str]
     sources: list[str]
     must_not: list[str] = field(default_factory=list)
+    # 加分項：有提到更好，但少了也不會讓使用者做錯事，不影響「全對」（docs/decisions/030）
+    nice_to_have: list[str] = field(default_factory=list)
     should_refuse: bool = False
     split: str = "dev"
 
@@ -88,6 +90,8 @@ def write_question_files(questions: list[Question], folder: Path, title: str, co
                 lines.append(f"- 應該引用：{'、'.join(q.sources)}")
             if q.must_not:
                 lines.append(f"- 不能說：{'；'.join(q.must_not)}")
+            if q.nice_to_have:
+                lines.append(f"- 加分：{'；'.join(q.nice_to_have)}")
             lines.append("")
     (folder / "questions.md").write_text("\n".join(lines), encoding="utf-8")
     counts = {name: sum(1 for q in questions if q.type == t) for t, name in TYPE_NAMES.items()}

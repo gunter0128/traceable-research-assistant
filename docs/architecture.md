@@ -425,6 +425,7 @@ AskResponse { answer: "……14 天[1]。", citations: [ { number: 1, filename, 
 | `eval/expand_docs.py`、`eval/review_docs.py` | 擴大知識庫：產生干擾文件、檢查會不會改變答案（026） |
 | `eval/build_pdfs.py` | 文件轉成 PDF，自動檢查規則表的關鍵字都在文件裡 |
 | `eval/run.py` | 用臨時資料庫跑評估：檢索、引用用程式判斷，回答用 gpt-4o 評審逐項對清單 |
+| `eval/rescore.py` | 改了評分規則之後，用新規則重新評分存下來的回答，不重新回答（030） |
 | `eval/retrieval.py` | 只比檢索（不生成答案），用來便宜地篩選搜尋的做法（028） |
 | `eval/openai_baseline.py` | 對照：OpenAI 現成的 file search（025、027） |
 | `eval/doc_status.py` | 每份文件狀態的標準答案（現行、舊版…），用來量標籤的上限和小模型判斷的準確率（029） |

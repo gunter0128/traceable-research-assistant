@@ -99,8 +99,11 @@ JUDGE_PROMPT = """你是問答系統的評審。系統回答的是{domain}的問
 
 判斷原則：
 - 看「意思」不看字面：同一件事換個說法也算有提到；數字必須一致（14 天和 15 天是不同的事）
-- 「不能說的錯誤說法」：系統的回答裡如果有表達這個意思（包括當成答案或結論講出來），就算出現；
-  如果系統只是在說明「那是舊版」「那不適用於你」時提到這個數字，不算出現
+- 「不能說的錯誤說法」：系統把它當成問題的答案，或當成適用於提問的人、現在有效的規定，才算出現。以下不算：
+  - 系統明確標出那是別的對象（例如別的公司、職級、地點）的規定，跟適用的答案分開列出
+  - 系統明確說明那是舊版、已經廢止、還沒生效、草案或沒有通過的內容
+  - 只是出現同一個數字，整句的意思不同（例如把兩種假分開說明之後再加總，不等於說其中一種假有那麼多天）
+- 回答前後矛盾時（例如開頭說「可以」，後面又說不符合條件），以開頭的結論為準：使用者通常先看結論
 - 「拒答」：系統明確表示文件中找不到、沒有相關資訊、無法回答
 
 問題：{question}
@@ -112,14 +115,16 @@ JUDGE_PROMPT = """你是問答系統的評審。系統回答的是{domain}的問
 
 系統引用的文件：{cited}
 
-請逐項判斷，輸出 JSON：
+請逐項判斷，先寫理由再下判斷，item 照下面列的原文抄、順序一樣，沒有列出的項目不要自己加，輸出 JSON：
 {{
-  "must_include": [{{"item": "原文", "present": true/false, "reason": "一句話"}}],
-  "must_not": [{{"item": "原文", "present": true/false, "reason": "一句話"}}],
+  "must_include": [{{"item": "原文", "reason": "一句話", "present": true/false}}],
+  "nice_to_have": [{{"item": "原文", "reason": "一句話", "present": true/false}}],
+  "must_not": [{{"item": "原文", "reason": "一句話", "present": true/false}}],
   "refused": true/false
 }}
 
 一定要提到的：{must_include}
+有提到更好的：{nice_to_have}
 不能說的：{must_not}"""
 
 
@@ -127,6 +132,7 @@ def judge(client: OpenAI, domain: str, q: dict, response: str, cited: list[str])
     prompt = JUDGE_PROMPT.format(
         domain=domain, question=q["question"], answer=q["answer"], response=response, cited="、".join(cited) or "（無）",
         must_include=json.dumps(q["must_include"], ensure_ascii=False),
+        nice_to_have=json.dumps(q.get("nice_to_have", []), ensure_ascii=False),
         must_not=json.dumps(q["must_not"], ensure_ascii=False),
     )
     result = client.chat.completions.create(
@@ -157,8 +163,9 @@ def run_once(db, user, workspace, questions, client, domain, today) -> list[dict
 def score(client, domain, q, answer, retrieved, cited, seconds) -> dict:
     required = sorted({doc_code(s) for s in q["sources"]})
     verdict = judge(client, domain, q, answer, cited)
-    included = [v["present"] for v in verdict["must_include"]]
-    violated = [v["present"] for v in verdict["must_not"]]
+    included = _align(q["must_include"], verdict.get("must_include", []))
+    bonus = _align(q.get("nice_to_have", []), verdict.get("nice_to_have", []))
+    violated = _align(q["must_not"], verdict.get("must_not", []))
     refused = bool(verdict["refused"])
     row = {
         "id": q["id"], "type": q["type"], "question": q["question"], "response": answer,
@@ -168,6 +175,8 @@ def score(client, domain, q, answer, retrieved, cited, seconds) -> dict:
         # 引用完整：該引用的文件，答案全部都有標出來。沒有答案的題目，要「一個都沒標」才算對
         "cite_full": not cited if q["should_refuse"] else all(r in cited for r in required),
         "include_rate": sum(included) / len(included) if included else None,
+        # 加分項有提到幾成（不影響全對，docs/decisions/030）
+        "bonus_rate": sum(bonus) / len(bonus) if bonus else None,
         "misuse": any(violated),
         "refused": refused,
         "refusal_ok": refused == q["should_refuse"],
@@ -179,6 +188,17 @@ def score(client, domain, q, answer, retrieved, cited, seconds) -> dict:
     print(f"  {mark} {q['id']} {q['question'][:30]:32} 檢索 {'完整' if row['full_hit'] else ('—' if row['full_hit'] is None else '缺')}"
           f"{'  誤用' if row['misuse'] else ''}{'  拒答' if refused else ''}")
     return row
+
+
+# 評審偶爾會自己多寫一項、漏寫一項或改寫項目的文字（954 次裡有 15 次，docs/decisions/030）
+# 只採用題目裡有的項目：先照原文對回去，對不到、但數量一樣的話照順序對；都對不到就當作 false
+def _align(expected: list[str], judged: list[dict]) -> list[bool]:
+    by_text = {v.get("item"): v for v in judged}
+    aligned = []
+    for i, item in enumerate(expected):
+        v = by_text.get(item) or (judged[i] if len(judged) == len(expected) else None)
+        aligned.append(bool(v and v.get("present")))
+    return aligned
 
 
 def summarize(rows: list[dict]) -> dict:
