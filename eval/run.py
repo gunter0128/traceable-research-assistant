@@ -149,13 +149,30 @@ def load_evidence(corpus: str) -> dict[str, list[str]]:
     return {qid: [quote for _, _, quote in items] for qid, items in getattr(module, "EVIDENCE", {}).items()}
 
 
+# 回答的服務暫時連不上時（例如接實驗室自己架的模型，SSH 轉接斷線），等一下再試，最多等約 5 分鐘
+# 不然斷一下整輪評估就中止了（docs/decisions/034）。秒數只算成功的那一次
+ASK_RETRIES = 10
+ASK_RETRY_WAIT = 30
+
+
+def _ask(db, workspace, user, question, today):
+    for attempt in range(ASK_RETRIES):
+        started = time.perf_counter()
+        try:
+            response, passages = qa_service.ask_with_passages(db, workspace.id, user.id, question, today=today)
+            return response, passages, time.perf_counter() - started
+        except qa_service.AIServiceUnavailable:
+            if attempt == ASK_RETRIES - 1:
+                raise
+            print(f"  （回答的服務連不上，{ASK_RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）")
+            time.sleep(ASK_RETRY_WAIT)
+
+
 def run_once(db, user, workspace, questions, client, domain, today, evidence=None) -> list[dict]:
     rows = []
     for q in questions:
-        started = time.perf_counter()
         # 今天日期固定成知識庫設定的「現在」（2026-10-20），分數才不會因為哪天跑評估而變
-        response, passages = qa_service.ask_with_passages(db, workspace.id, user.id, q["question"], today=today)
-        seconds = time.perf_counter() - started
+        response, passages, seconds = _ask(db, workspace, user, q["question"], today)
         retrieved = sorted({doc_code(p.filename) for p in passages})
         # 引用：自己從答案裡數 [n]，不看 response.citations（模型忘了標時，系統會退回列出全部搜到的段落，會灌水）
         _, marked = qa_service._extract_citations(response.answer, len(passages))
