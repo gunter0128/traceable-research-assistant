@@ -278,6 +278,13 @@ def main():
     parser.add_argument("--note", default="", help="這次評估的說明，例如「基準」「改 prompt」")
     parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / school 學校")
     parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
+    parser.add_argument("--answer-base-url",
+                        help="回答改接這個 OpenAI 格式的服務，例如 http://localhost:8000/v1（實驗室用 vLLM 架的開源模型，"
+                             "docs/decisions/034）；找文件照舊用 OpenAI")
+    parser.add_argument("--no-think", action="store_true",
+                        help="搭配 --answer-base-url：關掉開源模型的思考模式（Qwen 系列），直接回答")
+    parser.add_argument("--answer-timeout", type=float,
+                        help="回答每次最多等幾秒（預設跟線上一樣 15 秒）；本機架的模型比較慢時調大")
     parser.add_argument("--top-k", type=int,
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
     parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog", "oracle"],
@@ -312,6 +319,15 @@ def main():
         openai_client.GENERATION_MODEL = args.model
         # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
         openai_client.PRICES_PER_MILLION.setdefault("gpt-4o-mini", (Decimal("0.15"), Decimal("0.60")))
+    if args.answer_base_url:
+        # 自己架的模型不用付 API 的錢（GPU 的成本另外算），價目表記 0
+        openai_client.PRICES_PER_MILLION.setdefault(openai_client.GENERATION_MODEL, (Decimal(0), Decimal(0)))
+        extra = {"chat_template_kwargs": {"enable_thinking": False}} if args.no_think else None
+        openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
+    if args.answer_timeout:
+        openai_client.QA_TIMEOUT = args.answer_timeout
+        # 整個問答的時間預算也跟著放寬：重試兩次加上轉向量、搜尋
+        qa_service.ANSWER_BUDGET_SECONDS = max(qa_service.ANSWER_BUDGET_SECONDS, args.answer_timeout * 2 + 20)
     # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
     usage_service.ensure_within_quota = lambda db, owner_id: None
 
@@ -334,7 +350,8 @@ def main():
             "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split,
             "planner": qa_service.PLANNER if args.planner != "oracle" or args.oracle_recall == 1 and not args.oracle_wrong
             else f"oracle（選對 {args.oracle_recall:.0%}、多選 {args.oracle_wrong} 份）",
-            "doc_status": qa_service.DOC_STATUS, "chunker": chunker.STRATEGY}
+            "doc_status": qa_service.DOC_STATUS, "chunker": chunker.STRATEGY,
+            "answer_endpoint": args.answer_base_url or "OpenAI"}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
 

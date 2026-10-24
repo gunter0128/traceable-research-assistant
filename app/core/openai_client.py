@@ -446,6 +446,19 @@ def _parse_statuses(content: str | None, filenames: set[str]) -> dict[str, tuple
     return statuses
 
 
+# 回答用的模型服務（docs/decisions/034）：預設就是 OpenAI
+# 也可以換成任何「OpenAI 格式」的服務，例如在內部 GPU 上用 vLLM 架的開源模型：機密文件不用送到外部
+# answer_extra_body：那個服務需要的額外參數（例如關掉開源模型的「思考模式」），OpenAI 不需要
+answer_client = client
+answer_extra_body: dict | None = None
+
+
+def use_answer_endpoint(base_url: str, api_key: str = "not-needed", extra_body: dict | None = None) -> None:
+    global answer_client, answer_extra_body
+    answer_client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+    answer_extra_body = extra_body
+
+
 # 放在問題後面的提醒：模型對離問題最近的指示比較會照做
 CITATION_REMINDER = "（回答時，用到資料的句子，句尾要標上依據的段落編號，例如 [1]。）"
 
@@ -458,8 +471,9 @@ def generate_answer(
     on_usage: Callable[[Usage], None] | None = None,
 ) -> str:
     def call(timeout: float):
-        return client.with_options(timeout=timeout).chat.completions.create( # 對話生成的功能
+        return answer_client.with_options(timeout=timeout).chat.completions.create( # 對話生成的功能
             model=GENERATION_MODEL,
+            extra_body=answer_extra_body,
             messages=[
                 {"role": "system", "content": ANSWER_RULES}, # 開發者給 LLM 的規則
                 # 真正的使用者輸入。最後再提醒一次標引用：只寫在 system 的原則裡，約三成的回答會忘記標（docs/decisions/021）
