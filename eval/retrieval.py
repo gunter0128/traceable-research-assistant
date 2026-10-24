@@ -5,7 +5,7 @@
 #
 # 用法（專案資料夾，臨時資料庫要先開好，見 eval/run.py）：
 #   .venv\Scripts\python -m eval.retrieval --corpus enterprise
-#   預設比 none / rewrite / checklist / catalog 四種規劃 × 5、8 段，只用練習題
+#   預設比 none / catalog 兩種規劃 × 5、8 段，只用練習題
 #
 # 同一題的規劃只做一次，再分別取 5 段、8 段：段數不同的結果，差別只來自段數，不會混到規劃的隨機性
 
@@ -27,7 +27,7 @@ from app.core import chunker, openai_client
 from app.services import qa_service
 from eval.common import CORPORA, TYPE_NAMES, evidence_rate
 
-PLANNERS = ["none", "rewrite", "checklist", "catalog"]
+PLANNERS = ["none", "catalog"]
 
 
 def main():

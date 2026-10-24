@@ -50,7 +50,6 @@ from app.core.db import Base, SessionLocal, engine
 from app.repositories import chunk_repo, document_repo, workspace_repo
 from app.services import auth_service, document_service, qa_service, usage_service
 from eval.common import CORPORA, TYPE_NAMES, evidence_rate
-from eval.doc_status import gold_status
 
 EVAL = Path(__file__).parent
 RESULTS = EVAL / "data" / "results"
@@ -251,7 +250,6 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
              (f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜"
               # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
               + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
-              + (f"文件狀態 {meta['doc_status']}｜" if meta.get("doc_status", "none") != "none" else "")
               + (f"切段 {meta['chunker']}｜" if meta.get("chunker", "fixed") != "fixed" else "")
               + f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
@@ -276,7 +274,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=1, help="同樣的設定跑幾輪（看分數的隨機波動）")
     parser.add_argument("--note", default="", help="這次評估的說明，例如「基準」「改 prompt」")
-    parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / school 學校")
+    parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / school 學校 / labor 勞動法規")
     parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
     parser.add_argument("--answer-base-url",
                         help="回答改接這個 OpenAI 格式的服務，例如 http://localhost:8000/v1（實驗室用 vLLM 架的開源模型，"
@@ -287,7 +285,7 @@ def main():
                         help="回答每次最多等幾秒（預設跟線上一樣 15 秒）；本機架的模型比較慢時調大")
     parser.add_argument("--top-k", type=int,
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
-    parser.add_argument("--planner", choices=["none", "rewrite", "checklist", "catalog", "oracle"],
+    parser.add_argument("--planner", choices=["none", "catalog", "oracle"],
                         help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）；"
                              "oracle 直接用題目的標準答案指定要去哪幾份文件找，量「找文件做到完美時」的上限（031）")
     parser.add_argument("--oracle-recall", type=float, default=1.0,
@@ -296,9 +294,6 @@ def main():
                         help="搭配 --planner oracle：另外多選幾份不相關的文件")
     parser.add_argument("--chunker", choices=["fixed", "structured"],
                         help="切段的方式（不指定就用系統現在的設定 chunker.STRATEGY，docs/decisions/032）")
-    parser.add_argument("--doc-status", choices=["none", "llm", "oracle"],
-                        help="回答前判斷文件是否有效（docs/decisions/029）：llm 小模型判斷；"
-                             "oracle 直接用標準答案（eval/doc_status.py），量「標籤完全正確時」的上限")
     parser.add_argument("--split", choices=["dev", "test", "all"],
                         help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
                              "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
@@ -310,11 +305,6 @@ def main():
         chunker.STRATEGY = args.chunker
     if args.planner:
         qa_service.PLANNER = args.planner
-    if args.doc_status == "oracle":
-        qa_service.DOC_STATUS = "oracle"
-        qa_service._label_documents = oracle_labels(args.corpus)
-    elif args.doc_status:
-        qa_service.DOC_STATUS = args.doc_status
     if args.model:
         openai_client.GENERATION_MODEL = args.model
         # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
@@ -350,22 +340,10 @@ def main():
             "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split,
             "planner": qa_service.PLANNER if args.planner != "oracle" or args.oracle_recall == 1 and not args.oracle_wrong
             else f"oracle（選對 {args.oracle_recall:.0%}、多選 {args.oracle_wrong} 份）",
-            "doc_status": qa_service.DOC_STATUS, "chunker": chunker.STRATEGY,
+            "chunker": chunker.STRATEGY,
             "answer_endpoint": args.answer_base_url or "OpenAI"}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
-
-
-# 標準答案當標籤（docs/decisions/029）：換掉 qa_service._label_documents，參數跟它一樣
-def oracle_labels(corpus: str):
-    def label(db, workspace, groups, headers, today, deadline, on_usage):
-        statuses = {}
-        for document, _ in groups:
-            status = gold_status(corpus, doc_code(document.filename))
-            if status != "現行":
-                statuses[document.id] = (status, None)
-        return statuses
-    return label
 
 
 # 完美的規劃器（docs/decisions/031）：換掉 qa_service._plan，參數跟它一樣

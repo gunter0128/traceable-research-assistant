@@ -243,7 +243,7 @@ def test_merge_round_robin():
     assert qa_service._merge_round_robin([[a, b, c]], 2) == [a, b]  # 只有一句（不規劃）：就是原本的前幾名
 
 
-# 測試：規劃的 JSON 三種格式都接受，去掉空白和重複，最多 4 筆；格式不對就當作沒有規劃
+# 測試：規劃的 JSON 照規定的格式和模型偶爾用的別種格式都接受，去掉空白和重複，最多 4 筆；格式不對就當作沒有規劃
 P = openai_client.PlannedSearch
 
 
@@ -281,8 +281,8 @@ def _record_embedded(monkeypatch) -> list:
 # 測試：開了規劃，原本的問題和規劃出來的句子都會拿去搜
 def test_planned_queries_are_searched(client, monkeypatch):
     embedded = _record_embedded(monkeypatch)
-    monkeypatch.setattr(qa_service, "PLANNER", "checklist")
-    monkeypatch.setattr(openai_client, "plan_queries", lambda question, mode, **kwargs: [P("方法"), P("限制")])
+    monkeypatch.setattr(qa_service, "PLANNER", "catalog")
+    monkeypatch.setattr(openai_client, "plan_queries", lambda question, catalog, **kwargs: [P("方法"), P("限制")])
     token = _register_and_login(client, "erin@example.com")
     ws_id = _create_workspace(client, token)
     _upload_pdf(client, token, ws_id)
@@ -296,9 +296,9 @@ def test_planned_queries_are_searched(client, monkeypatch):
 # 測試：規劃失敗不算問答失敗，退回只用問題搜
 def test_planner_failure_falls_back_to_question(client, monkeypatch):
     embedded = _record_embedded(monkeypatch)
-    monkeypatch.setattr(qa_service, "PLANNER", "checklist")
+    monkeypatch.setattr(qa_service, "PLANNER", "catalog")
 
-    def broken_planner(question, mode, **kwargs):
+    def broken_planner(question, catalog, **kwargs):
         raise openai_client.OpenAITemporaryError()
 
     monkeypatch.setattr(openai_client, "plan_queries", broken_planner)
@@ -320,7 +320,7 @@ def test_catalog_planner_targets_listed_documents_only(client, monkeypatch):
     monkeypatch.setattr(qa_service, "PLANNER", "catalog")
     seen = {}
 
-    def fake_planner(question, mode, catalog=None, **kwargs):
+    def fake_planner(question, catalog, **kwargs):
         seen["catalog"] = catalog
         return [P("方法", "thesis.pdf"), P("限制", "編出來的.pdf")]
 
@@ -348,7 +348,7 @@ def test_catalog_planner_targets_listed_documents_only(client, monkeypatch):
 def test_no_planning_by_default(client, monkeypatch):
     embedded = _record_embedded(monkeypatch)
 
-    def must_not_call(question, mode, **kwargs):
+    def must_not_call(question, catalog, **kwargs):
         raise AssertionError("不規劃時不該呼叫")
 
     monkeypatch.setattr(openai_client, "plan_queries", must_not_call)
@@ -360,86 +360,3 @@ def test_no_planning_by_default(client, monkeypatch):
 
     assert qa_service.PLANNER == "none"
     assert embedded == [["方法是什麼？"]]
-
-
-# ---------- 回答前判斷文件是否有效（docs/decisions/029）----------
-
-# 測試：判斷的 JSON 只留要判斷的檔名和認得的狀態
-def test_parse_statuses():
-    content = (
-        '{"documents": [{"file": "a.pdf", "status": "舊版", "reason": "已有新版"}, '
-        '{"file": "b.pdf", "status": "現行"}, {"file": "c.pdf", "status": "亂寫的"}, '
-        '{"file": "沒問的.pdf", "status": "舊版"}]}'
-    )
-    assert openai_client._parse_statuses(content, {"a.pdf", "b.pdf", "c.pdf"}) == {
-        "a.pdf": ("舊版", "已有新版"),
-        "b.pdf": ("現行", None),
-    }
-    assert openai_client._parse_statuses("不是 JSON", {"a.pdf"}) == {}
-
-
-# 測試：不是現行的文件，在開頭下面註明狀態，並提醒不能當成答案；現行的文件不加
-def test_context_marks_documents_that_are_not_current():
-    new = SimpleNamespace(id=1, filename="手冊_2026.pdf")
-    old = SimpleNamespace(id=2, filename="手冊_2024.pdf")
-    chunks = [
-        SimpleNamespace(document_id=1, document=new, chunk_index=0, content="新版"),
-        SimpleNamespace(document_id=2, document=old, chunk_index=0, content="舊版"),
-    ]
-    groups = qa_service._group_by_document(chunks)
-
-    context = qa_service._build_context(groups, {}, date(2026, 10, 20), {2: ("舊版", "已有 2026 年版")})
-
-    assert "【文件】手冊_2024.pdf\n文件開頭：\n文件狀態：舊版，已經有較新的版本或已經廢止（已有 2026 年版）。不能當成現在的答案" in context
-    assert context.count("文件狀態") == 1
-
-
-# 測試：開了判斷，會把搜到的文件交給模型判斷，結果標在給回答模型的資料上
-def test_document_statuses_are_shown_to_the_answer_model(client, monkeypatch):
-    sent = {}
-
-    def fake_generate(question, context, **kwargs):
-        sent["context"] = context
-        return "答案[1]"
-
-    def fake_label(knowledge_base, today_text, catalog, targets, **kwargs):
-        sent["knowledge_base"], sent["targets"] = knowledge_base, [filename for filename, _ in targets]
-        return {"thesis.pdf": ("草案", "還在徵詢意見")}
-
-    monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
-    monkeypatch.setattr(openai_client, "label_documents", fake_label)
-    monkeypatch.setattr(qa_service, "DOC_STATUS", "llm")
-    token = _register_and_login(client, "ivan@example.com")
-    ws_id = _create_workspace(client, token, name="青嶼科技規章")
-    _upload_pdf(client, token, ws_id)
-
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "方法是什麼？"}, headers=_auth_headers(token))
-
-    assert response.status_code == 200
-    assert sent["knowledge_base"] == "青嶼科技規章"
-    assert sent["targets"] == ["thesis.pdf"]
-    assert "文件狀態：草案或提案，還沒正式通過（還在徵詢意見）" in sent["context"]
-
-
-# 測試：判斷失敗不算問答失敗，照常回答，只是沒有標狀態
-def test_status_failure_still_answers(client, monkeypatch):
-    sent = {}
-
-    def fake_generate(question, context, **kwargs):
-        sent["context"] = context
-        return "答案[1]"
-
-    def broken_label(*args, **kwargs):
-        raise openai_client.OpenAITemporaryError()
-
-    monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
-    monkeypatch.setattr(openai_client, "label_documents", broken_label)
-    monkeypatch.setattr(qa_service, "DOC_STATUS", "llm")
-    token = _register_and_login(client, "judy@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id)
-
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "方法是什麼？"}, headers=_auth_headers(token))
-
-    assert response.status_code == 200
-    assert "文件狀態" not in sent["context"]

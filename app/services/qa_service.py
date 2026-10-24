@@ -24,11 +24,9 @@ DOCUMENT_HEADER_CHARS = 200
 # 每次問答搜幾段給模型看（docs/decisions/020）
 SEARCH_LIMIT = 5
 
-# 搜尋前要不要先規劃要查什麼（docs/decisions/028）
-#   none：不規劃，只拿問題直接搜（現在線上用的）
-#   rewrite：自由改寫成幾句搜尋句子；checklist：照四種常見的資料逐項檢查；
-#   catalog：checklist 再加上文件清單，可以指定去哪份文件找（見 openai_client 的 PLAN_*）
-# 線上要不要換、換哪一種，看評估結果決定
+# 搜尋前要不要先規劃要查什麼（docs/decisions/028、033）
+#   none：不規劃，只拿問題直接搜（線上用的）
+#   catalog：看過文件清單，規劃要去哪幾份文件找（openai_client.PLAN_CATALOG）。量過沒有讓答案變好，只當評估工具
 PLANNER = "none"
 
 # 規劃最多花幾秒：規劃失敗還可以只用問題搜，不能讓它把回答的時間吃掉
@@ -37,19 +35,6 @@ PLAN_BUDGET_SECONDS = 8
 # 給規劃看的文件清單：最多幾份、每份附上開頭的幾個字（標題、生效日期、適用對象通常寫在最前面）
 PLAN_CATALOG_LIMIT = 200
 PLAN_CATALOG_HEADER_CHARS = 100
-
-# 回答前要不要判斷每份搜到的文件現在是否有效（docs/decisions/029）
-#   none：不判斷（現在線上用的）；llm：請小模型判斷（openai_client.label_documents）
-DOC_STATUS = "none"
-# 判斷最多花幾秒：判斷失敗就當作沒判斷，照常回答
-STATUS_BUDGET_SECONDS = 8
-# 不是「現行」的文件，在資料裡怎麼寫
-STATUS_NOTES = {
-    "舊版": "舊版，已經有較新的版本或已經廢止",
-    "尚未生效": "還沒生效",
-    "草案": "草案或提案，還沒正式通過",
-    "其他單位": "別的單位的規定",
-}
 
 
 # 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
@@ -74,7 +59,7 @@ def ask_with_passages(
     db: Session, workspace_id: int, owner_id: int, question: str, today: date | None = None
 ) -> tuple[AskResponse, list[CitationOut]]:
     # 借用 workspace 的 ownership 檢查：先確認這個 workspace 是不是你的
-    workspace = workspace_service.get_owned_workspace(db, workspace_id, owner_id)
+    workspace_service.get_owned_workspace(db, workspace_id, owner_id)
     # 今天的用量到上限了就不回答（docs/decisions/012）。還沒到的話，這次會完整回答完，就算答完之後超過了也一樣
     usage_service.ensure_within_quota(db, owner_id)
 
@@ -101,8 +86,7 @@ def ask_with_passages(
             fields["chunks"] = len(chunks)
             fields["documents"] = len(groups)
         today = today or datetime.now(usage_service.TAIWAN).date()
-        statuses = _label_documents(db, workspace, groups, headers, today, deadline, record_usage)
-        context = _build_context(groups, headers, today, statuses)
+        context = _build_context(groups, headers, today)
         with log.timed("qa_generate") as fields:
             answer = openai_client.generate_answer(question, context, deadline=deadline, on_usage=record_usage)
             fields["answer_chars"] = len(answer or "")
@@ -146,60 +130,25 @@ def ask_with_passages(
 def _plan(db: Session, workspace_id: int, question: str, deadline: float, on_usage) -> list:
     if PLANNER == "none":
         return []
-    catalog = None
-    if PLANNER == "catalog":
-        catalog = [
-            (filename, " ".join(header.split())[:PLAN_CATALOG_HEADER_CHARS])
-            for filename, header in chunk_repo.document_headers(db, workspace_id, PLAN_CATALOG_LIMIT)
-        ]
+    catalog = [
+        (filename, " ".join(header.split())[:PLAN_CATALOG_HEADER_CHARS])
+        for filename, header in chunk_repo.document_headers(db, workspace_id, PLAN_CATALOG_LIMIT)
+    ]
     plan_deadline = min(deadline, time.monotonic() + PLAN_BUDGET_SECONDS)
     with log.timed("qa_plan", planner=PLANNER) as fields:
         try:
-            searches = openai_client.plan_queries(
-                question, PLANNER, catalog=catalog, deadline=plan_deadline, on_usage=on_usage
-            )
+            searches = openai_client.plan_queries(question, catalog, deadline=plan_deadline, on_usage=on_usage)
         except (openai_client.OpenAITemporaryError, openai_client.OpenAIPermanentError) as exc:
             log.event("qa_plan_failed", logging.WARNING, error_type=type(exc).__name__)
             searches = []
         # 模型指定的檔名不在清單裡（抄錯、編出來的）：不限文件，改成整個 workspace 都搜
-        filenames = {filename for filename, _ in catalog or []}
+        filenames = {filename for filename, _ in catalog}
         for search in searches:
             if search.document not in filenames:
                 search.document = None
         fields["queries"] = len(searches)
         fields["targeted"] = sum(search.document is not None for search in searches)
     return searches
-
-
-# 判斷搜到的每份文件現在是否有效，回傳 {document_id: (狀態, 理由)}，只放不是「現行」的
-# DOC_STATUS 是 none 就不判斷；判斷失敗（OpenAI 出錯、超時）也當作沒判斷，照常回答
-def _label_documents(db: Session, workspace, groups, headers: dict[int, str], today: date, deadline: float, on_usage) -> dict:
-    if DOC_STATUS == "none" or not groups:
-        return {}
-    catalog = [
-        (filename, " ".join(header.split())[:PLAN_CATALOG_HEADER_CHARS])
-        for filename, header in chunk_repo.document_headers(db, workspace.id, PLAN_CATALOG_LIMIT)
-    ]
-    targets = [
-        (document.filename, " ".join(headers.get(document.id, "").split())[:DOCUMENT_HEADER_CHARS])
-        for document, _ in groups
-    ]
-    status_deadline = min(deadline, time.monotonic() + STATUS_BUDGET_SECONDS)
-    with log.timed("qa_status", documents=len(targets)) as fields:
-        try:
-            labels = openai_client.label_documents(
-                workspace.name, _date_text(today), catalog, targets, deadline=status_deadline, on_usage=on_usage
-            )
-        except (openai_client.OpenAITemporaryError, openai_client.OpenAIPermanentError) as exc:
-            log.event("qa_status_failed", logging.WARNING, error_type=type(exc).__name__)
-            labels = {}
-        statuses = {
-            document.id: labels[document.filename]
-            for document, _ in groups
-            if document.filename in labels and labels[document.filename][0] != "現行"
-        }
-        fields["not_current"] = len(statuses)
-    return statuses
 
 
 def _date_text(day: date) -> str:
@@ -273,19 +222,13 @@ def _group_by_document(chunks) -> list[tuple]:
 #     開頭直接給模型讀，不自己解析日期：民國年、西元年、學年度各種寫法，模型都讀得懂
 #   文件不編號、只標檔名：編了號，模型會寫「依據：文件 1」，使用者看不到文件 1 是哪一份
 #   段落編號 [1] [2]… 跨文件連續編，跟 citations 的順序一樣
-#   statuses：判斷出不是「現行」的文件（docs/decisions/029），在開頭下面註明，並提醒不能當成答案
-def _build_context(groups, headers: dict[int, str], today: date, statuses: dict | None = None) -> str:
+def _build_context(groups, headers: dict[int, str], today: date) -> str:
     blocks = [f"今天日期：{_date_text(today)}"]
     number = 0
     for document, group in groups:
         # 把換行和連續空白壓成一個空格，開頭才不會佔太多行
         header = " ".join(headers.get(document.id, "").split())[:DOCUMENT_HEADER_CHARS]
-        block = f"【文件】{document.filename}\n文件開頭：{header}"
-        if statuses and document.id in statuses:
-            status, reason = statuses[document.id]
-            note = STATUS_NOTES[status] + (f"（{reason}）" if reason else "")
-            block += f"\n文件狀態：{note}。不能當成現在的答案，只能用來說明它為什麼不適用"
-        blocks.append(block)
+        blocks.append(f"【文件】{document.filename}\n文件開頭：{header}")
         for chunk in group:
             number += 1
             blocks.append(f"[{number}] {chunk.content}")
