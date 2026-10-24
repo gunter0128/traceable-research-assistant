@@ -389,7 +389,9 @@ def generate_answer(
     if on_usage is not None:
         # prompt_tokens：送進去的（問題 + 資料 + 規則）；completion_tokens：生成出來的答案
         on_usage(Usage(GENERATION_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens))
-    return response.choices[0].message.content # 選擇第一個候選回應(一個問題可能有好幾種回應)
+    # 選擇第一個候選回應(一個問題可能有好幾種回應)
+    # 開源模型開思考模式時，想到長度上限還沒想完，就沒有答案（content 是 None），當成空的回答
+    return response.choices[0].message.content or ""
 
 
 # embedding 的回應只有輸入的 token 數（沒有生成任何文字）

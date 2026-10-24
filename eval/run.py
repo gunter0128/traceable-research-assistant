@@ -149,6 +149,15 @@ def load_evidence(corpus: str) -> dict[str, list[str]]:
     return {qid: [quote for _, _, quote in items] for qid, items in getattr(module, "EVIDENCE", {}).items()}
 
 
+# 接 Qwen 時的抽字設定：照 Qwen3.5 模型說明的建議，思考和不思考各一組（docs/decisions/034）
+# 不給的話 vLLM 用自己的預設（temperature 1、候選字不設限），偶爾會抽到機率很低的字，出現簡體字、亂碼
+#   top_k / top_p：只從最可能的前 20 個字、累積機率 0.8（或 0.95）以內挑；presence_penalty：已經出現過的字扣分，減少重複
+QWEN_SAMPLING = {
+    "think": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
+    "no_think": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
+}
+
+
 # 回答的服務暫時連不上時（例如接實驗室自己架的模型，SSH 轉接斷線），等一下再試，最多等約 5 分鐘
 # 不然斷一下整輪評估就中止了（docs/decisions/034）。秒數只算成功的那一次
 ASK_RETRIES = 10
@@ -268,7 +277,9 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
               # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
               + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
               + (f"切段 {meta['chunker']}｜" if meta.get("chunker", "fixed") != "fixed" else "")
-              + f"回答 {meta.get('model', '—')}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
+              + f"回答 {meta.get('model', '—')}"
+              + {True: "（思考）", False: "（不思考）"}.get(meta.get("thinking"), "")
+              + f"｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
     for key in ["all", *TYPE_NAMES]:
@@ -314,6 +325,8 @@ def main():
     parser.add_argument("--split", choices=["dev", "test", "all"],
                         help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
                              "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
+    parser.add_argument("--per-type", type=int,
+                        help="每種題型只抽幾題（固定隨機種子，每次抽到的一樣）：很慢的設定先小規模試，例如思考模式")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
     if args.top_k:
@@ -329,7 +342,9 @@ def main():
     if args.answer_base_url:
         # 自己架的模型不用付 API 的錢（GPU 的成本另外算），價目表記 0
         openai_client.PRICES_PER_MILLION.setdefault(openai_client.GENERATION_MODEL, (Decimal(0), Decimal(0)))
-        extra = {"chat_template_kwargs": {"enable_thinking": False}} if args.no_think else None
+        extra = dict(QWEN_SAMPLING["no_think" if args.no_think else "think"])
+        if args.no_think:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
         openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
     if args.answer_timeout:
         openai_client.QA_TIMEOUT = args.answer_timeout
@@ -339,6 +354,8 @@ def main():
     usage_service.ensure_within_quota = lambda db, owner_id: None
 
     questions, split = load_questions(args.corpus, args.split)
+    if args.per_type:
+        questions = sample_per_type(questions, args.per_type)
     if args.planner == "oracle":
         qa_service._plan = oracle_plan(questions, args.oracle_recall, args.oracle_wrong)
     client = OpenAI(api_key=settings.openai_api_key)
@@ -358,7 +375,9 @@ def main():
             "planner": qa_service.PLANNER if args.planner != "oracle" or args.oracle_recall == 1 and not args.oracle_wrong
             else f"oracle（選對 {args.oracle_recall:.0%}、多選 {args.oracle_wrong} 份）",
             "chunker": chunker.STRATEGY,
-            "answer_endpoint": args.answer_base_url or "OpenAI"}
+            "answer_endpoint": args.answer_base_url or "OpenAI",
+            "thinking": None if not args.answer_base_url else not args.no_think,
+            "answer_sampling": openai_client.answer_extra_body}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
 
@@ -398,6 +417,16 @@ def load_questions(corpus: str, split: str | None) -> tuple[list[dict], str]:
     if split != "all":
         questions = [q for q in questions if q["split"] == split]
     return questions, split
+
+
+# 每種題型各抽 n 題，題型的比例跟整套一樣；順序照原本的題目順序
+def sample_per_type(questions: list[dict], n: int) -> list[dict]:
+    rng = random.Random(2026)
+    picked = set()
+    for qtype in TYPE_NAMES:
+        group = [q["id"] for q in questions if q["type"] == qtype]
+        picked.update(rng.sample(group, min(n, len(group))))
+    return [q for q in questions if q["id"] in picked]
 
 
 def current_commit() -> str:
