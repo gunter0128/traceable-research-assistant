@@ -106,9 +106,10 @@ def judge_local(client: OpenAI, mode: str, item: dict) -> tuple[dict | None, flo
         return None, seconds
 
 
-# 「不矛盾」的評審也一樣要先量：gpt-4o 補評過的回答（eval/trust_checks.py 的 *_checks.json），讓 Qwen（不思考）再判一次
+# 「不矛盾」的評審也一樣要先量：gpt-4o 補評過的回答（eval/trust_checks.py 的 *_checks.json），讓 Qwen 再判一次
 # gpt-4o 判成矛盾的全部拿來（很少），判成不矛盾的隨機抽 100 個；最要看 gpt-4o 判矛盾、Qwen 卻判不矛盾的比例
-def check_consistency(client: OpenAI) -> None:
+# 量過：不思考放過 7/19，不夠準，所以也量思考模式
+def check_consistency(client: OpenAI, mode: str) -> None:
     flagged, clean = [], []
     for checks in sorted((EVAL / "data" / "results").glob("*_checks.json")):
         rows = json.loads(checks.read_text(encoding="utf-8"))["rows"]
@@ -125,7 +126,8 @@ def check_consistency(client: OpenAI) -> None:
         result = client.chat.completions.create(
             model="qwen3.5-9b", messages=[{"role": "user", "content": CONSISTENCY_PROMPT.format(
                 question=item["question"], response=item["response"])}],
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}, timeout=300)
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0} if mode == "no_think"
+            else QWEN_SAMPLING["think"], timeout=900)
         match = re.search(r"\{.*\}", result.choices[0].message.content or "", flags=re.DOTALL)
         try:
             return bool(json.loads(match.group()).get("contradiction")) if match else None
@@ -137,7 +139,7 @@ def check_consistency(client: OpenAI) -> None:
     missed = sum(v is False for item, v in zip(items, verdicts, strict=True) if item["gpt"])
     extra = sum(v is True for item, v in zip(items, verdicts, strict=True) if not item["gpt"])
     unread = sum(v is None for v in verdicts)
-    print(f"\n不矛盾的評審（Qwen 不思考）：gpt-4o 判矛盾 {len(flagged)} 個、判不矛盾抽 {len(items) - len(flagged)} 個，讀不出來 {unread} 個")
+    print(f"\n不矛盾的評審（Qwen {mode}）：gpt-4o 判矛盾 {len(flagged)} 個、判不矛盾抽 {len(items) - len(flagged)} 個，讀不出來 {unread} 個")
     print(f"  放過的矛盾（gpt-4o 判矛盾、Qwen 判不矛盾）：{missed}/{len(flagged)}")
     print(f"  多抓的（gpt-4o 判不矛盾、Qwen 判矛盾）：{extra}/{len(items) - len(flagged)}")
 
@@ -151,7 +153,7 @@ def main():
     args = parser.parse_args()
     client = OpenAI(base_url=args.base_url, api_key="not-needed", max_retries=2)
     if args.consistency:
-        check_consistency(client)
+        check_consistency(client, args.mode)
         return
     items = sample(load_questions(), args.n)
     # 一次送 4 筆：實驗室的 vLLM 同時處理 4 筆（--max-num-seqs 4）

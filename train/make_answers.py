@@ -121,16 +121,22 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
     detail["citation_checks"] = checks
     if any(c["missing"] for c in checks):
         reasons.append("引用對不上")
-    consistency = parse_json(chat(client, [{"role": "user", "content": CONSISTENCY_PROMPT.format(
-        question=q["question"], response=answer)}], NO_THINK, timeout=300))
-    detail["consistency"] = consistency
-    if consistency is None or consistency.get("contradiction"):
-        reasons.append("前後矛盾")
+    if contradicts(client, q["question"], answer, NO_THINK, detail, "consistency"):
+        reasons.append("前後矛盾（不思考的評審）")
     if any(c in SIMPLIFIED for c in answer):
         reasons.append("有簡體字")
     if len(answer) > MAX_CHARS:
         reasons.append(f"超過 {MAX_CHARS} 字")
     return not reasons, reasons, detail
+
+
+# 不矛盾的評審：量過（train/judge_check.py --consistency），gpt-4o 判成矛盾的 19 個，不思考放過 7 個、思考放過 3 個
+# 都不夠準，所以兩個都判，任何一個判矛盾就丟掉；思考的比較慢，只判其他檢查都通過的
+def contradicts(client: OpenAI, question: str, answer: str, extra: dict, detail: dict, key: str) -> bool:
+    verdict = parse_json(chat(client, [{"role": "user", "content": CONSISTENCY_PROMPT.format(
+        question=question, response=answer)}], extra, timeout=900))
+    detail[key] = verdict
+    return verdict is None or bool(verdict.get("contradiction"))
 
 
 def main():
@@ -161,6 +167,17 @@ def main():
         item.update(answer=answer, cited=sorted({item["codes"][n - 1] for n in marked}))
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda item: check(client, item), items))
+    # 其他檢查都通過的，再請思考模式判一次不矛盾
+    survivors = [(item, result) for item, result in zip(items, results, strict=True) if result[0]]
+
+    def think_check(pair):
+        item, (_, reasons, detail) = pair
+        if contradicts(client, item["q"]["question"], item["answer"], QWEN_SAMPLING["think"], detail, "consistency_think"):
+            reasons.append("前後矛盾（思考的評審）")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(think_check, survivors))
+    results = [(not reasons, reasons, detail) for _, reasons, detail in results]
 
     out, examples = [], []
     for item, (passed, reasons, detail) in zip(items, results, strict=True):
