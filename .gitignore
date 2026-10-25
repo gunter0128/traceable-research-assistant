@@ -21,3 +21,6 @@ docs/learning/
 eval/data/
 eval/*/pdfs/
 eval/labor/raw/
+
+# 訓練資料（下載的規章、產生的題目和示範答案，docs/decisions/039）
+train/data/
