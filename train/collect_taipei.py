@@ -27,7 +27,7 @@ TOPICS = {
     "出國": 12, "研習": 12, "門禁": 8, "採購": 12, "志工": 10,
 }
 # 名稱有這些字的不要：可能跟勞動法規那套考卷的內容重疊（公務人員請假規則），或跟主題無關
-EXCLUDE = re.compile(r"請假|休假|加班|差勤|退休|資遣|撫卹|產假|陪產|育嬰|俸|薪|待遇")
+EXCLUDE = re.compile(r"請假|休假|加班|差勤|退休|資遣|撫卹|產假|陪產|育嬰|俸|薪|待遇|勞")
 
 
 def search(client: httpx.Client, keyword: str, page: int) -> list[tuple[str, str, bool]]:
