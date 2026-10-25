@@ -13,7 +13,25 @@ class Settings(BaseSettings): # BaseModel的子類別 不用給他明確的資�
     secret_key: str
     access_token_expire_minutes: int = 30
     algorithm: str = "HS256"
-    openai_api_key: str
+    # 企業內部版轉向量、回答都接本機的模型，用不到 OpenAI，所以是選填
+    openai_api_key: str | None = None
+
+    # ---------- 轉向量、回答要接哪個服務（docs/decisions/037）----------
+    # 不設定 base_url 就用 OpenAI（公開展示版）
+    # 企業內部版設成公司內部用 vLLM 架的模型服務：呼叫方式跟 OpenAI 一樣，只是網址不同，資料不會送到外部
+    embedding_base_url: str | None = None
+    embedding_model: str = "text-embedding-3-small"
+    # 向量有幾個數字，資料庫的向量欄位要跟它一樣（text-embedding-3-small 是 1536、Qwen3-Embedding-0.6B 是 1024）
+    embedding_dimension: int = 1536
+    # 有些模型轉「問題」時要在前面加固定的說明，轉文件段落時不用加（Qwen3-Embedding 要加任務說明，docs/decisions/035）
+    embedding_query_prefix: str = ""
+    answer_base_url: str | None = None
+    answer_model: str = "gpt-4o"
+    # 送給回答服務的額外參數（環境變數裡寫 JSON），例如 Qwen 建議的抽字設定、關掉思考模式（docs/decisions/036）
+    answer_extra_body: dict | None = None
+    # 回答每次最多等幾秒：本機的模型比 OpenAI 慢，長的回答會超過 15 秒
+    answer_timeout: float = 15
+
     # 這兩個改成選填：本機開發用 trace-app-s3 的金鑰（.env 裡有值）；
     # 部署在 Fargate 上時不會有這兩個環境變數，改靠 Task Role 自動取得憑證
     aws_access_key_id: str | None = None

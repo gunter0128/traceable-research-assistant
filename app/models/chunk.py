@@ -4,6 +4,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import Column, ForeignKey, Integer, Text
 from sqlalchemy.orm import relationship
 
+from app.core.config import settings
 from app.core.db import Base
 
 
@@ -17,8 +18,8 @@ class Chunk(Base):
     chunk_index = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
     # 這段文字轉成的向量 用 pgvector 的 Vector 型別 才能在 SQL 裡用 <=> 做相似度搜尋
-    # 1536 對應 text-embedding-3-small 這個 embedding 模型輸出的維度 兩邊要對得上
-    embedding = Column(Vector(1536), nullable=False)
+    # 維度要跟轉向量的模型對得上：text-embedding-3-small 是 1536、Qwen3-Embedding-0.6B 是 1024（看設定，docs/decisions/037）
+    embedding = Column(Vector(settings.embedding_dimension), nullable=False)
 
     # chunk.document 拿到這段文字屬於的 Document 物件
     # back_populates="chunks" = Document 那邊對回來的屬性名 (Document 要有一條 chunks relationship 指回這裡)

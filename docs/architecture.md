@@ -429,3 +429,25 @@ AskResponse { answer: "……14 天[1]。", citations: [ { number: 1, filename, 
 | `eval/openai_baseline.py` | 對照：OpenAI 現成的 file search（025、027） |
 
 結果寫在 `docs/eval-results.md`。改到問答相關的程式時手動跑（不接 CI 的原因見 docs/decisions/024）。
+
+## 企業內部版（MLOps）—— 2026-10-25 進行中
+
+同一份程式碼，兩種部署（decisions/034）：
+
+| | 公開展示版 | 企業內部版 |
+|---|---|---|
+| 放在哪 | AWS（Lambda、CloudFront，上面那套） | 公司內部的一台 GPU 主機（docker-compose，第 2 步） |
+| 轉向量 | OpenAI text-embedding-3-small（1536 維） | 本機的 Qwen3-Embedding-0.6B（1024 維，035） |
+| 回答 | OpenAI gpt-4o | 本機的 Qwen3.5-9B，不思考（036），之後換成訓練過的版本 |
+
+**用設定切換**（decisions/037）：`app/core/config.py` 的 `EMBEDDING_*`、`ANSWER_*` 不設定就是 OpenAI；設定了網址，就改接公司內部用 vLLM 架的服務（呼叫方式跟 OpenAI 一樣）。`openai_client` 的 `embedding_client`、`answer_client` 依設定建立，其他程式不用知道接的是哪一邊。向量欄位的維度跟著 `EMBEDDING_DIMENSION`（migration `e5a1b7c9d2f4`）。
+
+```
+企業內部版的問答
+  qa_service.ask
+    ├─ openai_client.embed_queries ──▶ vLLM：Qwen3-Embedding（問題前面加任務說明）
+    ├─ chunk_repo.search_similar   ──▶ PostgreSQL + pgvector（1024 維）
+    └─ openai_client.generate_answer ─▶ vLLM：Qwen3.5-9B（建議的抽字設定、不思考）
+```
+
+步驟：① 系統可以設定接本機模型（037）→ ② 在實驗室用 docker 架起整套 → ③ 準備訓練資料 → ④ 訓練 adapter → ⑤ 過了上線門檻（036）才換上 → ⑥ 整理文件。

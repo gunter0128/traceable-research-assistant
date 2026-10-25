@@ -277,6 +277,7 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
               # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
               + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
               + (f"切段 {meta['chunker']}｜" if meta.get("chunker", "fixed") != "fixed" else "")
+              + (f"轉向量 {meta['embedding']}｜" if meta.get("embedding", "text-embedding-3-small") != "text-embedding-3-small" else "")
               + f"回答 {meta.get('model', '—')}"
               + {True: "（思考）", False: "（不思考）"}.get(meta.get("thinking"), "")
               + f"｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
@@ -306,11 +307,11 @@ def main():
     parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
     parser.add_argument("--answer-base-url",
                         help="回答改接這個 OpenAI 格式的服務，例如 http://localhost:8000/v1（實驗室用 vLLM 架的開源模型，"
-                             "docs/decisions/034）；找文件照舊用 OpenAI")
+                             "docs/decisions/034）；轉向量照設定（環境變數 EMBEDDING_BASE_URL 等，docs/decisions/037）")
     parser.add_argument("--no-think", action="store_true",
                         help="搭配 --answer-base-url：關掉開源模型的思考模式（Qwen 系列），直接回答")
     parser.add_argument("--answer-timeout", type=float,
-                        help="回答每次最多等幾秒（預設跟線上一樣 15 秒）；本機架的模型比較慢時調大")
+                        help="回答每次最多等幾秒（預設看設定的 answer_timeout，OpenAI 是 15 秒）；本機架的模型比較慢時調大")
     parser.add_argument("--top-k", type=int,
                         help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
     parser.add_argument("--planner", choices=["none", "catalog", "oracle"],
@@ -347,7 +348,7 @@ def main():
             extra["chat_template_kwargs"] = {"enable_thinking": False}
         openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
     if args.answer_timeout:
-        openai_client.QA_TIMEOUT = args.answer_timeout
+        openai_client.ANSWER_TIMEOUT = args.answer_timeout
         # 整個問答的時間預算也跟著放寬：重試兩次加上轉向量、搜尋
         qa_service.ANSWER_BUDGET_SECONDS = max(qa_service.ANSWER_BUDGET_SECONDS, args.answer_timeout * 2 + 20)
     # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
@@ -375,7 +376,9 @@ def main():
             "planner": qa_service.PLANNER if args.planner != "oracle" or args.oracle_recall == 1 and not args.oracle_wrong
             else f"oracle（選對 {args.oracle_recall:.0%}、多選 {args.oracle_wrong} 份）",
             "chunker": chunker.STRATEGY,
-            "answer_endpoint": args.answer_base_url or "OpenAI",
+            "answer_endpoint": args.answer_base_url or settings.answer_base_url or "OpenAI",
+            # 轉向量的模型看設定（環境變數 EMBEDDING_BASE_URL 等，docs/decisions/037），預設是 OpenAI
+            "embedding": openai_client.EMBEDDING_MODEL,
             "thinking": None if not args.answer_base_url else not args.no_think,
             "answer_sampling": openai_client.answer_extra_body}
     save_results(meta, summaries, all_rows, tag=meta["commit"])

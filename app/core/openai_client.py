@@ -20,20 +20,27 @@ from openai import OpenAI
 from app.core import log
 from app.core.config import settings
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+# 用哪個模型轉向量、回答，看設定（docs/decisions/037）：公開展示版用 OpenAI，企業內部版用本機的模型
+EMBEDDING_MODEL = settings.embedding_model
 # 負責生成答案用的模型 跟上面 embedding 用的是不同任務 分開一個常數
 # 2026-10 從 gpt-4o-mini 換成 gpt-4o：「適不適用於問的人」的題目答得好很多，每題成本約 16 倍（docs/decisions/023）
-GENERATION_MODEL = "gpt-4o"
+GENERATION_MODEL = settings.answer_model
 # 搜尋前規劃要查什麼用的模型（docs/decisions/028）：只是把問題寫成幾句搜尋句子，小模型就夠，便宜又快
 PLANNER_MODEL = "gpt-4o-mini"
 
 # 每 100 萬個 token 多少美元：(輸入, 輸出)。embedding 只有輸入
 # 2026-10 OpenAI 官網的價格，OpenAI 調價時要跟著改（docs/decisions/012）
 PRICES_PER_MILLION = {
-    EMBEDDING_MODEL: (Decimal("0.02"), Decimal(0)),
-    GENERATION_MODEL: (Decimal("2.50"), Decimal(10)),
+    "text-embedding-3-small": (Decimal("0.02"), Decimal(0)),
+    "gpt-4o": (Decimal("2.50"), Decimal(10)),
     PLANNER_MODEL: (Decimal("0.15"), Decimal("0.60")),
 }
+# 自己架的模型不用付 API 的錢（GPU、電費另外算），記 0
+# 只有接自己的服務時才補：用 OpenAI 時模型名字打錯，算錢那一步就會報錯，不會默默記成 0
+if settings.embedding_base_url:
+    PRICES_PER_MILLION[EMBEDDING_MODEL] = (Decimal(0), Decimal(0))
+if settings.answer_base_url:
+    PRICES_PER_MILLION[GENERATION_MODEL] = (Decimal(0), Decimal(0))
 
 
 # 一次呼叫用了多少（OpenAI 每次回應都會附上）
@@ -51,7 +58,17 @@ class Usage:
 
 # max_retries=0：關掉 SDK 內建的重試，全部由下面的 _with_retries 處理
 # 每次嘗試最多等多久，呼叫時才用 with_options(timeout=...) 指定（文件處理跟問答不一樣）
-client = OpenAI(api_key=settings.openai_api_key, max_retries=0)
+# 企業內部版沒有 OpenAI 的金鑰：SDK 沒給金鑰會直接報錯，先給一個假的，真的去呼叫 OpenAI 時才會失敗（金鑰錯誤，歸類成永久性錯誤）
+client = OpenAI(api_key=settings.openai_api_key or "not-set", max_retries=0)
+
+
+# 自己架的服務（vLLM）不檢查金鑰，但 SDK 一定要給一個
+def _client_for(base_url: str | None) -> OpenAI:
+    return client if base_url is None else OpenAI(base_url=base_url, api_key="not-needed", max_retries=0)
+
+
+# 轉向量用的服務：沒設定就是 OpenAI
+embedding_client = _client_for(settings.embedding_base_url)
 
 # 文件處理（背景執行，沒人在等）：每次最多等 30 秒、最多試 5 次；OpenAI 叫我們等，最多等 60 秒
 PROCESSING_TIMEOUT = 30
@@ -60,6 +77,8 @@ PROCESSING_MAX_WAIT = 60
 # 問答（使用者在等）：每次最多等 15 秒、最多試 2 次；OpenAI 叫我們等超過 5 秒就直接放棄
 # 總時間由 qa_service 給的 deadline 控制（整個問答共用 50 秒）
 QA_TIMEOUT = 15
+# 生成答案每次最多等幾秒：OpenAI 用 15 秒；本機的模型比較慢，看設定（docs/decisions/037）
+ANSWER_TIMEOUT = settings.answer_timeout
 QA_ATTEMPTS = 2
 QA_MAX_WAIT = 5
 
@@ -186,7 +205,7 @@ def embed_texts(
 ) -> list[list[float]]:
     def call(timeout: float):
         # with_options(timeout=...)：只有這一次呼叫用這個等待上限，不影響其他地方
-        return client.with_options(timeout=timeout).embeddings.create(
+        return embedding_client.with_options(timeout=timeout).embeddings.create(
             model=EMBEDDING_MODEL, input=texts
         )
 
@@ -207,14 +226,15 @@ def embed_texts(
 # 何時呼叫：qa_service 把使用者的問題（和規劃出來的搜尋句子）轉成向量，拿去跟 chunk 比相似度
 # 幾句一起送，只呼叫一次：規劃出 4 句搜尋句子的話，不用多等 4 次來回
 # deadline：整個問答共用的截止時間（qa_service 算好傳進來）
+# 問題前面加上模型要求的說明（設定的 embedding_query_prefix，OpenAI 不用加）；文件段落不加，見 embed_texts
 def embed_queries(
     texts: list[str],
     deadline: float | None = None,
     on_usage: Callable[[Usage], None] | None = None,
 ) -> list[list[float]]:
     def call(timeout: float):
-        return client.with_options(timeout=timeout).embeddings.create(
-            model=EMBEDDING_MODEL, input=texts
+        return embedding_client.with_options(timeout=timeout).embeddings.create(
+            model=EMBEDDING_MODEL, input=[settings.embedding_query_prefix + text for text in texts]
         )
 
     response = _with_retries(
@@ -343,16 +363,17 @@ ANSWER_RULES = """你是一個根據使用者提供的文件回答問題的助�
 7. 資料完全沒有相關資訊時，才說「文件中找不到相關資訊」；只有一部分資訊時，回答有的部分，並說明缺什麼。"""
 
 
-# 回答用的模型服務（docs/decisions/034）：預設就是 OpenAI
+# 回答用的模型服務（docs/decisions/034、037）：看設定，沒設定就是 OpenAI
 # 也可以換成任何「OpenAI 格式」的服務，例如在內部 GPU 上用 vLLM 架的開源模型：機密文件不用送到外部
-# answer_extra_body：那個服務需要的額外參數（例如關掉開源模型的「思考模式」），OpenAI 不需要
-answer_client = client
-answer_extra_body: dict | None = None
+# answer_extra_body：那個服務需要的額外參數（例如 Qwen 建議的抽字設定、關掉思考模式），OpenAI 不需要
+answer_client = _client_for(settings.answer_base_url)
+answer_extra_body: dict | None = settings.answer_extra_body
 
 
-def use_answer_endpoint(base_url: str, api_key: str = "not-needed", extra_body: dict | None = None) -> None:
+# 評估時換別的回答服務比較用（eval/run.py --answer-base-url），線上看設定
+def use_answer_endpoint(base_url: str, extra_body: dict | None = None) -> None:
     global answer_client, answer_extra_body
-    answer_client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+    answer_client = _client_for(base_url)
     answer_extra_body = extra_body
 
 
@@ -381,7 +402,7 @@ def generate_answer(
     response = _with_retries(
         call,
         attempts=QA_ATTEMPTS,
-        timeout=QA_TIMEOUT,
+        timeout=ANSWER_TIMEOUT,
         max_wait=QA_MAX_WAIT,
         give_up_on_long_wait=True,
         deadline=deadline,
