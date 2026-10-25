@@ -22,7 +22,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from eval.run import JUDGE_PROMPT, QWEN_SAMPLING, _align
+from eval.run import CONSISTENCY_PROMPT, JUDGE_PROMPT, QWEN_SAMPLING, _align
 
 EVAL = Path(__file__).parent.parent / "eval"
 OUT = Path(__file__).parent / "data" / "judge_check"
@@ -106,14 +106,54 @@ def judge_local(client: OpenAI, mode: str, item: dict) -> tuple[dict | None, flo
         return None, seconds
 
 
+# 「不矛盾」的評審也一樣要先量：gpt-4o 補評過的回答（eval/trust_checks.py 的 *_checks.json），讓 Qwen（不思考）再判一次
+# gpt-4o 判成矛盾的全部拿來（很少），判成不矛盾的隨機抽 100 個；最要看 gpt-4o 判矛盾、Qwen 卻判不矛盾的比例
+def check_consistency(client: OpenAI) -> None:
+    flagged, clean = [], []
+    for checks in sorted((EVAL / "data" / "results").glob("*_checks.json")):
+        rows = json.loads(checks.read_text(encoding="utf-8"))["rows"]
+        source = json.loads(checks.with_name(checks.name.replace("_checks", "")).read_text(encoding="utf-8"))
+        answers = {(i, r["id"]): r for i, run in enumerate(source["runs"]) for r in run}
+        for c in rows:
+            if "contradiction" in c:
+                r = answers[(c["run"], c["id"])]
+                (flagged if c["contradiction"] else clean).append(
+                    {"question": r["question"], "response": r["response"], "gpt": c["contradiction"]})
+    items = flagged + random.Random(2026).sample(clean, min(100, len(clean)))
+
+    def judge(item):
+        result = client.chat.completions.create(
+            model="qwen3.5-9b", messages=[{"role": "user", "content": CONSISTENCY_PROMPT.format(
+                question=item["question"], response=item["response"])}],
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}, timeout=300)
+        match = re.search(r"\{.*\}", result.choices[0].message.content or "", flags=re.DOTALL)
+        try:
+            return bool(json.loads(match.group()).get("contradiction")) if match else None
+        except json.JSONDecodeError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        verdicts = list(pool.map(judge, items))
+    missed = sum(v is False for item, v in zip(items, verdicts, strict=True) if item["gpt"])
+    extra = sum(v is True for item, v in zip(items, verdicts, strict=True) if not item["gpt"])
+    unread = sum(v is None for v in verdicts)
+    print(f"\n不矛盾的評審（Qwen 不思考）：gpt-4o 判矛盾 {len(flagged)} 個、判不矛盾抽 {len(items) - len(flagged)} 個，讀不出來 {unread} 個")
+    print(f"  放過的矛盾（gpt-4o 判矛盾、Qwen 判不矛盾）：{missed}/{len(flagged)}")
+    print(f"  多抓的（gpt-4o 判不矛盾、Qwen 判矛盾）：{extra}/{len(items) - len(flagged)}")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["no_think", "think"], required=True)
+    parser.add_argument("--mode", choices=["no_think", "think"], default="no_think")
     parser.add_argument("--n", type=int, default=300)
+    parser.add_argument("--consistency", action="store_true", help="改量「不矛盾」的評審")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     args = parser.parse_args()
-    items = sample(load_questions(), args.n)
     client = OpenAI(base_url=args.base_url, api_key="not-needed", max_retries=2)
+    if args.consistency:
+        check_consistency(client)
+        return
+    items = sample(load_questions(), args.n)
     # 一次送 4 筆：實驗室的 vLLM 同時處理 4 筆（--max-num-seqs 4）
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda item: judge_local(client, args.mode, item), items))

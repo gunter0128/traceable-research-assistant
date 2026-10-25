@@ -64,25 +64,29 @@ def doc_code(name: str) -> str:
 
 # ---------- 準備：建表、放進知識庫的文件 ----------
 def setup_knowledge_base(corpus: str):
-    # 本機模式：沒有 SQS，上傳後直接在同一個流程裡處理（docs/decisions/003）
-    settings.sqs_queue_url = None
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-
     folder = EVAL / corpus
     pdfs = {pdf.name: pdf.read_bytes() for pdf in sorted((folder / "pdfs").glob("*.pdf"))}
     expected = len(list((folder / "docs").glob("*.md")))
     if len(pdfs) != expected:
         raise SystemExit(f"{corpus}/pdfs/ 裡應該有 {expected} 份 PDF，現在有 {len(pdfs)} 份。"
                          f"先跑 python -m eval.build_pdfs --corpus {corpus}")
+    return build_knowledge_base(pdfs, CORPORA[corpus]["workspace"])
+
+
+# 建表、把 PDF 一份一份走系統正常的處理流程放進知識庫；訓練資料也用這個（train/make_answers.py）
+def build_knowledge_base(pdfs: dict[str, bytes], workspace_name: str):
+    # 本機模式：沒有 SQS，上傳後直接在同一個流程裡處理（docs/decisions/003）
+    settings.sqs_queue_url = None
+    with engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
     # 檔案不放 S3：處理時「從 S3 下載」改成直接讀本機的 PDF，其他步驟（解析、切段、轉向量、存資料庫）都跟線上一樣
     s3_client.download_file = lambda key: pdfs[key]
 
     db = SessionLocal()
     user = auth_service.register_user(db, "eval@example.com", "eval-password")
-    workspace = workspace_repo.create(db, user.id, CORPORA[corpus]["workspace"])
+    workspace = workspace_repo.create(db, user.id, workspace_name)
     started = time.perf_counter()
     for name in pdfs:
         document = document_repo.create(db, workspace.id, name, name)
