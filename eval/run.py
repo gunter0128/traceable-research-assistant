@@ -203,6 +203,18 @@ QWEN_SAMPLING = {
     "no_think": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
 }
 
+# 理想回答的寫法（docs/decisions/038），接在回答原則第 7 條後面，只在評估時加（--ideal-rules），線上的回答原則不動
+# 用途：量「不訓練、只改規定」能做到多少；也是寫訓練資料時給示範答案的規定
+# 跟回答原則一樣只放通用的寫法，不放任何領域的詞（docs/decisions/019）
+IDEAL_RULES = """
+8. 第一句直接給結論，不要先鋪陳背景或重述問題。
+9. 用自己的話整理重點，不要整段照抄資料的原文；同一件事只講一次。
+10. 結論只有一個：不要寫到一半改口或更正自己，前後的數字要一致。
+11. 只詳細說明適用於提問者的規定；不適用的（舊版、草案、還沒生效、別的單位），用一句話說明為什麼不適用，不要列出它的內容。
+12. 問題沒說明對象或情況、答案又因此不同時，每種情況各用一句話說明。
+13. 每一句標的段落編號，那一段裡要真的寫著這句話講的內容。
+14. 整個回答盡量在 150 字以內，需要分情況時可以稍長；不要加「結論」「說明」這類標題。"""
+
 
 # 回答的服務暫時連不上時（例如接實驗室自己架的模型，SSH 轉接斷線），等一下再試，最多等約 5 分鐘
 # 不然斷一下整輪評估就中止了（docs/decisions/034）。秒數只算成功的那一次
@@ -336,6 +348,7 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
               + (f"轉向量 {meta['embedding']}｜" if meta.get("embedding", "text-embedding-3-small") != "text-embedding-3-small" else "")
               + f"回答 {meta.get('model', '—')}"
               + {True: "（思考）", False: "（不思考）"}.get(meta.get("thinking"), "")
+              + ("｜加上理想回答的規定" if meta.get("ideal_rules") else "")
               + f"｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
@@ -391,6 +404,9 @@ def main():
                         help="另外請評審判斷每個回答前後有沒有矛盾（docs/decisions/038），每 70 題約多 0.15 美元")
     parser.add_argument("--per-type", type=int,
                         help="每種題型只抽幾題（固定隨機種子，每次抽到的一樣）：很慢的設定先小規模試，例如思考模式")
+    parser.add_argument("--ids", nargs="+", help="只跑這幾題（題號），例如只挑真實情境的題目")
+    parser.add_argument("--ideal-rules", action="store_true",
+                        help="回答原則後面加上理想回答的寫法（IDEAL_RULES，docs/decisions/038），線上的回答原則不動")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
     if args.top_k:
@@ -420,6 +436,10 @@ def main():
     questions, split = load_questions(args.corpus, args.split)
     if args.per_type:
         questions = sample_per_type(questions, args.per_type)
+    if args.ids:
+        questions = [q for q in questions if q["id"] in set(args.ids)]
+    if args.ideal_rules:
+        openai_client.ANSWER_RULES += IDEAL_RULES
     if args.planner == "oracle":
         qa_service._plan = oracle_plan(questions, args.oracle_recall, args.oracle_wrong)
     client = OpenAI(api_key=settings.openai_api_key)
@@ -443,7 +463,10 @@ def main():
             "answer_endpoint": args.answer_base_url or settings.answer_base_url or "OpenAI",
             # 轉向量的模型看設定（環境變數 EMBEDDING_BASE_URL 等，docs/decisions/037），預設是 OpenAI
             "embedding": openai_client.EMBEDDING_MODEL,
-            "thinking": None if not args.answer_base_url else not args.no_think,
+            # 有沒有開思考模式：接 OpenAI 時沒有這回事；接自己的服務時看送出去的參數（命令列或環境變數設定的）
+            "thinking": None if openai_client.answer_client is openai_client.client else
+            (openai_client.answer_extra_body or {}).get("chat_template_kwargs", {}).get("enable_thinking", True),
+            "ideal_rules": args.ideal_rules,
             "answer_sampling": openai_client.answer_extra_body}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
