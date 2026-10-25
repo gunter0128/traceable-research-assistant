@@ -49,7 +49,7 @@ from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
 from app.repositories import chunk_repo, document_repo, workspace_repo
 from app.services import auth_service, document_service, qa_service, usage_service
-from eval.common import CORPORA, TYPE_NAMES, evidence_rate
+from eval.common import CORPORA, TYPE_NAMES, citation_checks, evidence_rate
 
 EVAL = Path(__file__).parent
 RESULTS = EVAL / "data" / "results"
@@ -142,6 +142,52 @@ def judge(client: OpenAI, domain: str, q: dict, response: str, cited: list[str])
     return json.loads(result.choices[0].message.content)
 
 
+# ---------- 不矛盾（docs/decisions/038）----------
+# 上面的評審遇到前後矛盾時以開頭的結論為準：開頭對了，後面自相矛盾也不會扣分
+# 這裡另外問一次，只判斷回答本身有沒有矛盾，不管內容對不對
+# 分開問：上面的量尺一個字都不改，之前存下來的回答也能補評（eval/trust_checks.py），分數可以互相比
+CONSISTENCY_PROMPT = """你是問答系統的評審。這次只判斷一件事：系統的回答本身有沒有前後矛盾。
+
+算矛盾：
+- 同一件事給了互相衝突的結論，例如開頭說「可以」，後面又說不符合條件、不能申請
+- 同一件事前後給了不同的數字，例如前面說 14 天、後面說 15 天
+- 回答到一半推翻自己前面的說法（例如「更正：……」「前面說錯了」）
+
+不算矛盾：
+- 分別說明不同對象、情況、版本、公司的規定，例如「正職 14 天，約聘 10 天」
+- 說明舊版、草案、別的單位的規定，並講清楚為什麼不適用
+- 先講原則，再講例外或但書
+
+只看回答本身，不用判斷內容對不對，也不用管它有沒有回答到問題。
+
+問題：{question}
+
+系統的回答：
+{response}
+
+先寫理由再下判斷，輸出 JSON：{{"reason": "一句話", "contradiction": true/false}}"""
+
+
+def judge_consistency(client: OpenAI, question: str, response: str) -> dict:
+    result = client.chat.completions.create(
+        model=JUDGE_MODEL, temperature=0, response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": CONSISTENCY_PROMPT.format(question=question, response=response)}],
+    )
+    verdict = json.loads(result.choices[0].message.content)
+    return {"contradiction": bool(verdict.get("contradiction")), "contradiction_reason": verdict.get("reason", "")}
+
+
+# 模型看到的 [n]：檔名、文件開頭（跟 qa_service._build_context 一樣取前面一段），加上那一段的內容
+def seen_passage(filename: str, header: str, content: str) -> str:
+    return f"{filename}\n{' '.join(header.split())[:qa_service.DOCUMENT_HEADER_CHARS]}\n{content}"
+
+
+# 引用對得上（eval/common.py 的 citation_checks）：有可以檢查的句子，而且每一句的數字都在標的原文裡；沒有可以檢查的句子是 None
+def trust_fields(answer: str, passages: list[str], question: str, today) -> dict:
+    checks = citation_checks(answer, passages, f"{question}\n今天日期：{qa_service._date_text(today)}")
+    return {"citation_checks": checks, "citation_ok": all(not c["missing"] for c in checks) if checks else None}
+
+
 # ---------- 一輪：逐題問、評分 ----------
 # 題目附的依據原文（目前只有勞動法規有）：{題號: [原文, ...]}，用來算「依據的原文有沒有找到」（docs/decisions/031）
 def load_evidence(corpus: str) -> dict[str, list[str]]:
@@ -177,7 +223,7 @@ def _ask(db, workspace, user, question, today):
             time.sleep(ASK_RETRY_WAIT)
 
 
-def run_once(db, user, workspace, questions, client, domain, today, evidence=None) -> list[dict]:
+def run_once(db, user, workspace, questions, client, domain, today, evidence=None, consistency=False) -> list[dict]:
     rows = []
     for q in questions:
         # 今天日期固定成知識庫設定的「現在」（2026-10-20），分數才不會因為哪天跑評估而變
@@ -187,8 +233,15 @@ def run_once(db, user, workspace, questions, client, domain, today, evidence=Non
         _, marked = qa_service._extract_citations(response.answer, len(passages))
         cited = sorted({doc_code(p.filename) for p in passages if p.number in marked})
         quotes = (evidence or {}).get(q["id"], [])
-        rows.append(score(client, domain, q, response.answer, retrieved, cited, seconds,
-                          evidence_rate(quotes, [p.content for p in passages])))
+        texts = [p.content for p in passages]
+        row = score(client, domain, q, response.answer, retrieved, cited, seconds, evidence_rate(quotes, texts))
+        # 模型當時看到的每個 [n] 也存下來：之後要逐句檢查引用、補新的檢查，不用重跑
+        headers = chunk_repo.first_chunks(db, list({p.document_id for p in passages}))
+        row["passages"] = [seen_passage(p.filename, headers.get(p.document_id, ""), p.content) for p in passages]
+        row.update(trust_fields(response.answer, row["passages"], q["question"], today))
+        if consistency:
+            row.update(judge_consistency(client, q["question"], response.answer))
+        rows.append(row)
     return rows
 
 
@@ -255,6 +308,9 @@ def summarize(rows: list[dict]) -> dict:
             "cite_full": rate([r.get("cite_full") for r in group]),
             "misuse": rate([r["misuse"] for r in group]),
             "include": rate([r["include_rate"] for r in group]),
+            # 可信、可追蹤（docs/decisions/038）：之前的結果沒有這兩項，是 None
+            "citation_ok": rate([r.get("citation_ok") for r in group]),
+            "consistent": rate([None if "contradiction" not in r else not r["contradiction"] for r in group]),
             "refusal_ok": rate([r["refusal_ok"] for r in group]),
             # 雙層分析（取自我的論文）：答錯的題目，是文件沒搜到（取得層），還是搜到了還答錯（使用層）
             "fail_acquisition": sum(1 for r in wrong if not r["full_hit"]),
@@ -295,6 +351,11 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
     if summaries[0]["all"].get("evidence_full") is not None:
         lines += ["", "依據的原文全部找到：" + " / ".join(pct(s["all"]["evidence_full"]) for s in summaries)
                   + "（「檢索完整」只看找到那份文件；長文件要看有沒有找到答案的那一條）"]
+    if summaries[0]["all"].get("citation_ok") is not None:
+        lines += ["", "引用對得上：" + " / ".join(pct(s["all"]["citation_ok"]) for s in summaries)
+                  + "（有數字、有標 [n] 的句子，數字都出現在標的那段原文裡）"]
+    if summaries[0]["all"].get("consistent") is not None:
+        lines += ["", "不矛盾：" + " / ".join(pct(s["all"]["consistent"]) for s in summaries) + "（另外請評審判斷回答前後有沒有矛盾）"]
     lines += ["", "跑了多輪時，每格依序是每一輪的結果（用來看隨機造成的波動）。", ""]
     return "\n".join(lines)
 
@@ -326,6 +387,8 @@ def main():
     parser.add_argument("--split", choices=["dev", "test", "all"],
                         help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
                              "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
+    parser.add_argument("--consistency", action="store_true",
+                        help="另外請評審判斷每個回答前後有沒有矛盾（docs/decisions/038），每 70 題約多 0.15 美元")
     parser.add_argument("--per-type", type=int,
                         help="每種題型只抽幾題（固定隨機種子，每次抽到的一樣）：很慢的設定先小規模試，例如思考模式")
     args = parser.parse_args()
@@ -366,7 +429,8 @@ def main():
     for i in range(args.runs):
         print(f"\n第 {i + 1} 輪")
         today = importlib.import_module(f"eval.{args.corpus}.rules").TODAY
-        rows = run_once(db, user, workspace, questions, client, corpus["domain"], today, load_evidence(args.corpus))
+        rows = run_once(db, user, workspace, questions, client, corpus["domain"], today, load_evidence(args.corpus),
+                        consistency=args.consistency)
         all_rows.append(rows)
         summaries.append(summarize(rows))
 

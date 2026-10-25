@@ -110,6 +110,52 @@ def evidence_rate(quotes: list[str], texts: list[str]) -> float | None:
     return sum(quote_found(quote, texts) for quote in quotes) / len(quotes)
 
 
+# ---------- 引用對得上（docs/decisions/038）----------
+# 「引用完整」只看該引用的文件有沒有出現在某個 [n] 裡，不管每一句標的對不對
+# 這裡逐句檢查：句子裡的數字，要出現在它標的那幾段原文裡。例如寫「30 日內 [5]」，第 5 段要有 30 日
+# 只檢查有數字、有標 [n] 的句子；規章的答案大多有數字，沒有數字的句子要靠意思判斷，這裡不管
+# 「原文」是模型當時看到的 [n]：那份文件的檔名、文件開頭，加上那一段（版本日期常寫在開頭或檔名）
+# 不檢查：條號（第 38 條、第 3 項）——段落從條文中間切開時，條號常在上一段；問題裡本來就有的數字
+# 偏寬：只要數字出現在標的段落裡就算，不管是不是同一件事的數字；自己算出來的數字（例如百分比）會被當成對不上
+CITATION_MARKER = re.compile(r"[\[［]\s*(\d+(?:\s*[,，、]\s*\d+)*)\s*[\]］]")
+
+
+# 文字裡的數字：中文數字先轉成阿拉伯數字，千分位的逗號拿掉
+# 不能用上面的 normalize：它會拿掉所有空白，表格裡「P4–P5 3,600 元」會黏成 P4–P53600，數字就錯了
+def _numbers_in(text: str) -> set[str]:
+    text = re.sub(r"百分之([零〇一二兩三四五六七八九十百]+)", lambda m: f"{cn_number(m.group(1))}%", text)
+    text = re.sub(r"[零〇一二兩三四五六七八九十百千]+", lambda m: f" {cn_number(m.group())} ", text)
+    text = re.sub(r"(?<=\d),(?=\d{3})", "", text)  # 千分位：12,000 → 12000
+    return numbers(text)
+
+
+def _claim_numbers(text: str) -> set[str]:
+    text = re.sub(r"\S+\.pdf", "", text)  # 檔名裡的數字（2026年版）不是在講內容
+    text = re.sub(r"[A-Z]+-\d+", "", text)  # 文件代號（HR-02、L-01）
+    text = re.sub(r"(?m)^\s*\d+\s*[.、)）]", "", text)  # 條列的編號（1. 2.）
+    # 條號和段落位置（第 38 條、第三項、第 50-1 條、第 4 段）
+    text = re.sub(r"第\s*[\d零〇一二兩三四五六七八九十百]+(?:\s*[-之]\s*[\d一二三四五六七八九十]+)?\s*[條項款目點章節篇編段]", "", text)
+    return _numbers_in(text)
+
+
+# 回傳每個「有數字、有標 [n]」的句子：[{sentence, cited, missing}]，missing 是標的原文裡找不到的數字
+# passages：模型當時看到的每個 [n]（檔名 + 文件開頭 + 那一段），照編號排（第 0 個是 [1]）
+# given：問題、今天日期——裡面本來就有的數字不檢查（例如「年資 23 年」是使用者自己說的，今天幾號是系統給的，都不是從文件來的）
+def citation_checks(answer: str, passages: list[str], given: str) -> list[dict]:
+    given = _claim_numbers(given)
+    checks = []
+    for sentence in re.split(r"(?<=[。！？\n])", answer):
+        cited = {int(n) for group in CITATION_MARKER.findall(sentence) for n in re.findall(r"\d+", group)}
+        cited = {n for n in cited if 1 <= n <= len(passages)}
+        claimed = _claim_numbers(CITATION_MARKER.sub("", sentence)) - given
+        if not cited or not claimed:
+            continue
+        # 原文不拿掉條列編號：法條的「一、」「1.」後面常常就是要找的數字
+        found = set().union(*(_numbers_in(passages[n - 1]) for n in cited))
+        checks.append({"sentence": sentence.strip(), "cited": sorted(cited), "missing": sorted(claimed - found)})
+    return checks
+
+
 TEST_RATIO = 0.3
 
 
