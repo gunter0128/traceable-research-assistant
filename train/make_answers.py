@@ -27,17 +27,24 @@ from eval.run import CONSISTENCY_PROMPT, IDEAL_RULES, JUDGE_PROMPT, QWEN_SAMPLIN
 # isort: on
 
 import argparse
+import hashlib
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
+import openai
 import psycopg
 from openai import OpenAI
+from sqlalchemy.exc import ProgrammingError
 
 from app.core import openai_client
+from app.core.db import SessionLocal
+from app.models.document import Document
+from app.models.workspace import Workspace
 from app.repositories import chunk_repo
 from app.services import qa_service
 from eval.common import citation_checks
@@ -58,6 +65,23 @@ def create_database() -> None:
             conn.execute(f'CREATE DATABASE "{name}"')
 
 
+# 上次建好的知識庫還在、文件數也對，就直接用：重建一次的話，轉向量的結果會有極小的差異，
+# 少數題目搜到的段落不同，給老師的資料就跟上次不一樣，存起來的示範答案就用不上了
+def existing_knowledge_base(expected: int):
+    db = SessionLocal()
+    try:
+        workspace = db.query(Workspace).filter(Workspace.name == "臺北市政府規章").first()
+        processed = db.query(Document).filter(Document.status == "processed").count() if workspace else 0
+    except ProgrammingError:  # 第一次跑，還沒有資料表
+        db.rollback()
+        workspace, processed = None, 0
+    if workspace is not None and processed == expected:
+        print(f"沿用上次建好的知識庫：{processed} 份文件")
+        return db, workspace
+    db.close()
+    return None, None
+
+
 # 跟 qa_service.ask_with_passages 同一套步驟：搜段落、照文件分組、組成給模型看的資料
 def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list[str]]:
     searches = [openai_client.PlannedSearch(question)]
@@ -72,9 +96,49 @@ def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list
     return context, seen, codes
 
 
+# 每一次問模型的結果都存起來（照「送了什麼」當鑰匙），做完一筆就寫進檔案
+# 第一次跑時，老師寫完 267 題（3 小時）之後轉接斷線，程式中斷、什麼都沒存到；現在中斷了重跑，做過的直接拿來用
+class Cache:
+    def __init__(self, path: Path):
+        self.path, self.lock, self.done = path, threading.Lock(), {}
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line:
+                    record = json.loads(line)
+                    self.done[record["key"]] = record["value"]
+
+    def get(self, key: str):
+        return self.done.get(key)
+
+    def put(self, key: str, value: str) -> None:
+        with self.lock:
+            self.done[key] = value
+            with self.path.open("a", encoding="utf-8") as out:
+                out.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
+
+
+CACHE = Cache(DATA / "llm_cache.jsonl")
+# 連不上實驗室的模型時（轉接斷線、模型重開），等 30 秒再試，最多等 20 分鐘：期間把轉接重開就能接著跑
+RETRY_WAIT, RETRIES = 30, 40
+
+
 def chat(client: OpenAI, messages: list[dict], extra: dict, timeout: float) -> str:
-    result = client.chat.completions.create(model="qwen3.5-9b", messages=messages, extra_body=extra, timeout=timeout)
-    return (result.choices[0].message.content or "").strip()
+    key = hashlib.sha256(json.dumps([messages, extra], ensure_ascii=False).encode()).hexdigest()
+    if (cached := CACHE.get(key)) is not None:
+        return cached
+    for attempt in range(RETRIES):
+        try:
+            result = client.chat.completions.create(model="qwen3.5-9b", messages=messages, extra_body=extra,
+                                                    timeout=timeout)
+            break
+        except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError):
+            if attempt == RETRIES - 1:
+                raise
+            print(f"  （連不上實驗室的模型，{RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）", flush=True)
+            time.sleep(RETRY_WAIT)
+    answer = (result.choices[0].message.content or "").strip()
+    CACHE.put(key, answer)
+    return answer
 
 
 def parse_json(text: str) -> dict | None:
@@ -150,7 +214,9 @@ def main():
 
     create_database()
     pdfs = {pdf.name: pdf.read_bytes() for pdf in sorted((DATA / "pdfs").glob("*.pdf"))}
-    db, _, workspace, _ = build_knowledge_base(pdfs, "臺北市政府規章")
+    db, workspace = existing_knowledge_base(len(pdfs))
+    if workspace is None:
+        db, _, workspace, _ = build_knowledge_base(pdfs, "臺北市政府規章")
     items = []
     for q in questions:
         context, seen, codes = retrieve(db, workspace.id, q["question"])
