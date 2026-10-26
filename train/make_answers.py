@@ -85,7 +85,16 @@ def existing_knowledge_base(expected: int):
 # 跟 qa_service.ask_with_passages 同一套步驟：搜段落、照文件分組、組成給模型看的資料
 def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list[str]]:
     searches = [openai_client.PlannedSearch(question)]
-    embeddings = openai_client.embed_queries([question])
+    # 轉向量的服務也一樣：連不上就等一下再試（第二次跑時轉向量的模型停了，程式一開始就中斷）
+    for attempt in range(RETRIES):
+        try:
+            embeddings = openai_client.embed_queries([question])
+            break
+        except openai_client.OpenAITemporaryError:
+            if attempt == RETRIES - 1:
+                raise
+            print(f"  （連不上轉向量的模型，{RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）", flush=True)
+            time.sleep(RETRY_WAIT)
     chunks = qa_service._search(db, workspace_id, searches, embeddings, qa_service.SEARCH_LIMIT)
     groups = qa_service._group_by_document(chunks)
     headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
