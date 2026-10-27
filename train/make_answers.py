@@ -168,9 +168,15 @@ def user_message(context: str, question: str) -> str:
 NO_ANSWER_RULE = "\n15. 文件裡找不到答案時，直接說「文件中找不到相關資訊」，並說明缺什麼；這時不要標段落編號。"
 
 
+# 抽查 30 題發現的寫法問題：寫文件代號（「TP-079 已停辦」，161 題裡 16 題）、引用寫成 [第 5 條]
+# 第 4 次起加上這一條；前幾次的規定不變，存好的示範答案才用得上
+FORMAT_RULE = "\n16. 提到文件時寫文件名稱，不要寫文件代號（例如 TP-001）；段落編號只用 [數字]，例如 [2]，不要寫成 [第 5 條]。"
+
+
 # attempt：第幾次寫（0 開始）。不合格的題目會再寫，每次換一個隨機種子，寫出不同的版本，有一次合格就留下
 def teach(client: OpenAI, item: dict, attempt: int) -> str:
-    rules = openai_client.ANSWER_RULES + IDEAL_RULES + (NO_ANSWER_RULE if attempt else "")
+    rules = (openai_client.ANSWER_RULES + IDEAL_RULES + (NO_ANSWER_RULE if attempt >= 1 else "")
+             + (FORMAT_RULE if attempt >= 3 else ""))
     messages = [{"role": "system", "content": rules},
                 {"role": "user", "content": user_message(item["context"], item["q"]["question"])}]
     extra = QWEN_SAMPLING["think"] if attempt == 0 else {**QWEN_SAMPLING["think"], "seed": attempt}
@@ -178,6 +184,12 @@ def teach(client: OpenAI, item: dict, attempt: int) -> str:
 
 
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+
+# 人工抽查（30 題）判不合格的示範答案：{題號: 第幾次寫的}，那一次的答案丟掉，讓老師再寫
+MANUAL_REJECT = {
+    "t0132": 2,  # 「東、南大門上班時段 7 時至 8 時開放」看起來像只開 1 小時（應該是上午 7 時到晚間 8 時）
+    "t0112": 1,  # 問該交報告書還是提要表，沒說明甲類、乙類各是哪些出國，提問的人還是不知道要交哪一種
+}
 
 
 # 篩選：回傳 (合格與否, 不合格的原因, 細節)
@@ -207,6 +219,12 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
         reasons.append("前後矛盾（不思考的評審）")
     if any(c in SIMPLIFIED for c in answer):
         reasons.append("有簡體字")
+    if re.search(r"TP-\d+", answer):
+        reasons.append("寫了文件代號")
+    if re.search(r"[\[［](?!\d)[^\]］]{1,12}[\]］]", answer):
+        reasons.append("引用不是 [數字] 的格式")
+    if MANUAL_REJECT.get(q["id"]) == item["attempts"]:
+        reasons.append("人工抽查不合格")
     if len(answer) > MAX_CHARS:
         reasons.append(f"超過 {MAX_CHARS} 字")
     return not reasons, reasons, detail
@@ -247,7 +265,7 @@ def run_attempt(client: OpenAI, todo: list[dict], attempt: int) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--questions", type=Path, default=DATA / "questions_reviewed.jsonl")
-    parser.add_argument("--attempts", type=int, default=3, help="不合格的題目最多寫幾次（含第一次）")
+    parser.add_argument("--attempts", type=int, default=4, help="不合格的題目最多寫幾次（含第一次）")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     args = parser.parse_args()
     if not openai_client.embedding_client.base_url.host.startswith("localhost"):
