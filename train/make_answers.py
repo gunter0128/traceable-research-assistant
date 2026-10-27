@@ -185,10 +185,14 @@ def teach(client: OpenAI, item: dict, attempt: int) -> str:
 
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
 
-# 人工抽查（30 題）判不合格的示範答案：{題號: 第幾次寫的}，那一次的答案丟掉，讓老師再寫
+# 人工抽查判不合格的示範答案：{題號: {第幾次寫的}}，那幾次的答案丟掉，讓老師再寫
 MANUAL_REJECT = {
-    "t0132": 2,  # 「東、南大門上班時段 7 時至 8 時開放」看起來像只開 1 小時（應該是上午 7 時到晚間 8 時）
-    "t0112": 1,  # 問該交報告書還是提要表，沒說明甲類、乙類各是哪些出國，提問的人還是不知道要交哪一種
+    "t0132": {2},  # 「東、南大門上班時段 7 時至 8 時開放」看起來像只開 1 小時（應該是上午 7 時到晚間 8 時）
+    # 問該交報告書還是提要表，沒說明甲類、乙類各是哪些出國，提問的人還是不知道要交哪一種
+    # 第 2、3 次寫的也一樣：重點清單沒要求說明類別，評審擋不下來，整題不用
+    "t0112": {1, 2, 3, 4},
+    # 第 4 次寫的：沒說執行中不得轉借（只說「應持續使用於原定目的」），最後「暫無適用法規」會讓人誤會
+    "t0046": {4},
 }
 
 
@@ -223,7 +227,7 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
         reasons.append("寫了文件代號")
     if re.search(r"[\[［](?!\d)[^\]］]{1,12}[\]］]", answer):
         reasons.append("引用不是 [數字] 的格式")
-    if MANUAL_REJECT.get(q["id"]) == item["attempts"]:
+    if item["attempts"] in MANUAL_REJECT.get(q["id"], set()):
         reasons.append("人工抽查不合格")
     if len(answer) > MAX_CHARS:
         reasons.append(f"超過 {MAX_CHARS} 字")
