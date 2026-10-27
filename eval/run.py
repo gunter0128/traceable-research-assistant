@@ -219,6 +219,17 @@ IDEAL_RULES = """
 13. 每一句標的段落編號，那一段裡要真的寫著這句話講的內容。
 14. 整個回答盡量在 150 字以內，需要分情況時可以稍長；不要加「結論」「說明」這類標題。"""
 
+# 把回答原則裡不夠精準的地方講清楚（--precise-rules），只在評估時加，線上的回答原則不動
+# 來源：訓練後的回答在練習題上錯在哪（選錯適用的規定、漏了限制、說明不適用的句子沒標引用、依據那一行時有時無）
+# 跟回答原則一樣只放通用的寫法，不放任何領域的詞（docs/decisions/019）
+PRECISE_RULES = """
+8. 下結論前，先找出規定寫的適用條件（對象、身分、單位、職級、期間、生效或廢止日期），逐一對照提問者的情況和今天的日期；條件不符合的規定，不能當成答案。
+9. 規定裡有限制或例外時（例如某些人不適用、不給薪、有上限），也要一起說。
+10. 每一句講到資料內容的句子都要標段落編號，包括說明某條規定不適用、已廢止、還沒生效的句子；只有最後的依據那一行不用標。
+11. 回答的最後一定要另起一行，寫「依據：文件名稱 條次」；說找不到相關資訊時不用寫。"""
+# 問題後面的提醒也一起改：模型對離問題最近的指示比較會照做（docs/decisions/021）
+PRECISE_REMINDER = "（回答時，每一句講到資料內容的句子，句尾都要標上依據的段落編號，例如 [1]；說明某條規定不適用的句子也要標。）"
+
 
 # 回答的服務暫時連不上時（例如接實驗室自己架的模型，SSH 轉接斷線），等一下再試，最多等約 5 分鐘
 # 不然斷一下整輪評估就中止了（docs/decisions/034）。秒數只算成功的那一次
@@ -353,6 +364,7 @@ def report_markdown(summaries: list[dict], meta: dict) -> str:
               + f"回答 {meta.get('model', '—')}"
               + {True: "（思考）", False: "（不思考）"}.get(meta.get("thinking"), "")
               + ("｜加上理想回答的規定" if meta.get("ideal_rules") else "")
+              + ("｜加上精準的規定" if meta.get("precise_rules") else "")
               + f"｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
@@ -411,6 +423,8 @@ def main():
     parser.add_argument("--ids", nargs="+", help="只跑這幾題（題號），例如只挑真實情境的題目")
     parser.add_argument("--ideal-rules", action="store_true",
                         help="回答原則後面加上理想回答的寫法（IDEAL_RULES，docs/decisions/038），線上的回答原則不動")
+    parser.add_argument("--precise-rules", action="store_true",
+                        help="回答原則後面加上講得更精準的規定，問題後面的提醒也換掉（PRECISE_RULES），線上的回答原則不動")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
     if args.top_k:
@@ -444,6 +458,9 @@ def main():
         questions = [q for q in questions if q["id"] in set(args.ids)]
     if args.ideal_rules:
         openai_client.ANSWER_RULES += IDEAL_RULES
+    if args.precise_rules:
+        openai_client.ANSWER_RULES += PRECISE_RULES
+        openai_client.CITATION_REMINDER = PRECISE_REMINDER
     if args.planner == "oracle":
         qa_service._plan = oracle_plan(questions, args.oracle_recall, args.oracle_wrong)
     client = OpenAI(api_key=settings.openai_api_key)
@@ -471,6 +488,7 @@ def main():
             "thinking": None if openai_client.answer_client is openai_client.client else
             (openai_client.answer_extra_body or {}).get("chat_template_kwargs", {}).get("enable_thinking", True),
             "ideal_rules": args.ideal_rules,
+            "precise_rules": args.precise_rules,
             "answer_sampling": openai_client.answer_extra_body}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
