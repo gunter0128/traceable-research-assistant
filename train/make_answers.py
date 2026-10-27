@@ -7,8 +7,9 @@
 #      - 評審（Qwen 不思考，train/judge_check.py 量過跟 gpt-4o 一致 96%）對照標準答案：完全正確
 #      - 有答案的題目至少標到一份出題時設定的文件；沒有答案的題目一個都不標
 #      - 引用對得上：每句的數字都在它標的那段（eval/common.py citation_checks）
-#      - 不矛盾（Qwen 不思考，同一套不矛盾的評審規則）
+#      - 不矛盾（Qwen 不思考、思考各判一次，任何一個判矛盾就丟掉）
 #      - 只用繁體中文、200 字以內
+#   不合格的題目最多再寫 2 次（換隨機種子），有一次合格就留下；第一次跑只有 36% 合格（docs/decisions/039）
 #   4. 一筆訓練資料 = 輸入（線上的回答原則，不含理想回答的寫法 + 搜到的段落 + 題目）→ 輸出（合格的示範答案）
 #      訓練時不給理想回答的寫法：模型要自己學會這些習慣
 #
@@ -162,10 +163,18 @@ def user_message(context: str, question: str) -> str:
     return f"資料：\n{context}\n\n問題：{question}\n\n{openai_client.CITATION_REMINDER}"
 
 
-def teach(client: OpenAI, item: dict) -> str:
-    messages = [{"role": "system", "content": openai_client.ANSWER_RULES + IDEAL_RULES},
+# 第一次跑時漏了一條：文件找不到答案時，老師會寫「找不到……[1][3][4]」，拿段落當沒有答案的證據（沒有答案的題目 42 題只 1 題合格）
+# 重寫時（第 2 次起）加上這一條；第 1 次維持原本的規定，存好的示範答案才用得上
+NO_ANSWER_RULE = "\n15. 文件裡找不到答案時，直接說「文件中找不到相關資訊」，並說明缺什麼；這時不要標段落編號。"
+
+
+# attempt：第幾次寫（0 開始）。不合格的題目會再寫，每次換一個隨機種子，寫出不同的版本，有一次合格就留下
+def teach(client: OpenAI, item: dict, attempt: int) -> str:
+    rules = openai_client.ANSWER_RULES + IDEAL_RULES + (NO_ANSWER_RULE if attempt else "")
+    messages = [{"role": "system", "content": rules},
                 {"role": "user", "content": user_message(item["context"], item["q"]["question"])}]
-    return chat(client, messages, QWEN_SAMPLING["think"], timeout=900)
+    extra = QWEN_SAMPLING["think"] if attempt == 0 else {**QWEN_SAMPLING["think"], "seed": attempt}
+    return chat(client, messages, extra, timeout=900)
 
 
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
@@ -212,9 +221,33 @@ def contradicts(client: OpenAI, question: str, answer: str, extra: dict, detail:
     return verdict is None or bool(verdict.get("contradiction"))
 
 
+# 寫一次、篩一次：結果記在每個 item 上（passed、reasons、detail、answer、cited、attempts）
+def run_attempt(client: OpenAI, todo: list[dict], attempt: int) -> None:
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        answers = list(pool.map(lambda item: teach(client, item, attempt), todo))
+    for item, answer in zip(todo, answers, strict=True):
+        _, marked = qa_service._extract_citations(answer, len(item["seen"]))
+        item.update(answer=answer, cited=sorted({item["codes"][n - 1] for n in marked}), attempts=attempt + 1)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda item: check(client, item), todo))
+    # 其他檢查都通過的，再請思考模式判一次不矛盾
+    survivors = [(item, result) for item, result in zip(todo, results, strict=True) if result[0]]
+
+    def think_check(pair):
+        item, (_, reasons, detail) = pair
+        if contradicts(client, item["q"]["question"], item["answer"], QWEN_SAMPLING["think"], detail, "consistency_think"):
+            reasons.append("前後矛盾（思考的評審）")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(think_check, survivors))
+    for item, (_, reasons, detail) in zip(todo, results, strict=True):
+        item.update(passed=not reasons, reasons=reasons, detail=detail)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--questions", type=Path, default=DATA / "questions_reviewed.jsonl")
+    parser.add_argument("--attempts", type=int, default=3, help="不合格的題目最多寫幾次（含第一次）")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     args = parser.parse_args()
     if not openai_client.embedding_client.base_url.host.startswith("localhost"):
@@ -233,33 +266,23 @@ def main():
     db.close()
 
     client = OpenAI(base_url=args.base_url, api_key="not-needed", max_retries=2)
-    started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        answers = list(pool.map(lambda item: teach(client, item), items))
-    print(f"示範答案寫完：{len(items)} 題，{(time.perf_counter() - started) / 60:.0f} 分鐘")
-    for item, answer in zip(items, answers, strict=True):
-        _, marked = qa_service._extract_citations(answer, len(item["seen"]))
-        item.update(answer=answer, cited=sorted({item["codes"][n - 1] for n in marked}))
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda item: check(client, item), items))
-    # 其他檢查都通過的，再請思考模式判一次不矛盾
-    survivors = [(item, result) for item, result in zip(items, results, strict=True) if result[0]]
-
-    def think_check(pair):
-        item, (_, reasons, detail) = pair
-        if contradicts(client, item["q"]["question"], item["answer"], QWEN_SAMPLING["think"], detail, "consistency_think"):
-            reasons.append("前後矛盾（思考的評審）")
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(think_check, survivors))
-    results = [(not reasons, reasons, detail) for _, reasons, detail in results]
+    for attempt in range(args.attempts):
+        # 第 2 次起只重寫不合格的；有答案、但系統根本沒搜到出題那份規章的不重寫：段落裡沒有答案，再寫也不會對
+        todo = [item for item in items if not item.get("passed") and (
+            attempt == 0 or item["q"]["should_refuse"] or set(item["q"]["sources"]) & set(item["codes"]))]
+        if not todo:
+            break
+        started = time.perf_counter()
+        run_attempt(client, todo, attempt)
+        print(f"第 {attempt + 1} 次：寫了 {len(todo)} 題，{(time.perf_counter() - started) / 60:.0f} 分鐘，"
+              f"累計合格 {sum(bool(item.get('passed')) for item in items)} 題", flush=True)
 
     out, examples = [], []
-    for item, (passed, reasons, detail) in zip(items, results, strict=True):
-        q = item["q"]
+    for item in items:
+        q, passed, reasons, detail = item["q"], item["passed"], item["reasons"], item["detail"]
         out.append({"id": q["id"], "type": q["type"], "question": q["question"], "answer": item["answer"],
                     "cited": item["cited"], "retrieved": sorted(set(item["codes"])), "sources": q["sources"],
-                    "passed": passed, "reasons": reasons, **detail})
+                    "attempts": item["attempts"], "passed": passed, "reasons": reasons, **detail})
         if passed:
             # 訓練時給的是線上的回答原則（不含理想回答的寫法），跟上線時模型看到的一模一樣
             examples.append({"id": q["id"], "type": q["type"], "messages": [
