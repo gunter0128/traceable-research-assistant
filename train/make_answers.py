@@ -149,14 +149,21 @@ MANUAL_REJECT: dict[str, set[int]] = {}
 # 依據那一行：另起一行，「依據：」開頭
 BASIS_LINE = re.compile(r"\n\s*依據[：:]")
 # 說「資料沒寫」的句子不用標引用：只有一部分資訊的題目，要說明缺什麼
-ABSENT = re.compile(r"找不到|沒有(寫|規定|提到|說明|明定)|未(提及|載明|規定|說明|明定|記載)")
+ABSENT = re.compile(r"找不到|無法(判斷|確定|得知)|並未|沒有.{0,20}(寫|規定|提到|說明|明定|記載)|"
+                    r"未.{0,6}(提及|載明|規定|說明|明定|記載|詳述)")
+# 開頭一句很短、沒有數字的結論可以不標，例如「不行。」：038 的理想回答就是這樣寫，依據在下一句
+SHORT_CONCLUSION = 20
 
 
 # 依據那一行之前，每一句都要標段落編號（041）：第 1 版的示範答案有一半有句子沒標，模型照著學
 def uncited_sentences(answer: str) -> list[str]:
     body = BASIS_LINE.split(answer)[0]
+    # 編號標在句號後面（「……子系統。[3][4]」）也算這一句的：先搬到句號前面再切句
+    body = re.sub(r"([。！？])\s*((?:\[\d+\])+)", r"\2\1", body)
     sentences = [s.strip() for s in re.split(r"(?<=[。！？])|\n", body) if s.strip()]
-    return [s for s in sentences if not re.search(r"\[\d+\]", s) and not ABSENT.search(s)]
+    return [s for i, s in enumerate(sentences)
+            if not re.search(r"\[\d+\]", s) and not ABSENT.search(s)
+            and not (i == 0 and len(s) <= SHORT_CONCLUSION and not re.search(r"\d", s))]
 
 
 # 篩選：回傳 (合格與否, 不合格的原因, 細節)
