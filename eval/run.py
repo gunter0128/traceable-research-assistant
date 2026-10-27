@@ -139,11 +139,16 @@ def judge(client: OpenAI, domain: str, q: dict, response: str, cited: list[str])
         nice_to_have=json.dumps(q.get("nice_to_have", []), ensure_ascii=False),
         must_not=json.dumps(q["must_not"], ensure_ascii=False),
     )
-    result = client.chat.completions.create(
-        model=JUDGE_MODEL, temperature=0, response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return json.loads(result.choices[0].message.content)
+    # 評審偶爾會漏掉整個欄位（例如沒寫 refused），整輪評估會在最後一題前中斷：再問一次，問 3 次都缺才報錯
+    for _ in range(3):
+        result = client.chat.completions.create(
+            model=JUDGE_MODEL, temperature=0, response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        verdict = json.loads(result.choices[0].message.content)
+        if "refused" in verdict:
+            return verdict
+    raise ValueError(f"評審連續 3 次沒有回 refused：{q['id']}")
 
 
 # ---------- 不矛盾（docs/decisions/038）----------
