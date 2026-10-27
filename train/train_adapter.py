@@ -4,7 +4,7 @@
 #   一筆訓練資料 = 輸入（線上的回答原則 + 搜到的段落 + 題目）→ 輸出（合格的示範答案），由 train/make_answers.py 產生
 #   格式跟線上一模一樣：Qwen 的對話格式、關掉思考模式；loss 只算回答的部分（輸入是給它讀的，不是要它學著寫）
 # 怎麼分資料：每種題型各抽 10% 當驗證集，不拿來訓練
-#   每訓練完一輪算一次驗證集的 loss，存下最好的那一輪
+#   每訓練完一輪算一次驗證集的 loss，每一輪的 adapter 都存（adapters/taipei-50/epoch-1 …），記下 loss 最低的是哪一輪
 #   剩下的 --n 50 就拿前 50 筆：50 筆 ⊂ 100 筆 ⊂ 全部，學習曲線比出來的才是資料量的差別
 # 記錄：每次訓練的設定、資料的版本（檔案的 sha256）、loss 曲線、產出的 adapter 都記在 MLflow（實驗室本機的檔案）
 #
@@ -134,9 +134,10 @@ def train(model, items: list[dict], val: list[dict], cfg: dict, out: Path) -> di
         result["val_loss"].append(loss)
         mlflow.log_metric("val_loss", loss, step=step)
         print(f"第 {epoch} 輪 驗證集 loss {loss:.4f}")
+        # 每輪都存：驗證集只有 17 筆，loss 最低的不一定考得最好，考試後可以直接換另一輪，不用重新訓練
+        model.save_pretrained(out / f"epoch-{epoch}")  # 只存 adapter（約 100MB），不存底模
         if loss < min(result["val_loss"][:-1]):
             result["best_epoch"] = epoch
-            model.save_pretrained(out)  # 只存 adapter（約 100MB），不存底模
     result["seconds_per_example"] = round((time.perf_counter() - started) / seen, 1)
     # PyTorch 跟顯示卡要過的最大量（含暫時沒用到的），比實際用到的多一點，比較接近會不會爆
     result["peak_gb"] = round(torch.cuda.max_memory_reserved() / 2**30, 1)
@@ -183,8 +184,6 @@ def main():
                            "data_sha256": hashlib.sha256(data).hexdigest()[:16], "max_tokens": longest,
                            "targets": TARGETS, **LORA, **cfg})
         result = train(model, train_items, val_items, cfg, out)
-        if args.smoke:
-            model.save_pretrained(out)  # 試跑不管有沒有變好都存，接著要拿來試 vLLM 掛不掛得上
         result["train_ids"] = [it["id"] for it in train_items]
         result["val_ids"] = [it["id"] for it in val_items]
         out.mkdir(parents=True, exist_ok=True)
