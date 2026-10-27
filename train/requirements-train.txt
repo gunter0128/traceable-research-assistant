@@ -1,0 +1,7 @@
+# 實驗室訓練用的環境：跟 vLLM 的環境分開，免得裝訓練套件時改到 vLLM 用的版本（docs/decisions/040）
+# torch 先裝跟 vLLM 環境同一版（確定跟實驗室的顯示卡驅動相容），再裝這些；裝好後用 pip freeze 把版本固定下來
+transformers>=5
+peft
+accelerate
+mlflow
+flash-linear-attention
