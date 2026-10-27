@@ -12,7 +12,7 @@
 #   python train_adapter.py --smoke                       試跑：最長的 16 筆訓練 2 步，看記憶體夠不夠、一筆多久
 #   python train_adapter.py --n 50                        訓練，adapter 存到 adapters/taipei-50
 #   python train_adapter.py                               全部的訓練資料，存到 adapters/taipei-all
-#   python train_adapter.py --eval-only merged/taipei-50  合併後的模型在驗證集的 loss，要跟訓練時最好的那輪一樣
+# 訓練完用 vLLM 直接掛上 adapter，用 vllm_loss.py 確認 vLLM 上的驗證集 loss 跟訓練時差不多
 
 import argparse
 import hashlib
@@ -148,7 +148,6 @@ def main():
     parser.add_argument("--examples", default="examples.jsonl")
     parser.add_argument("--n", type=int, help="用前幾筆訓練資料；不給就全部")
     parser.add_argument("--smoke", action="store_true", help="試跑：最長的 16 筆訓練 2 步")
-    parser.add_argument("--eval-only", metavar="MODEL", help="只算這個模型（合併後的）在驗證集的 loss")
     args = parser.parse_args()
 
     data = Path(args.examples).read_bytes()
@@ -169,11 +168,6 @@ def main():
         print(f"最長的一筆 {len(tail['ids'])} 個 token；它的結尾（確認格式）：")
         print(tokenizer.decode(tail["ids"][-(tail["answer_len"] + 30) :]))
 
-    if args.eval_only:
-        model = load_model(args.eval_only)
-        print(f"{args.eval_only} 驗證集 loss {val_loss(model, val_items):.4f}")
-        return
-
     model = load_model(BASE)
     # 用重算換記憶體：往前算時不留每層的中間結果，往回算時再算一次
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -190,7 +184,7 @@ def main():
                            "targets": TARGETS, **LORA, **cfg})
         result = train(model, train_items, val_items, cfg, out)
         if args.smoke:
-            model.save_pretrained(out)  # 試跑不管有沒有變好都存，接著要拿來試合併
+            model.save_pretrained(out)  # 試跑不管有沒有變好都存，接著要拿來試 vLLM 掛不掛得上
         result["train_ids"] = [it["id"] for it in train_items]
         result["val_ids"] = [it["id"] for it in val_items]
         out.mkdir(parents=True, exist_ok=True)
