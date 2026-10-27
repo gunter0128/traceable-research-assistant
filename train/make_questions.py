@@ -12,9 +12,13 @@
 #   主題清單：沒有答案的題目（規章沒寫的事）——沒辦法用程式證明真的沒寫；如果其實有寫，之後老師會答出來，
 #     評審對照「應該說找不到」會判不合格丟掉，不會混進訓練資料
 #
+# 第 2 批（--more，docs/decisions/041）：第 1 版訓練出來的模型最常錯在「選錯適用的規定」（身分、版本、子機關）
+#   只出用到新下載規章的題目，另外每份現行規章再出 2 題身分題（PERSONA），接在原本的題目後面，題號接著編
+#
 # 用法（專案資料夾，實驗室的 Qwen 和轉接要開著）：
 #   .venv\Scripts\python -m train.make_questions --pilot     先試 10 份規章左右，約 20 題，給人看
 #   .venv\Scripts\python -m train.make_questions             全部，約 300 題
+#   .venv\Scripts\python -m train.make_questions --more      第 2 批
 
 import argparse
 import difflib
@@ -29,6 +33,7 @@ from openai import OpenAI
 from app.core.pdf_parser import extract_text
 from eval.common import normalize, numbers, quote_found
 from eval.run import QWEN_SAMPLING
+from train.llm import chat, parse_json
 
 DATA = Path(__file__).parent / "data" / "taipei"
 TYPES = {"general", "conditional", "persona", "version", "scope", "cross_doc", "no_answer"}
@@ -54,6 +59,20 @@ SINGLE = """你要幫「規章問答系統」出訓練用的題目。下面是�
 {rules}
 
 輸出 JSON：{{"questions": [{{"type": "general", "question": "", "answer": "", "must_include": [], "must_not": [], "evidence": [""]}}]}}
+
+規章（檔名：{file}）：
+{text}"""
+
+# 第 2 批：專門出身分題。一題問到適用的人，一題問到不適用、或適用另一種規定的人：模型要練的是判斷「哪一條適用他」
+PERSONA = """你要幫「規章問答系統」出訓練用的題目。下面是臺北市政府的一份內部規章。請想像你是臺北市政府或所屬機關的同仁。
+如果這份規章對不同的對象、身分、職級、單位、期間或情況有不同的規定（包括某些人不適用、要比照或準用別的規定），出 2 題 persona：
+問題裡說明提問者的身分或情況，標準答案只給適用他的規定；其中一題的提問者要是「規定不適用他」或「適用另一種規定」的人，
+標準答案要說明他適用哪一種、或為什麼不適用；must_not 放套用到其他身分的說法。
+如果規章沒有因人或情況而不同的規定，回傳空的 questions。
+
+{rules}
+
+輸出 JSON：{{"questions": [{{"type": "persona", "question": "", "answer": "", "must_include": [], "must_not": [], "evidence": [""]}}]}}
 
 規章（檔名：{file}）：
 {text}"""
@@ -177,15 +196,51 @@ def plan(docs: list[dict], pilot: bool) -> list[tuple[str, str, list[dict]]]:
     return tasks
 
 
+# 第 2 批：只出用到新規章的題目（至少一份是新的），另外每份現行規章（新舊都算）再出 2 題身分題
+# 隨機種子換一個：長的規章會取到跟第 1 批不同的段落
+def plan_more(docs: list[dict]) -> list[tuple[str, str, list[dict]]]:
+    rng = random.Random(2027)
+    current = [d for d in docs if not d["abolished"] and len(d["text"]) >= 500]
+    abolished = [d for d in docs if d["abolished"] and len(d["text"]) >= 300]
+    new = {d["file"] for d in docs if d.get("batch") == 2}
+    tasks = []
+
+    def pair(qtype, first, second):
+        prompt = PAIR.format(task=PAIR_TASKS[qtype], rules=COMMON_RULES, qtype=qtype,
+                             file1=first["file"], text1=excerpt(first["text"], rng),
+                             file2=second["file"], text2=excerpt(second["text"], rng))
+        tasks.append((qtype, prompt, [first, second]))
+
+    def best(doc, candidates, minimum=PAIR_MIN_SIMILARITY):
+        candidates = [c for c in candidates if related(doc, c) >= minimum]
+        return max(candidates, key=lambda c: related(doc, c)) if candidates else None
+
+    for d in current:
+        if d["file"] in new:
+            tasks.append(("single", SINGLE.format(rules=COMMON_RULES, file=d["file"], text=excerpt(d["text"], rng)), [d]))
+    # 版本：新的舊版配現行的；舊的舊版只在配到的現行規章是新的時候才出（配舊的那組第 1 批出過了）
+    for old in abolished:
+        newest = best(old, [d for d in current if d["topic"] == old["topic"]])
+        if newest and (old["file"] in new or newest["file"] in new):
+            pair("version", old, newest)
+    # 適用範圍：同上，有一份是新的才出
+    for own in [d for d in current if d["bureau"]]:
+        citywide = best(own, [d for d in current if d["topic"] == own["topic"] and not d["bureau"]], SCOPE_MIN_SIMILARITY)
+        if citywide and (own["file"] in new or citywide["file"] in new):
+            pair("scope", citywide, own)
+    pairs = [(a, b) for i, a in enumerate(current) for b in current[i + 1:]
+             if a["topic"] == b["topic"] and related(a, b) >= PAIR_MIN_SIMILARITY and (a["file"] in new or b["file"] in new)]
+    for a, b in rng.sample(pairs, min(30, len(pairs))):
+        pair("cross_doc", a, b)
+    for d in current:
+        tasks.append(("persona", PERSONA.format(rules=COMMON_RULES, file=d["file"], text=excerpt(d["text"], rng)), [d]))
+    return tasks
+
+
+# 問的結果存起來、連不上會重試（train/llm.py）：出題要跑 2 小時，中途斷線重跑時做過的直接拿來用
 def ask(client: OpenAI, prompt: str) -> list[dict]:
-    result = client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "content": prompt}],
-                                            extra_body=QWEN_SAMPLING["think"], timeout=1200)
-    text = result.choices[0].message.content or ""
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    try:
-        return json.loads(match.group()).get("questions", []) if match else []
-    except json.JSONDecodeError:
-        return []
+    result = parse_json(chat(client, [{"role": "user", "content": prompt}], QWEN_SAMPLING["think"], timeout=1200))
+    return (result or {}).get("questions", [])
 
 
 # 「不能說」只放錯誤的說法；Qwen 有時會寫成給評審的指示（「不要提條號」），這種拿掉
@@ -241,16 +296,21 @@ def problem(q: dict, used: list[dict]) -> str | None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pilot", action="store_true")
+    parser.add_argument("--more", action="store_true", help="第 2 批：接在原本的題目後面")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     args = parser.parse_args()
     docs = load_docs()
-    tasks = plan(docs, args.pilot)
+    tasks = plan_more(docs) if args.more else plan(docs, args.pilot)
     print(f"出題工作 {len(tasks)} 個：" + "、".join(f"{t} {sum(x[0] == t for x in tasks)}" for t in dict.fromkeys(x[0] for x in tasks)))
     client = OpenAI(base_url=args.base_url, api_key="not-needed", max_retries=2)
     with ThreadPoolExecutor(max_workers=4) as pool:
         answers = list(pool.map(lambda task: ask(client, task[1]), tasks))
 
-    kept, rejected, seen = [], [], []
+    # 第 2 批：題號接著編，太像的題目也要跟第 1 批的比
+    before = [json.loads(line) for line in (DATA / "questions.jsonl").read_text(encoding="utf-8").splitlines()
+              if line] if args.more else []
+    start = max((int(q["id"][1:]) for q in before), default=0)
+    kept, rejected, seen = [], [], [normalize(q["question"]) for q in before]
     for (_, _, used), questions in zip(tasks, answers, strict=True):
         for q in questions:
             q["must_not"] = [m for m in q.get("must_not") or [] if not INSTRUCTION.match(m.strip())]
@@ -263,16 +323,18 @@ def main():
                 continue
             seen.append(text)
             kept.append({
-                "id": f"t{len(kept) + 1:04d}", "type": q["type"], "question": q["question"], "answer": q["answer"],
+                "id": f"t{start + len(kept) + 1:04d}", "type": q["type"], "question": q["question"], "answer": q["answer"],
                 "must_include": q.get("must_include", []), "must_not": q.get("must_not", []), "nice_to_have": [],
                 "sources": [d["code"] for d in used] if q["type"] != "no_answer" else [],
                 "should_refuse": q["type"] == "no_answer", "split": "train",
                 "evidence": [e if isinstance(e, str) else e.get("quote", "") for e in q.get("evidence") or []],
             })
     name = "pilot" if args.pilot else "questions"
-    (DATA / f"{name}.jsonl").write_text("".join(json.dumps(q, ensure_ascii=False) + "\n" for q in kept), encoding="utf-8")
-    (DATA / f"{name}_rejected.jsonl").write_text("".join(json.dumps(q, ensure_ascii=False) + "\n" for q in rejected),
-                                                encoding="utf-8")
+    mode = "a" if args.more else "w"  # 第 2 批接在原本的檔案後面
+    with (DATA / f"{name}.jsonl").open(mode, encoding="utf-8") as out:
+        out.write("".join(json.dumps(q, ensure_ascii=False) + "\n" for q in kept))
+    with (DATA / f"{name}_rejected.jsonl").open(mode, encoding="utf-8") as out:
+        out.write("".join(json.dumps(q, ensure_ascii=False) + "\n" for q in rejected))
     print(f"合格 {len(kept)} 題、不合格 {len(rejected)} 題：{DATA / name}.jsonl")
     for reason in sorted({r['reason'].split('：')[0] for r in rejected}):
         print(f"  {reason}：{sum(r['reason'].startswith(reason) for r in rejected)}")

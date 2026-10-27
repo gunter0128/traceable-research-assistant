@@ -149,6 +149,7 @@ def main():
     parser.add_argument("--examples", default="examples.jsonl")
     parser.add_argument("--n", type=int, help="用前幾筆訓練資料；不給就全部")
     parser.add_argument("--smoke", action="store_true", help="試跑：最長的 16 筆訓練 2 步")
+    parser.add_argument("--name", default="taipei", help="adapter 名稱的開頭：第 2 版的資料用 taipei-v2，不蓋掉第 1 版")
     args = parser.parse_args()
 
     data = Path(args.examples).read_bytes()
@@ -175,7 +176,7 @@ def main():
     model = get_peft_model(model, LoraConfig(target_modules=TARGETS, task_type="CAUSAL_LM", **LORA))
     model.print_trainable_parameters()
 
-    name = "smoke" if args.smoke else f"taipei-{args.n or 'all'}"
+    name = "smoke" if args.smoke else f"{args.name}-{args.n or 'all'}"
     out = Path("adapters") / name
     mlflow.set_tracking_uri("sqlite:///mlflow.db")  # 記錄存在實驗室這台電腦，不送到外面
     mlflow.set_experiment("answer-adapter")

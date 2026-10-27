@@ -2,14 +2,15 @@
 #
 # 每一題：
 #   1. 系統搜段落：跟真實使用一模一樣（本機的轉向量模型、只拿問題搜、找 5 段、照文件分組、附檔名和文件開頭）
-#   2. 老師寫示範答案：Qwen 思考模式，回答原則加上理想回答的寫法（eval/run.py 的 IDEAL_RULES）
+#   2. 老師寫示範答案：Qwen 思考模式，回答原則加上理想回答的寫法（eval/run.py 的 IDEAL_RULES）和下面的第 15～20 條
 #   3. 篩選，全部通過才留下：
 #      - 評審（Qwen 不思考，train/judge_check.py 量過跟 gpt-4o 一致 96%）對照標準答案：完全正確
 #      - 有答案的題目至少標到一份出題時設定的文件；沒有答案的題目一個都不標
 #      - 引用對得上：每句的數字都在它標的那段（eval/common.py citation_checks）
+#      - 有答案的題目：依據那一行之前每一句都標了段落編號、依據另起一行（第 2 版，041）
 #      - 不矛盾（Qwen 不思考、思考各判一次，任何一個判矛盾就丟掉）
 #      - 只用繁體中文、200 字以內
-#   不合格的題目最多再寫 2 次（換隨機種子），有一次合格就留下；第一次跑只有 36% 合格（docs/decisions/039）
+#   不合格的題目最多再寫 3 次（換隨機種子），有一次合格就留下；第 1 版第一次跑只有 36% 合格（docs/decisions/039）
 #   4. 一筆訓練資料 = 輸入（線上的回答原則，不含理想回答的寫法 + 搜到的段落 + 題目）→ 輸出（合格的示範答案）
 #      訓練時不給理想回答的寫法：模型要自己學會這些習慣
 #
@@ -28,16 +29,13 @@ from eval.run import CONSISTENCY_PROMPT, IDEAL_RULES, JUDGE_PROMPT, QWEN_SAMPLIN
 # isort: on
 
 import argparse
-import hashlib
 import json
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 
-import openai
 import psycopg
 from openai import OpenAI
 from sqlalchemy.exc import ProgrammingError
@@ -50,6 +48,7 @@ from app.repositories import chunk_repo
 from app.services import qa_service
 from eval.common import citation_checks
 from train.judge_check import correct_from
+from train.llm import RETRIES, RETRY_WAIT, chat, parse_json
 from train.make_questions import SIMPLIFIED
 
 DATA = Path(__file__).parent / "data" / "taipei"
@@ -106,77 +105,34 @@ def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list
     return context, seen, codes
 
 
-# 每一次問模型的結果都存起來（照「送了什麼」當鑰匙），做完一筆就寫進檔案
-# 第一次跑時，老師寫完 267 題（3 小時）之後轉接斷線，程式中斷、什麼都沒存到；現在中斷了重跑，做過的直接拿來用
-class Cache:
-    def __init__(self, path: Path):
-        self.path, self.lock, self.done = path, threading.Lock(), {}
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line:
-                    record = json.loads(line)
-                    self.done[record["key"]] = record["value"]
-
-    def get(self, key: str):
-        return self.done.get(key)
-
-    def put(self, key: str, value: str) -> None:
-        with self.lock:
-            self.done[key] = value
-            with self.path.open("a", encoding="utf-8") as out:
-                out.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
-
-
-CACHE = Cache(DATA / "llm_cache.jsonl")
-# 連不上實驗室的模型時（轉接斷線、模型重開），等 30 秒再試，最多等 20 分鐘：期間把轉接重開就能接著跑
-RETRY_WAIT, RETRIES = 30, 40
-
-
-def chat(client: OpenAI, messages: list[dict], extra: dict, timeout: float) -> str:
-    key = hashlib.sha256(json.dumps([messages, extra], ensure_ascii=False).encode()).hexdigest()
-    if (cached := CACHE.get(key)) is not None:
-        return cached
-    for attempt in range(RETRIES):
-        try:
-            result = client.chat.completions.create(model="qwen3.5-9b", messages=messages, extra_body=extra,
-                                                    timeout=timeout)
-            break
-        except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError):
-            if attempt == RETRIES - 1:
-                raise
-            print(f"  （連不上實驗室的模型，{RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）", flush=True)
-            time.sleep(RETRY_WAIT)
-    answer = (result.choices[0].message.content or "").strip()
-    CACHE.put(key, answer)
-    return answer
-
-
-def parse_json(text: str) -> dict | None:
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    try:
-        return json.loads(match.group()) if match else None
-    except json.JSONDecodeError:
-        return None
-
-
 def user_message(context: str, question: str) -> str:
     return f"資料：\n{context}\n\n問題：{question}\n\n{openai_client.CITATION_REMINDER}"
 
 
-# 第一次跑時漏了一條：文件找不到答案時，老師會寫「找不到……[1][3][4]」，拿段落當沒有答案的證據（沒有答案的題目 42 題只 1 題合格）
-# 重寫時（第 2 次起）加上這一條；第 1 次維持原本的規定，存好的示範答案才用得上
+# 第 1 版漏了一條：文件找不到答案時，老師會寫「找不到……[1][3][4]」，拿段落當沒有答案的證據（沒有答案的題目 42 題只 1 題合格）
 NO_ANSWER_RULE = "\n15. 文件裡找不到答案時，直接說「文件中找不到相關資訊」，並說明缺什麼；這時不要標段落編號。"
 
 
-# 抽查 30 題發現的寫法問題：寫文件代號（「TP-079 已停辦」，161 題裡 16 題）、引用寫成 [第 5 條]
-# 第 4 次起加上這一條；前幾次的規定不變，存好的示範答案才用得上
+# 第 1 版抽查 30 題發現的寫法問題：寫文件代號（「TP-079 已停辦」，161 題裡 16 題）、引用寫成 [第 5 條]
 FORMAT_RULE = "\n16. 提到文件時寫文件名稱，不要寫文件代號（例如 TP-001）；段落編號只用 [數字]，例如 [2]，不要寫成 [第 5 條]。"
 
 
+# 第 2 版（docs/decisions/041）：第 1 版訓練出來的模型考練習題時，選錯適用的規定、漏了限制和例外、
+# 說明不適用的句子沒標引用、依據那一行時有時無。原本的規定大多有寫，只是不夠精準；講清楚之後放在老師的規定裡，
+# 學生從示範答案學（上線時給學生的回答原則不變，跟訓練時一樣）
+# 第 17 條：上線時直接加「條件不符合就不能當答案」，模型只要規定沒直接寫到提問者就說找不到
+#   （不該說找不到的從 3 題變 9 題），所以改成先找有沒有比照、準用的規定
+TEACHER_RULES = """
+17. 下結論前，先找出規定寫的適用條件（對象、身分、單位、職級、期間、生效或廢止日期），對照提問者的情況和今天的日期。規定沒有直接寫到提問者時，先找資料裡有沒有寫他比照、準用或適用哪一條；確定都沒有，才說缺什麼。
+18. 規定裡有限制或例外時（例如某些人不適用、不給薪、有上限），也要一起說。
+19. 每一句講到資料內容的句子都要標段落編號，包括結論、說明某條規定不適用、已廢止、還沒生效的句子；只有最後的依據那一行不用標。
+20. 回答的最後另起一行，寫「依據：文件名稱 條次」；說找不到相關資訊時不用寫。"""
+
+
 # attempt：第幾次寫（0 開始）。不合格的題目會再寫，每次換一個隨機種子，寫出不同的版本，有一次合格就留下
+# 第 1 版第 15、16 條是第 2、4 次寫起才加（為了用上存好的答案）；第 2 版舊題目也全部重寫，所有規定從第 1 次就給
 def teach(client: OpenAI, item: dict, attempt: int) -> str:
-    rules = (openai_client.ANSWER_RULES + IDEAL_RULES + (NO_ANSWER_RULE if attempt >= 1 else "")
-             + (FORMAT_RULE if attempt >= 3 else ""))
+    rules = openai_client.ANSWER_RULES + IDEAL_RULES + NO_ANSWER_RULE + FORMAT_RULE + TEACHER_RULES
     messages = [{"role": "system", "content": rules},
                 {"role": "user", "content": user_message(item["context"], item["q"]["question"])}]
     extra = QWEN_SAMPLING["think"] if attempt == 0 else {**QWEN_SAMPLING["think"], "seed": attempt}
@@ -186,14 +142,21 @@ def teach(client: OpenAI, item: dict, attempt: int) -> str:
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
 
 # 人工抽查判不合格的示範答案：{題號: {第幾次寫的}}，那幾次的答案丟掉，讓老師再寫
-MANUAL_REJECT = {
-    "t0132": {2},  # 「東、南大門上班時段 7 時至 8 時開放」看起來像只開 1 小時（應該是上午 7 時到晚間 8 時）
-    # 問該交報告書還是提要表，沒說明甲類、乙類各是哪些出國，提問的人還是不知道要交哪一種
-    # 第 2、3 次寫的也一樣：重點清單沒要求說明類別，評審擋不下來，整題不用
-    "t0112": {1, 2, 3, 4},
-    # 第 4 次寫的：沒說執行中不得轉借（只說「應持續使用於原定目的」），最後「暫無適用法規」會讓人誤會
-    "t0046": {4},
-}
+# 第 1 版判掉的是 t0132 第 2 次、t0046 第 4 次（第 2 版全部重寫，那幾次的答案已經不用）；
+# t0112 每次都沒說明甲類、乙類是哪些出國，是題目的問題，第 2 版改在 question_review.py 刪掉整題
+MANUAL_REJECT: dict[str, set[int]] = {}
+
+# 依據那一行：另起一行，「依據：」開頭
+BASIS_LINE = re.compile(r"\n\s*依據[：:]")
+# 說「資料沒寫」的句子不用標引用：只有一部分資訊的題目，要說明缺什麼
+ABSENT = re.compile(r"找不到|沒有(寫|規定|提到|說明|明定)|未(提及|載明|規定|說明|明定|記載)")
+
+
+# 依據那一行之前，每一句都要標段落編號（041）：第 1 版的示範答案有一半有句子沒標，模型照著學
+def uncited_sentences(answer: str) -> list[str]:
+    body = BASIS_LINE.split(answer)[0]
+    sentences = [s.strip() for s in re.split(r"(?<=[。！？])|\n", body) if s.strip()]
+    return [s for s in sentences if not re.search(r"\[\d+\]", s) and not ABSENT.search(s)]
 
 
 # 篩選：回傳 (合格與否, 不合格的原因, 細節)
@@ -219,6 +182,11 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
     detail["citation_checks"] = checks
     if any(c["missing"] for c in checks):
         reasons.append("引用對不上")
+    if not q["should_refuse"]:
+        if uncited_sentences(answer):
+            reasons.append("有句子沒標引用")
+        if not BASIS_LINE.search(answer):
+            reasons.append("依據沒有另起一行")
     if contradicts(client, q["question"], answer, NO_THINK, detail, "consistency"):
         reasons.append("前後矛盾（不思考的評審）")
     if any(c in SIMPLIFIED for c in answer):
@@ -271,10 +239,13 @@ def main():
     parser.add_argument("--questions", type=Path, default=DATA / "questions_reviewed.jsonl")
     parser.add_argument("--attempts", type=int, default=4, help="不合格的題目最多寫幾次（含第一次）")
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
+    parser.add_argument("--ids", nargs="+", help="只寫這幾題（先小量試新的規定），結果另外存成 *_pilot.jsonl")
     args = parser.parse_args()
     if not openai_client.embedding_client.base_url.host.startswith("localhost"):
         raise SystemExit("要先設好企業內部版的 EMBEDDING_* 環境變數：訓練資料要用本機的轉向量模型搜段落，跟上線時一樣")
     questions = [json.loads(line) for line in args.questions.read_text(encoding="utf-8").splitlines() if line]
+    if args.ids:
+        questions = [q for q in questions if q["id"] in set(args.ids)]
 
     create_database()
     pdfs = {pdf.name: pdf.read_bytes() for pdf in sorted((DATA / "pdfs").glob("*.pdf"))}
@@ -311,9 +282,11 @@ def main():
                 {"role": "system", "content": openai_client.ANSWER_RULES},
                 {"role": "user", "content": user_message(item["context"], q["question"])},
                 {"role": "assistant", "content": item["answer"]}]})
-    (DATA / "answers.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out), encoding="utf-8")
-    (DATA / "examples.jsonl").write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in examples),
-                                        encoding="utf-8")
+    suffix = "_pilot" if args.ids else ""
+    (DATA / f"answers{suffix}.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out),
+                                                encoding="utf-8")
+    (DATA / f"examples{suffix}.jsonl").write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in examples),
+                                                 encoding="utf-8")
     print(f"合格 {len(examples)} / {len(out)}（{len(examples) / len(out) * 100:.0f}%）")
     for reason in sorted({r for row in out for r in row["reasons"]}):
         print(f"  {reason}：{sum(reason in row['reasons'] for row in out)}")
