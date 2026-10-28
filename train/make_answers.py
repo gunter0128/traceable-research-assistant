@@ -12,6 +12,7 @@
 #      - 不矛盾（Qwen 不思考、思考各判一次，任何一個判矛盾就丟掉）
 #      - 只用繁體中文、200 字以內
 #   不合格的題目最多再寫 3 次（換隨機種子），有一次合格就留下；第 1 版第一次跑只有 36% 合格（docs/decisions/039）
+#   段落裡沒有出題時記下的原文的不重寫：老師只能說資料沒寫，再寫也不會對（第 2 版，041）
 #   4. 一筆訓練資料 = 輸入（線上的回答原則，不含理想回答的寫法 + 搜到的段落 + 題目）→ 輸出（合格的示範答案）
 #      訓練時不給理想回答的寫法：模型要自己學會這些習慣
 #
@@ -106,6 +107,20 @@ def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list
     return context, seen, codes
 
 
+# 段落裡有沒有出題時記下的原文（evidence）：原文每 8 個字一組，四分之一以上找得到就算有（換行、空白先拿掉）
+# 第 2 版（041）：搜到出題那份規章的有 98%，但搜到寫著答案那一段的只有 87%（一半以上找得到才算）
+# 這裡用四分之一，寧可多寫幾次：一半的話，答案那段其實有搜到、只是跟原文差幾個字的 t0043、t0061 也會被當成沒搜到
+def evidence_retrieved(item: dict) -> bool:
+    context = re.sub(r"\s+", "", item["context"])
+
+    def found(evidence: str) -> bool:
+        text = re.sub(r"\s+", "", evidence)
+        grams = [text[i:i + 8] for i in range(max(1, len(text) - 7))]
+        return sum(gram in context for gram in grams) / len(grams) >= 0.25
+
+    return not item["q"].get("evidence") or any(found(e) for e in item["q"]["evidence"])
+
+
 def user_message(context: str, question: str) -> str:
     return f"資料：\n{context}\n\n問題：{question}\n\n{openai_client.CITATION_REMINDER}"
 
@@ -145,7 +160,8 @@ NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0
 # 人工抽查判不合格的示範答案：{題號: {第幾次寫的}}，那幾次的答案丟掉，讓老師再寫
 # 第 1 版判掉的是 t0132 第 2 次、t0046 第 4 次（第 2 版全部重寫，那幾次的答案已經不用）；
 # t0112 每次都沒說明甲類、乙類是哪些出國，是題目的問題，第 2 版改在 question_review.py 刪掉整題
-MANUAL_REJECT: dict[str, set[int]] = {}
+# 第 2 版：t0212 問盤點（第三十一點，沒搜到），老師拿第五十六點的定期檢核來答，剛好都是每年一次，評審放過
+MANUAL_REJECT: dict[str, set[int]] = {"t0212": {1}}
 
 # 依據那一行：另起一行，「依據：」開頭
 BASIS_LINE = re.compile(r"\n\s*依據[：:]")
@@ -285,11 +301,13 @@ def main():
 
     client = OpenAI(base_url=args.base_url, api_key="not-needed", max_retries=2)
     for attempt in range(args.attempts):
-        # 第 2 次起只重寫不合格的；有答案、但系統根本沒搜到出題那份規章的不重寫：段落裡沒有答案，再寫也不會對
+        # 第 2 次起只重寫不合格的；有答案、但沒搜到出題那份規章或寫著答案那一段的不重寫：段落裡沒有答案，再寫也不會對
         todo = [item for item in items if not item.get("passed") and (
-            attempt == 0 or item["q"]["should_refuse"] or set(item["q"]["sources"]) & set(item["codes"]))]
+            attempt == 0 or item["q"]["should_refuse"]
+            or (set(item["q"]["sources"]) & set(item["codes"]) and evidence_retrieved(item)))]
         if not todo:
             break
+        print(f"第 {attempt + 1} 次開始：要寫 {len(todo)} 題", flush=True)
         started = time.perf_counter()
         run_attempt(client, todo, attempt)
         print(f"第 {attempt + 1} 次：寫了 {len(todo)} 題，{(time.perf_counter() - started) / 60:.0f} 分鐘，"
