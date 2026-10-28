@@ -8,6 +8,7 @@
 #      - 有答案的題目至少標到一份出題時設定的文件；沒有答案的題目一個都不標
 #      - 引用對得上：每句的數字都在它標的那段（eval/common.py citation_checks）
 #      - 有答案的題目：依據那一行之前每一句都標了段落編號、依據另起一行（第 2 版，041）
+#      - 標的編號都是段落編號：老師有時把條次寫成 [7]，資料只有 [1]～[5]（第 2 版，041）
 #      - 不矛盾（Qwen 不思考、思考各判一次，任何一個判矛盾就丟掉）
 #      - 只用繁體中文、200 字以內
 #   不合格的題目最多再寫 3 次（換隨機種子），有一次合格就留下；第 1 版第一次跑只有 36% 合格（docs/decisions/039）
@@ -166,6 +167,17 @@ def uncited_sentences(answer: str) -> list[str]:
             and not (i == 0 and len(s) <= SHORT_CONCLUSION and not re.search(r"\d", s))]
 
 
+# 評審偶爾把幾項重點合併、或改寫成回答裡的句子（第 2 版第一次寫的 251 題裡 7 題），項目對不上就全部算沒提到：
+# 對不上時提醒照抄項目，再問一次（跟 eval/run.py 評審漏了欄位時再問一樣）
+ALIGN_REMINDER = "\n\n注意：must_include、must_not 的每一項，item 要照抄上面列的原文，一項對一項，不要合併或改寫。"
+
+
+def misaligned(verdict: dict, q: dict) -> bool:
+    judged = verdict.get("must_include", [])
+    items = {v.get("item") for v in judged}
+    return len(judged) != len(q["must_include"]) and not all(m in items for m in q["must_include"])
+
+
 # 篩選：回傳 (合格與否, 不合格的原因, 細節)
 def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
     q, answer = item["q"], item["answer"]
@@ -177,6 +189,9 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
         must_include=json.dumps(q["must_include"], ensure_ascii=False), nice_to_have="[]",
         must_not=json.dumps(q["must_not"], ensure_ascii=False))
     verdict = parse_json(chat(client, [{"role": "user", "content": prompt}], NO_THINK, timeout=300))
+    if verdict is not None and misaligned(verdict, q):
+        verdict = parse_json(chat(client, [{"role": "user", "content": prompt + ALIGN_REMINDER}], NO_THINK,
+                                  timeout=300)) or verdict
     detail["verdict"] = verdict
     if verdict is None or not correct_from(verdict, q):
         reasons.append("評審判不完全正確")
@@ -189,6 +204,9 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
     detail["citation_checks"] = checks
     if any(c["missing"] for c in checks):
         reasons.append("引用對不上")
+    # 第 2 版第一次寫的 251 題裡 32 題有：系統會把超出範圍的編號丟掉，使用者點不到出處
+    if any(not 1 <= int(n) <= len(item["seen"]) for n in re.findall(r"\[(\d+)\]", answer)):
+        reasons.append("標的編號不是段落編號")
     if not q["should_refuse"]:
         if uncited_sentences(answer):
             reasons.append("有句子沒標引用")
