@@ -163,6 +163,10 @@ NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0
 # 第 2 版：t0212 問盤點（第三十一點，沒搜到），老師拿第五十六點的定期檢核來答，剛好都是每年一次，評審放過
 MANUAL_REJECT: dict[str, set[int]] = {"t0212": {1}}
 
+# 老師偶爾冒出一個簡體字（「不適用于」），意思不會變，直接換成繁體；很多字都是簡體的照樣篩掉（SIMPLIFIED）
+# 第 2 版（041）：1,368 筆答案裡 17 筆有 SIMPLIFIED 沒收的簡體字，「于」最多
+STRAY_SIMPLIFIED = str.maketrans("于并内异标报万", "於並內異標報萬")
+
 # 依據那一行：另起一行，「依據：」開頭
 BASIS_LINE = re.compile(r"\n\s*依據[：:]")
 # 說「資料沒寫」的句子不用標引用：只有一部分資訊的題目，要說明缺什麼
@@ -257,6 +261,7 @@ def run_attempt(client: OpenAI, todo: list[dict], attempt: int) -> None:
     with ThreadPoolExecutor(max_workers=4) as pool:
         answers = list(pool.map(lambda item: teach(client, item, attempt), todo))
     for item, answer in zip(todo, answers, strict=True):
+        answer = answer and answer.translate(STRAY_SIMPLIFIED)
         _, marked = qa_service._extract_citations(answer, len(item["seen"]))
         item.update(answer=answer, cited=sorted({item["codes"][n - 1] for n in marked}), attempts=attempt + 1)
     with ThreadPoolExecutor(max_workers=4) as pool:
