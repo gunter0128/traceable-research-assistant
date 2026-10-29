@@ -207,9 +207,10 @@ def load_evidence(corpus: str) -> dict[str, list[str]]:
 # 接 Qwen 時的抽字設定：照 Qwen3.5 模型說明的建議，思考和不思考各一組（docs/decisions/034）
 # 不給的話 vLLM 用自己的預設（temperature 1、候選字不設限），偶爾會抽到機率很低的字，出現簡體字、亂碼
 #   top_k / top_p：只從最可能的前 20 個字、累積機率 0.8（或 0.95）以內挑；presence_penalty：已經出現過的字扣分，減少重複
+# 不思考（線上回答）改成 temperature 0（docs/decisions/042）：每次都選機率最高的字，同一題的答案才不會忽對忽錯
 QWEN_SAMPLING = {
     "think": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
-    "no_think": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
+    "no_think": {"temperature": 0.0, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
 }
 
 # 理想回答的寫法（docs/decisions/038），接在回答原則第 7 條後面，只在評估時加（--ideal-rules），線上的回答原則不動
