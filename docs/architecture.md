@@ -387,7 +387,7 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 
 ## 問答品質（B）—— 2026-10-20
 
-目標：讓使用者看得到每個答案的出處、適用條件和生效時間，判斷答案是不是適用於自己。用虛構的企業和學校知識庫評估，每個改動都量過效果（docs/decisions/016～024）。
+目標：讓使用者看得到每個答案的出處、適用條件和生效時間，判斷答案是不是適用於自己。每個改動都用考卷量過效果（docs/decisions/016～024、043）。
 
 ### 現在的問答流程
 
@@ -395,8 +395,8 @@ EventBridge（每小時）──▶ Lambda：trace-app-sweeper（worker.py → h
 qa_service.ask(db, workspace_id, owner_id, question)
   │  1. ownership 檢查、每日用量檢查
   │  2. 問題轉向量 → 搜最像的 5 段（SEARCH_LIMIT，020）
-  │       評估時可以先規劃再搜（PLANNER，028）：多幾筆搜尋各搜一次、輪流合併成 5 段。線上沒開
   │  3. 按文件分組：同一份文件的段落放在一起、照原文順序排（018）
+  │     同一份文件前後相連的段落合併成一段，只給一個編號（043）
   │  4. 查這幾份文件的第 0 段，取開頭 200 字（標題、生效日期通常在這裡，018）
   │  5. 組給模型看的資料：
   │       今天日期：2026 年 10 月 20 日
@@ -419,26 +419,23 @@ AskResponse { answer: "……14 天[1]。", citations: [ { number: 1, filename, 
 
 | 檔案 | 用途 |
 |---|---|
-| `eval/enterprise/` | 虛構公司「青嶼科技」：78 份文件（026 擴大）、58 題（練習題 41、考試題 17） |
-| `eval/school/` | 虛構國小「澄溪國小」：41 份文件、21 題，只拿來驗證改進是不是只對企業文件有效 |
-| `eval/expand_docs.py`、`eval/review_docs.py` | 擴大知識庫：產生干擾文件、檢查會不會改變答案（026） |
-| `eval/build_pdfs.py` | 文件轉成 PDF，自動檢查規則表的關鍵字都在文件裡 |
+| `eval/enterprise/` | 虛構公司「青嶼科技」：78 份文件（含舊版、子公司、草案等干擾文件，026）、70 題（練習題 48、測試題 22） |
+| `eval/labor/` | 真實的勞動法規：22 部（全國法規資料庫）、70 題（練習題 46、測試題 24，031） |
+| `eval/build_pdfs.py` | 青嶼科技的文件轉成 PDF，自動檢查規則表的關鍵字都在文件裡 |
 | `eval/run.py` | 用臨時資料庫跑評估：檢索、引用用程式判斷，回答用 gpt-4o 評審逐項對清單 |
-| `eval/rescore.py` | 改了評分規則之後，用新規則重新評分存下來的回答，不重新回答（030） |
-| `eval/retrieval.py` | 只比檢索（不生成答案），用來便宜地篩選搜尋的做法（028） |
-| `eval/openai_baseline.py` | 對照：OpenAI 現成的 file search（025、027） |
+| `eval/common.py` | 題目格式、引用對得上的檢查（038） |
 
-結果寫在 `docs/eval-results.md`。改到問答相關的程式時手動跑（不接 CI 的原因見 docs/decisions/024）。
+整理過的結果在 `docs/eval-results.md`，每次評估的原始紀錄在 `docs/eval-log.md`。改到問答相關的程式時手動跑（不接 CI 的原因見 docs/decisions/024）。
 
-## 企業內部版（MLOps）—— 2026-10-25 進行中
+## 企業內部版（MLOps）—— 2026-10-25
 
 同一份程式碼，兩種部署（decisions/034）：
 
 | | 公開展示版 | 企業內部版 |
 |---|---|---|
-| 放在哪 | AWS（Lambda、CloudFront，上面那套） | 公司內部的一台 GPU 主機（docker-compose，第 2 步） |
+| 放在哪 | AWS（Lambda、CloudFront，上面那套） | 公司內部的一台 GPU 主機 |
 | 轉向量 | OpenAI text-embedding-3-small（1536 維） | 本機的 Qwen3-Embedding-0.6B（1024 維，035） |
-| 回答 | OpenAI gpt-4o | 本機的 Qwen3.5-9B，不思考（036），之後換成訓練過的版本 |
+| 回答 | OpenAI gpt-4o | 本機的 Qwen3.5-9B 加上自己訓練的 LoRA adapter（第 1 版），不思考、temperature 0（036、042） |
 
 **用設定切換**（decisions/037）：`app/core/config.py` 的 `EMBEDDING_*`、`ANSWER_*` 不設定就是 OpenAI；設定了網址，就改接公司內部用 vLLM 架的服務（呼叫方式跟 OpenAI 一樣）。`openai_client` 的 `embedding_client`、`answer_client` 依設定建立，其他程式不用知道接的是哪一邊。向量欄位的維度跟著 `EMBEDDING_DIMENSION`（migration `e5a1b7c9d2f4`）。
 
@@ -447,7 +444,24 @@ AskResponse { answer: "……14 天[1]。", citations: [ { number: 1, filename, 
   qa_service.ask
     ├─ openai_client.embed_queries ──▶ vLLM：Qwen3-Embedding（問題前面加任務說明）
     ├─ chunk_repo.search_similar   ──▶ PostgreSQL + pgvector（1024 維）
-    └─ openai_client.generate_answer ─▶ vLLM：Qwen3.5-9B（建議的抽字設定、不思考）
+    └─ openai_client.generate_answer ─▶ vLLM：Qwen3.5-9B + LoRA adapter（不思考、temperature 0）
 ```
 
-步驟：① 系統可以設定接本機模型（037）→ ② 在實驗室用 docker 架起整套 → ③ 準備訓練資料 → ④ 訓練 adapter → ⑤ 過了上線門檻（036）才換上 → ⑥ 整理文件。
+### 訓練回答模型（`train/`，不會部署）
+
+訓練資料用臺北市政府的內部規章，跟考卷不重複（039）。整條流程都在本機：企業拿自己的機密文件做訓練資料時，出題、寫答案、檢查都不能送到外部。
+
+```
+collect_taipei.py   下載臺北市政府規章
+      ▼
+make_questions.py   Qwen（思考）讀規章出題、寫標準答案，程式檢查原文和數字
+      ▼
+question_review.py  人工逐題審查，刪掉、修正有問題的題目
+      ▼
+make_answers.py     系統搜段落（跟線上一樣）→ Qwen（思考）照理想回答的寫法寫示範答案
+                    → 篩選：評審判全對、引用對得上、不矛盾、只用繁體中文、200 字以內
+      ▼
+train_adapter.py    在 RTX 3090 上訓練 LoRA adapter（040），vLLM 直接掛上
+```
+
+結果：答案從 265 字變成 92 字，正確率沒有掉；跟 gpt-4o 比，見 `docs/eval-results.md`。

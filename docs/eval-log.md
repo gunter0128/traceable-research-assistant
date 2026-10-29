@@ -1,6 +1,6 @@
-# 評估結果
+# 評估紀錄
 
-每次評估的結果。題目和評分方式見 docs/decisions/016、017；逐題的明細在 eval/data/results/（不進 git）。
+每次跑 eval/run.py 自動加在最上面的原始紀錄，包括試過不用的做法。整理過的結果見 docs/eval-results.md；逐題的明細在 eval/data/results/（不進 git）。
 
 ## 2026-10-29 16:30　勞動法規　v2 taipei-v2-e1 temperature 0
 

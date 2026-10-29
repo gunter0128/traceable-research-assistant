@@ -1,8 +1,8 @@
 # Traceable Research Assistant
 
-A question-answering service over your own PDFs. Every sentence in an answer cites the passage it came from, and the system is built to keep running on AWS when things go wrong.
+A question-answering service over your own PDFs. Every sentence in an answer cites the passage it came from, so readers can check it themselves. It runs on AWS with OpenAI, or fully on-premises with a fine-tuned open model, so confidential documents never leave the company.
 
-> **中文摘要**　把碩士論文（多跳問答的 RAG 失敗分析）做成可以實際使用的知識問答服務：上傳 PDF 後提問，回答逐句附上出處。重點不在功能數量，而在可靠性與可驗證性：背景處理與自動重試、雲端故障演練、延遲與成本量測、CI/CD、告警，以及用評估資料集決定設計取捨。所有設計決策記錄在 [`docs/decisions/`](docs/decisions/)（中文）。
+> **中文摘要**　把碩士論文（RAG 失敗分析）做成可以實際使用的知識問答服務：上傳 PDF 後提問，回答逐句附上出處。先用 OpenAI 在 AWS 上做出可靠的後端（背景處理、自動重試、故障演練、成本控制、CI/CD、告警），再換成資料不出公司的地端版本：本機的轉向量模型，加上自己用 LoRA 訓練的 Qwen3.5-9B。用兩套考卷量出地端版跟 gpt-4o 的差距。所有設計決策照主線整理在 [`docs/decisions/`](docs/decisions/)（中文）。
 
 ## What it does
 
@@ -65,7 +65,7 @@ Token usage and cost are recorded for every call. Daily limits apply per user (U
 
 ### CI/CD
 GitHub Actions ([`ci-cd.yml`](.github/workflows/ci-cd.yml)) runs on every push:
-- Lint (ruff) and 135 tests against a real PostgreSQL + pgvector service container, plus a frontend type check and build.
+- Lint (ruff) and 154 tests against a real PostgreSQL + pgvector service container, plus a frontend type check and build.
 - On `main`, it deploys only what changed. AWS access uses short-lived OIDC credentials, so no keys are stored in GitHub.
 - Database migrations run before the Lambdas are updated, and must stay compatible with the previous version.
 - After deploying, it warms up the new image and checks that the API responds, failing the run if it does not.
@@ -74,25 +74,35 @@ GitHub Actions ([`ci-cd.yml`](.github/workflows/ci-cd.yml)) runs on every push:
 Email alarms cover only the problems that need a person: error logs, an invalid or exhausted OpenAI key, the system-wide limit being reached, a sweeper that has not run, and messages in the dead-letter queue. Alarms fire on state changes, so a week-long issue sends one email, not hundreds.
 
 ### Answer quality, evaluated
-I built two evaluation sets: a fictional company knowledge base (18 documents, 58 questions) and a fictional school (21 questions, a different domain used only for held-out checks). The questions focus on whether a rule actually *applies to the person asking*, for example a policy that differs by seniority, an outdated version, or a regional exception.
+Two exam sets, 140 questions in total:
+- **A fictional company** (78 documents). Besides the current rules, it contains outdated versions, a subsidiary's rules, drafts and announcements that take effect next year, so many questions test whether a rule actually *applies to the person asking*.
+- **22 real Taiwanese labor laws**, long documents where the answer is one article among hundreds.
 
-- Retrieval is scored by code. Answers are scored by an LLM judge against per-question checklists of required facts and forbidden claims.
+Questions are split into a practice set (94) used while improving the system and a held-out test set (46) run only at the end.
+
+- Answers are scored by a gpt-4o judge against per-question checklists of required facts and forbidden claims. The judge itself was audited and its rules corrected.
+- Citations are checked by code: every number in a sentence must appear in the passage it cites.
+- The same settings run twice can differ by up to 9 points, so comparisons use at least 2 runs.
 - Wrong answers are split into *not retrieved* versus *retrieved but misused*, the same two-layer analysis as my thesis.
-- Each change is kept only if it measurably helps. Rejected ideas are recorded with the reason.
+- Ideas that did not measurably help were dropped, with the measurements kept in [`docs/decisions/archive/`](docs/decisions/archive/).
 
-Comparing answer models (2 runs each, same prompt):
+### On-premises version with a fine-tuned model
+The same code switches by configuration: embeddings and answers can point at any OpenAI-compatible server. On one RTX 3090 with vLLM, it runs Qwen3-Embedding-0.6B and Qwen3.5-9B with a LoRA adapter I trained.
 
-| Question set | gpt-4o-mini | gpt-4o |
-|---|---|---|
-| Company, practice (41) | 76% / 73% | 80% / 80% |
-| Company, unseen exam (17) | 76% / 65% | 76% / 82% |
-| School, other domain (21) | 86% / 90% | 95% / 95% |
+- **Training data stays on-premises too.** Questions come from Taipei City Government internal regulations, which do not overlap with the exams. Qwen in thinking mode writes the questions, which I reviewed one by one, and the example answers. Each example must pass a local judge, the citation check and a consistency check, and a sample was checked by hand.
+- **Results on the practice set:**
 
-The biggest gap was on questions where a rule does *not* apply to the asker (73% → 95% across all sets), so answers now use gpt-4o. Details: [`docs/eval-results.md`](docs/eval-results.md).
+| | Correct | Key facts | Citations complete | Citations match | Misuse | Consistent | Avg. length |
+|---|---|---|---|---|---|---|---|
+| gpt-4o (2 runs) | 71% | 76% | 65% | 95% | 5% | 98% | 86 |
+| Qwen3.5-9B, untrained (2 runs) | 73% | 82% | 64% | 87% | 7% | 97% | 265 |
+| Qwen3.5-9B + LoRA (1 run) | 74% | 80% | 65% | 82% | 7% | 97% | 92 |
+
+Training cut answers from 265 to 92 characters without losing accuracy. A rule split across two adjacent chunks was the main cause of wrong citations; merging adjacent passages raised *citations match* to 91% (code-checked, 4 runs each). The final held-out evaluation is still to do. Details: [`docs/eval-results.md`](docs/eval-results.md).
 
 ## Design decisions
 
-Every non-trivial choice has a short decision record in [`docs/decisions/`](docs/decisions/) (24 so far, in Chinese), covering the context, the options considered and why one was chosen. A few examples:
+Every non-trivial choice has a short decision record in [`docs/decisions/`](docs/decisions/) (in Chinese), covering the context, the options considered, the measurements and why one was chosen. The [index](docs/decisions/README.md) follows the project's main line. A few examples:
 
 | # | Decision |
 |---|---|
@@ -103,12 +113,15 @@ Every non-trivial choice has a short decision record in [`docs/decisions/`](docs
 | 013 | Fixed HTTPS URL: API on Lambda behind CloudFront |
 | 014 | CI/CD with GitHub Actions and OIDC |
 | 017 | Evaluation method and how to avoid overfitting prompts to the test set |
-| 023 | Answer model comparison: gpt-4o-mini vs gpt-4o |
+| 034 | On-premises version: keep documents inside the company, train our own answer model |
+| 039 | How training data is generated and filtered |
+| 042 | Temperature 0, and the release bar: no worse than gpt-4o on any metric |
+| 043 | Merge adjacent passages of the same document |
 
 ## Tech stack
 
 **Backend:** Python 3.11, FastAPI, SQLAlchemy 2.0, Alembic, PostgreSQL + pgvector, pytest, ruff
-**AI:** OpenAI `text-embedding-3-small` (embeddings), gpt-4o (answers), pypdf, tiktoken
+**AI:** OpenAI `text-embedding-3-small` and gpt-4o; Qwen3-Embedding-0.6B and Qwen3.5-9B served with vLLM; LoRA training with PyTorch, Transformers and PEFT, tracked in MLflow; pypdf, tiktoken
 **Cloud:** AWS Lambda, SQS, S3, CloudFront, ECR, Secrets Manager, CloudWatch, EventBridge, IAM; Docker
 **CI/CD:** GitHub Actions
 **Frontend:** React, Vite, TypeScript, Tailwind CSS
@@ -144,7 +157,7 @@ npm run dev                       # http://localhost:5173, proxies API calls to 
 pytest
 ```
 
-135 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
+154 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
 
 ## API
 
@@ -167,8 +180,10 @@ pytest
 - Summary questions ("what is this paper about?") are a poor fit for top-5 passage retrieval.
 - The free-tier database sleeps after 5 minutes idle, so the first request afterwards takes about 2 s longer.
 - Evaluation is run manually when Q&A code changes. It is not in CI because it costs money and its results vary between runs.
+- The on-premises model still lags gpt-4o slightly on citation accuracy and misuse. When a question does not say which company the asker works for, it sometimes gives only the subsidiary's rule instead of listing both.
+- The on-premises version answers in about 4 s, gpt-4o in about 2 s. Even at temperature 0, vLLM does not always return the same answer twice.
 
 ## What's next
 
-- Multi-hop retrieval with a visible reasoning trace, which is the core idea of my thesis.
-- A load test following the same pattern as the rest of the project: write down the expected bottleneck, measure, change, measure again.
+- The final held-out evaluation of the on-premises version.
+- Package the on-premises version with docker-compose and deploy it on the lab machine.
