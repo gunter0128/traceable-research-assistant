@@ -4,6 +4,7 @@
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from sqlalchemy.orm import Session
@@ -81,7 +82,7 @@ def ask_with_passages(
             )
         with log.timed("qa_search") as fields:
             chunks = _search(db, workspace_id, searches, embeddings, SEARCH_LIMIT)
-            groups = _group_by_document(chunks)
+            groups = _merge_adjacent(_group_by_document(chunks))
             headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
             fields["chunks"] = len(chunks)
             fields["documents"] = len(groups)
@@ -214,6 +215,43 @@ def _group_by_document(chunks) -> list[tuple]:
     for chunk in chunks:
         groups.setdefault(chunk.document_id, []).append(chunk)
     return [(group[0].document, sorted(group, key=lambda c: c.chunk_index)) for group in groups.values()]
+
+
+# 給模型看的一段：可能是好幾個相連的 chunk 合併成的（_merge_adjacent）
+# 欄位名稱跟 chunk 一樣（document_id、content），後面組 context、組引用的程式不用分是哪一種
+@dataclass
+class Passage:
+    document_id: int
+    first_index: int
+    last_index: int
+    content: str
+
+
+# 同一份文件前後相連的段落（chunk_index 連號）合併成一段、只給一個編號（docs/decisions/043）
+# 一條規定常被切成相連的兩段，兩段都搜到時，模型知道答案出自哪一條，卻常標到另一半：標錯的句子約六成是這種
+# 產生新的 Passage，不改搜出來的 chunk：那是資料庫的物件，改了內容可能被寫回資料庫
+def _merge_adjacent(groups) -> list[tuple]:
+    merged = []
+    for document, group in groups:
+        passages = []
+        for chunk in group:
+            if passages and chunk.chunk_index == passages[-1].last_index + 1:
+                passages[-1].content = _join_overlap(passages[-1].content, chunk.content)
+                passages[-1].last_index = chunk.chunk_index
+            else:
+                passages.append(Passage(chunk.document_id, chunk.chunk_index, chunk.chunk_index, chunk.content))
+        merged.append((document, passages))
+    return merged
+
+
+# 接起相連的兩段：固定長度切段時，相鄰兩段重疊約 50 個 token（chunker.chunk_text）
+# 找「前一段的結尾 = 後一段的開頭」最長的那一截，只留一份；找不到（照結構切的段落不重疊）就直接換行接上
+# 至少 10 個字才算重疊，太短的可能只是剛好一樣
+def _join_overlap(first: str, second: str) -> str:
+    for size in range(min(len(first), len(second)), 9, -1):
+        if first.endswith(second[:size]):
+            return first + second[size:]
+    return first + "\n" + second
 
 
 # 把搜到的段落兜成給模型看的資料（docs/decisions/018）：

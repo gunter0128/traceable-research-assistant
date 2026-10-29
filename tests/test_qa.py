@@ -210,6 +210,36 @@ def test_context_header_is_truncated():
     assert "字" * (qa_service.DOCUMENT_HEADER_CHARS + 1) not in context
 
 
+# 測試：同一份文件相連的段落合併成一段、只給一個編號（docs/decisions/043）
+# 第 1、2 段相連：合併，切段時重疊的那一截只留一份；第 4 段不相連：自己一段；不同文件的不合併
+def test_merge_adjacent_chunks_of_same_document():
+    law = SimpleNamespace(id=1, filename="法.pdf")
+    other = SimpleNamespace(id=2, filename="其他.pdf")
+    chunks = [
+        SimpleNamespace(document_id=1, document=law, chunk_index=2, content="第 16 條失業給付按月發給，最長發給九個月。"),
+        SimpleNamespace(document_id=2, document=other, chunk_index=3, content="其他文件"),
+        SimpleNamespace(document_id=1, document=law, chunk_index=4, content="第 18 條"),
+        SimpleNamespace(document_id=1, document=law, chunk_index=1, content="第 15 條拒絕受理。第 16 條失業給付按月發給，"),
+    ]
+
+    groups = qa_service._merge_adjacent(qa_service._group_by_document(chunks))
+    context = qa_service._build_context(groups, {}, date(2026, 1, 1))
+
+    assert [[p.content for p in passages] for _, passages in groups] == [
+        ["第 15 條拒絕受理。第 16 條失業給付按月發給，最長發給九個月。", "第 18 條"],
+        ["其他文件"],
+    ]
+    assert "[1] 第 15 條拒絕受理。第 16 條失業給付按月發給，最長發給九個月。\n\n[2] 第 18 條" in context
+    assert "[3] 其他文件" in context
+    # 搜出來的 chunk 本身不改（資料庫的物件）
+    assert chunks[3].content == "第 15 條拒絕受理。第 16 條失業給付按月發給，"
+
+
+# 測試：相連但沒有重疊（照結構切的段落）就換行接上，不會亂吃字
+def test_join_overlap_without_overlap():
+    assert qa_service._join_overlap("第一段。", "第二段。") == "第一段。\n第二段。"
+
+
 # 測試：workspace 裡還沒有任何文件時問問題，不會噴錯，只是 citations 是空的
 def test_ask_with_no_documents_returns_empty_citations(client, monkeypatch):
     monkeypatch.setattr(

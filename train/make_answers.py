@@ -98,7 +98,8 @@ def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list
             print(f"  （連不上轉向量的模型，{RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）", flush=True)
             time.sleep(RETRY_WAIT)
     chunks = qa_service._search(db, workspace_id, searches, embeddings, qa_service.SEARCH_LIMIT)
-    groups = qa_service._group_by_document(chunks)
+    # 相連的段落合併，跟線上一樣（docs/decisions/043；第 2 版以前的資料是沒合併的）
+    groups = qa_service._merge_adjacent(qa_service._group_by_document(chunks))
     headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
     context = qa_service._build_context(groups, headers, TODAY)
     ordered = [(document, chunk) for document, group in groups for chunk in group]
