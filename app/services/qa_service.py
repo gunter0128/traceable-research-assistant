@@ -25,18 +25,6 @@ DOCUMENT_HEADER_CHARS = 200
 # 每次問答搜幾段給模型看（docs/decisions/020）
 SEARCH_LIMIT = 5
 
-# 搜尋前要不要先規劃要查什麼（docs/decisions/028、033）
-#   none：不規劃，只拿問題直接搜（線上用的）
-#   catalog：看過文件清單，規劃要去哪幾份文件找（openai_client.PLAN_CATALOG）。量過沒有讓答案變好，只當評估工具
-PLANNER = "none"
-
-# 規劃最多花幾秒：規劃失敗還可以只用問題搜，不能讓它把回答的時間吃掉
-PLAN_BUDGET_SECONDS = 8
-
-# 給規劃看的文件清單：最多幾份、每份附上開頭的幾個字（標題、生效日期、適用對象通常寫在最前面）
-PLAN_CATALOG_LIMIT = 200
-PLAN_CATALOG_HEADER_CHARS = 100
-
 
 # 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
 # 暫時性的（重試過還是不行）跟永久性的（設定有誤）分開，給使用者的訊息不同
@@ -74,14 +62,10 @@ def ask_with_passages(
     # 每一段各記花多久，回答「問答慢在哪」（docs/decisions/010）
     # 問題只記字數、不記內容：使用者的問題可能是未發表的研究
     try:
-        # 原本的問題一定會搜（整個 workspace），規劃出來的搜尋接在後面
-        searches = [openai_client.PlannedSearch(question), *_plan(db, workspace_id, question, deadline, record_usage)]
-        with log.timed("qa_embed", question_chars=len(question), queries=len(searches)):
-            embeddings = openai_client.embed_queries(
-                [search.query for search in searches], deadline=deadline, on_usage=record_usage
-            )
+        with log.timed("qa_embed", question_chars=len(question)):
+            [embedding] = openai_client.embed_queries([question], deadline=deadline, on_usage=record_usage)
         with log.timed("qa_search") as fields:
-            chunks = _search(db, workspace_id, searches, embeddings, SEARCH_LIMIT)
+            chunks = chunk_repo.search_similar(db, workspace_id, embedding, limit=SEARCH_LIMIT)
             groups = _merge_adjacent(_group_by_document(chunks))
             headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
             fields["chunks"] = len(chunks)
@@ -126,59 +110,8 @@ def ask_with_passages(
     return AskResponse(answer=answer, citations=citations), passages
 
 
-# 規劃要搜什麼（不含原本的問題）。PLANNER 是 none 就不規劃
-# 規劃失敗（OpenAI 出錯、超過 PLAN_BUDGET_SECONDS）不算問答失敗：退回只用問題搜，跟不規劃一樣
-def _plan(db: Session, workspace_id: int, question: str, deadline: float, on_usage) -> list:
-    if PLANNER == "none":
-        return []
-    catalog = [
-        (filename, " ".join(header.split())[:PLAN_CATALOG_HEADER_CHARS])
-        for filename, header in chunk_repo.document_headers(db, workspace_id, PLAN_CATALOG_LIMIT)
-    ]
-    plan_deadline = min(deadline, time.monotonic() + PLAN_BUDGET_SECONDS)
-    with log.timed("qa_plan", planner=PLANNER) as fields:
-        try:
-            searches = openai_client.plan_queries(question, catalog, deadline=plan_deadline, on_usage=on_usage)
-        except (openai_client.OpenAITemporaryError, openai_client.OpenAIPermanentError) as exc:
-            log.event("qa_plan_failed", logging.WARNING, error_type=type(exc).__name__)
-            searches = []
-        # 模型指定的檔名不在清單裡（抄錯、編出來的）：不限文件，改成整個 workspace 都搜
-        filenames = {filename for filename, _ in catalog}
-        for search in searches:
-            if search.document not in filenames:
-                search.document = None
-        fields["queries"] = len(searches)
-        fields["targeted"] = sum(search.document is not None for search in searches)
-    return searches
-
-
 def _date_text(day: date) -> str:
     return f"{day.year} 年 {day.month} 月 {day.day} 日"
-
-
-# 每一筆搜尋各搜 limit 段（有指定文件的只在那份文件裡搜），再輪流合併成 limit 段
-# 合併後的段數跟不規劃時一樣，給模型看的量不變
-def _search(db: Session, workspace_id: int, searches: list, embeddings: list, limit: int) -> list:
-    results = [
-        chunk_repo.search_similar(db, workspace_id, embedding, limit=limit, filename=search.document)
-        for search, embedding in zip(searches, embeddings, strict=True)
-    ]
-    return _merge_round_robin(results, limit)
-
-
-# 每一句搜到的段落，輪流各拿一段：先拿每一句的第 1 名，再拿每一句的第 2 名……拿滿 limit 段為止
-# 這樣每一句至少分到一段，不會被別句擠掉（論文的做法：每一種證據都留保底名額）
-# 已經拿過的段落跳過，名額讓給後面的；results 的第一個是原本的問題，所以它的第 1 名一定排第一
-def _merge_round_robin(results: list[list], limit: int) -> list:
-    merged, seen = [], set()
-    for rank in range(max((len(result) for result in results), default=0)):
-        for result in results:
-            if rank < len(result) and result[rank].id not in seen:
-                seen.add(result[rank].id)
-                merged.append(result[rank])
-                if len(merged) == limit:
-                    return merged
-    return merged
 
 
 # 資料裡找不到答案時，模型會說的話（跟 openai_client.ANSWER_RULES 第 7 條的說法一樣）
@@ -244,8 +177,8 @@ def _merge_adjacent(groups) -> list[tuple]:
     return merged
 
 
-# 接起相連的兩段：固定長度切段時，相鄰兩段重疊約 50 個 token（chunker.chunk_text）
-# 找「前一段的結尾 = 後一段的開頭」最長的那一截，只留一份；找不到（照結構切的段落不重疊）就直接換行接上
+# 接起相連的兩段：切段時相鄰兩段重疊約 50 個 token（chunker.chunk_text）
+# 找「前一段的結尾 = 後一段的開頭」最長的那一截，只留一份；找不到就直接換行接上
 # 至少 10 個字才算重疊，太短的可能只是剛好一樣
 def _join_overlap(first: str, second: str) -> str:
     for size in range(min(len(first), len(second)), 9, -1):

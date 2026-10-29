@@ -12,7 +12,7 @@
 #   python train_adapter.py --smoke                       試跑：最長的 16 筆訓練 2 步，看記憶體夠不夠、一筆多久
 #   python train_adapter.py --n 50                        訓練，adapter 存到 adapters/taipei-50
 #   python train_adapter.py                               全部的訓練資料，存到 adapters/taipei-all
-# 訓練完用 vLLM 直接掛上 adapter，用 vllm_loss.py 確認 vLLM 上的驗證集 loss 跟訓練時差不多
+# 訓練完用 vLLM 直接掛上 adapter，確認過 vLLM 上的驗證集 loss 跟訓練時差不多（docs/decisions/040）
 
 import argparse
 import hashlib

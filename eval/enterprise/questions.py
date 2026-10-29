@@ -270,7 +270,7 @@ QUESTIONS = [
 
 # ---------- 擴大知識庫之後補的「不能說」（docs/decisions/026）----------
 # 新加的舊版、子公司、草案、還沒生效的公告，裡面的數字都不是現在對青嶼科技員工有效的答案
-# 衝突檢查（eval/review_docs.py）找出「粗心的人會怎麼答錯」，補進題目，抓出把干擾文件當成答案的錯
+# 衝突檢查找出「粗心的人會怎麼答錯」，補進題目，抓出把干擾文件當成答案的錯
 # 只補「不能說」，題目和標準答案都不改
 SUB = "那是子公司青嶼雲端服務的規定"
 OLD24 = {months: days for months, days in R.LEAVE_TABLE_2024}
@@ -309,7 +309,7 @@ EXTRA_MUST_NOT = {
     "x06": [f"使用遠端桌面服務（{SUB}）"],
 }
 _ids = {q.id for q in QUESTIONS}
-# 新增的題目（docs/decisions/031）一樣跑過衝突檢查（eval/review_docs.py --all-docs），補上它找到的陷阱
+# 新增的題目（docs/decisions/031）一樣跑過衝突檢查，補上它找到的陷阱
 EXTRA_MUST_NOT |= {
     "v07": [f"{money(OLD['P1-P3'][0])}（那是修訂前的標準）", f"{money(LS['P1-P3'][0])}（{SUB}）"],
     "v09": [f"每次 {money(R.SUB_OVERTIME_MEAL)}（{SUB}）"],

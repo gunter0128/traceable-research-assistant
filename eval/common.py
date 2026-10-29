@@ -1,4 +1,4 @@
-# 各套知識庫（企業 enterprise、學校 school、勞動法規 labor）共用的題目格式和輸出（docs/decisions/016、017、031）
+# 兩套考卷（企業 enterprise、勞動法規 labor）共用的題目格式和輸出（docs/decisions/016、017、031）
 #
 # 每題的欄位：
 #   type          general 普通題 / conditional 條件題 / persona 身分題 / version 版本題 /
@@ -25,12 +25,6 @@ CORPORA = {
         "domain": "公司內部規章",
         "footer": "本文件為虛構公司「青嶼科技」之測試資料，僅供系統評估使用，非真實公司規章。",
         "workspace": "青嶼科技規章",
-    },
-    "school": {
-        "title": "澄溪國小",
-        "domain": "學校規章與家長須知",
-        "footer": "本文件為虛構學校「澄溪國小」之測試資料，僅供系統評估使用，非真實學校規章。",
-        "workspace": "澄溪國小規章",
     },
     # 真實的長文件（docs/decisions/031）：從全國法規資料庫下載的勞動法規
     "labor": {

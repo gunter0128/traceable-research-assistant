@@ -335,7 +335,7 @@ def process_document(db: Session, document: Document) -> Document:
         if not text:
             raise NoExtractableText
         with log.timed("chunked") as fields:
-            pieces = chunker.chunk(text)
+            pieces = chunker.chunk_text(text)
             fields["chunks"] = len(pieces)
         lease.beat(done=0, total=len(pieces))
         # 先清掉這份文件舊的 chunk：同一份文件處理兩次（重試）結果跟處理一次一樣，不會變兩倍

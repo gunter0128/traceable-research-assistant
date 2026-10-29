@@ -1,5 +1,5 @@
 # 把知識庫的文件（簡單的 Markdown）轉成 PDF（B3）
-# 用法（專案資料夾）：.venv\Scripts\python -m eval.build_pdfs --corpus enterprise（或 school）
+# 用法（專案資料夾）：.venv\Scripts\python -m eval.build_pdfs --corpus enterprise
 #   讀 eval/<corpus>/docs/，產生到 eval/<corpus>/pdfs/
 # 做法：Markdown → HTML（規章的版面）→ 用 Edge 的無頭模式「列印成 PDF」
 # 使用者上傳的就是 PDF，用 PDF 測才測得到解析（中文、表格）的問題
@@ -80,12 +80,6 @@ def check_facts(corpus: str, pdfs: Path) -> None:
     # 去掉所有空白再比對：PDF 解析出來的文字可能在任何地方斷行
     rules = importlib.import_module(f"eval.{corpus}.rules")
     facts = list(getattr(rules, "FACTS", []))
-    # 擴大知識庫時加的新文件（catalog.py），每份文件大綱裡規定一定要出現的字也一起檢查（docs/decisions/026）
-    try:
-        catalog = importlib.import_module(f"eval.{corpus}.catalog")
-        facts += [(spec["code"], fact) for spec in catalog.GENERATED + catalog.DERIVED for fact in spec["facts"]]
-    except ModuleNotFoundError:
-        pass
     if not facts:
         print("沒有要檢查的關鍵字，跳過")
         return

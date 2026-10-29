@@ -1,14 +1,14 @@
-# 用虛構的知識庫評估問答系統（B4，docs/decisions/017）
+# 用考卷評估問答系統（docs/decisions/017）
 #
-# 兩套知識庫：enterprise（青嶼科技，平常改進用）、school（澄溪國小，只拿來驗證改進能不能用到別的領域）
+# 兩套考卷：enterprise（虛構的青嶼科技規章，docs/decisions/016）、labor（真實的勞動法規，docs/decisions/031）
 #
 # 用法（專案資料夾）：
 #   1. 開一個臨時資料庫（跟 CI 一樣，用完就丟）：
 #        docker run -d --rm --name eval-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=eval -p 55433:5432 pgvector/pgvector:pg16
 #   2. 產生 PDF（第一次才需要）：.venv\Scripts\python -m eval.build_pdfs --corpus enterprise
 #   3. 跑評估：.venv\Scripts\python -m eval.run --corpus enterprise --runs 2 --note "基準"
-#        企業題目預設只跑練習題（--split dev）；最後確認時才跑 --split test
-#        學校題目整套都是考試題，預設全部跑
+#        預設只跑練習題（--split dev）；最後確認時才跑 --split test
+#        接實驗室的模型：加上 --answer-base-url http://localhost:8000/v1 --model <adapter 名稱>
 #   4. 用完關掉資料庫：docker stop eval-pg
 #
 # 流程：
@@ -18,7 +18,7 @@
 #   檢索（程式判斷）：該引用的文件有沒有在系統搜到的段落裡
 #   引用（程式判斷）：該引用的文件有沒有在答案標的 [1][2] 裡（逐句引用，docs/decisions/021）
 #   回答（gpt-4o 對清單）：一定要提到的有沒有提到、不能說的有沒有出現、該拒答的有沒有拒答
-# 花費：企業 58 題每跑一輪，系統回答約 0.04 美元、評審約 0.3 美元；學校 21 題約三分之一
+# 花費：兩套練習題（94 題）各跑一輪，評審約 0.5 美元（含 --consistency）；回答接自己的模型不用錢
 
 import os
 
@@ -30,7 +30,6 @@ os.environ["DATABASE_URL"] = os.environ.get(
 import argparse
 import importlib
 import json
-import random
 import re
 import subprocess
 import time
@@ -44,7 +43,7 @@ from sqlalchemy import text
 
 # 載入所有資料表的定義，create_all 才建得出來
 from app import models  # noqa: F401
-from app.core import chunker, openai_client, s3_client
+from app.core import openai_client, s3_client
 from app.core.config import settings
 from app.core.db import Base, SessionLocal, engine
 from app.repositories import chunk_repo, document_repo, workspace_repo
@@ -53,12 +52,12 @@ from eval.common import CORPORA, TYPE_NAMES, citation_checks, evidence_rate
 
 EVAL = Path(__file__).parent
 RESULTS = EVAL / "data" / "results"
-REPORT = EVAL.parent / "docs" / "eval-results.md"
+REPORT = EVAL.parent / "docs" / "eval-log.md"
 JUDGE_MODEL = "gpt-4o"
 TAIWAN = timezone(timedelta(hours=8))
 
 def doc_code(name: str) -> str:
-    # 「HR-02 第 6 條」或「HR-02_員工手冊_2026年版.pdf」→ HR-02；學校的是 S-01
+    # 「HR-02 第 6 條」或「HR-02_員工手冊_2026年版.pdf」→ HR-02；勞動法規的是 L-01
     return re.match(r"[A-Z]+-\d+", name).group()
 
 
@@ -154,7 +153,7 @@ def judge(client: OpenAI, domain: str, q: dict, response: str, cited: list[str])
 # ---------- 不矛盾（docs/decisions/038）----------
 # 上面的評審遇到前後矛盾時以開頭的結論為準：開頭對了，後面自相矛盾也不會扣分
 # 這裡另外問一次，只判斷回答本身有沒有矛盾，不管內容對不對
-# 分開問：上面的量尺一個字都不改，之前存下來的回答也能補評（eval/trust_checks.py），分數可以互相比
+# 分開問：上面的量尺一個字都不改，分數可以跟加這項之前的結果互相比
 CONSISTENCY_PROMPT = """你是問答系統的評審。這次只判斷一件事：系統的回答本身有沒有前後矛盾。
 
 算矛盾：
@@ -213,30 +212,6 @@ QWEN_SAMPLING = {
     "no_think": {"temperature": 0.0, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
 }
 
-# 理想回答的寫法（docs/decisions/038），接在回答原則第 7 條後面，只在評估時加（--ideal-rules），線上的回答原則不動
-# 用途：量「不訓練、只改規定」能做到多少；也是寫訓練資料時給示範答案的規定
-# 跟回答原則一樣只放通用的寫法，不放任何領域的詞（docs/decisions/019）
-IDEAL_RULES = """
-8. 第一句直接給結論，不要先鋪陳背景或重述問題。
-9. 用自己的話整理重點，不要整段照抄資料的原文；同一件事只講一次。
-10. 結論只有一個：不要寫到一半改口或更正自己，前後的數字要一致。
-11. 只詳細說明適用於提問者的規定；不適用的（舊版、草案、還沒生效、別的單位），用一句話說明為什麼不適用，不要列出它的內容。
-12. 問題沒說明對象或情況、答案又因此不同時，每種情況各用一句話說明。
-13. 每一句標的段落編號，那一段裡要真的寫著這句話講的內容。
-14. 整個回答盡量在 150 字以內，需要分情況時可以稍長；不要加「結論」「說明」這類標題。"""
-
-# 把回答原則裡不夠精準的地方講清楚（--precise-rules），只在評估時加，線上的回答原則不動
-# 來源：訓練後的回答在練習題上錯在哪（選錯適用的規定、漏了限制、說明不適用的句子沒標引用、依據那一行時有時無）
-# 跟回答原則一樣只放通用的寫法，不放任何領域的詞（docs/decisions/019）
-PRECISE_RULES = """
-8. 下結論前，先找出規定寫的適用條件（對象、身分、單位、職級、期間、生效或廢止日期），逐一對照提問者的情況和今天的日期；條件不符合的規定，不能當成答案。
-9. 規定裡有限制或例外時（例如某些人不適用、不給薪、有上限），也要一起說。
-10. 每一句講到資料內容的句子都要標段落編號，包括說明某條規定不適用、已廢止、還沒生效的句子；只有最後的依據那一行不用標。
-11. 回答的最後一定要另起一行，寫「依據：文件名稱 條次」；說找不到相關資訊時不用寫。"""
-# 問題後面的提醒也一起改：模型對離問題最近的指示比較會照做（docs/decisions/021）
-PRECISE_REMINDER = "（回答時，每一句講到資料內容的句子，句尾都要標上依據的段落編號，例如 [1]；說明某條規定不適用的句子也要標。）"
-
-
 # 回答的服務暫時連不上時（例如接實驗室自己架的模型，SSH 轉接斷線），等一下再試，最多等約 5 分鐘
 # 不然斷一下整輪評估就中止了（docs/decisions/034）。秒數只算成功的那一次
 ASK_RETRIES = 10
@@ -279,7 +254,6 @@ def run_once(db, user, workspace, questions, client, domain, today, evidence=Non
 
 
 # 評一題：retrieved 是搜到的文件代號，cited 是答案標出來的文件代號
-# 抽出來是為了讓別的比較對象（例如 OpenAI 的 file search，eval/openai_baseline.py）用同一套標準打分
 # evidence：依據的原文找到了幾成（0～1），題目沒有附原文的是 None
 def score(client, domain, q, answer, retrieved, cited, seconds, evidence=None) -> dict:
     required = sorted({doc_code(s) for s in q["sources"]})
@@ -363,15 +337,7 @@ def pct(v):
 def report_markdown(summaries: list[dict], meta: dict) -> str:
     lines = [f"## {meta['time']}　{meta['title']}　{meta['note']}", "",
              (f"題目 {meta['split']}｜commit `{meta['commit']}`｜{meta['chunks']} 段｜搜尋前 {meta['top_k']} 段｜"
-              # OpenAI 的 file search 沒有「規劃」這個設定（它自己改寫查詢），meta 裡沒有就不寫
-              + (f"規劃 {meta['planner']}｜" if "planner" in meta else "")
-              + (f"切段 {meta['chunker']}｜" if meta.get("chunker", "fixed") != "fixed" else "")
-              + (f"轉向量 {meta['embedding']}｜" if meta.get("embedding", "text-embedding-3-small") != "text-embedding-3-small" else "")
-              + f"回答 {meta.get('model', '—')}"
-              + {True: "（思考）", False: "（不思考）"}.get(meta.get("thinking"), "")
-              + ("｜加上理想回答的規定" if meta.get("ideal_rules") else "")
-              + ("｜加上精準的規定" if meta.get("precise_rules") else "")
-              + f"｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
+              f"轉向量 {meta['embedding']}｜回答 {meta['model']}｜{len(summaries)} 輪｜評審 {JUDGE_MODEL}"), ""]
     lines += ["| 題型 | 題數 | 全對 | 檢索完整 | 引用完整 | 誤用 | 重點涵蓋 | 拒答正確 | 答錯：沒搜到 / 搜到還錯 |",
               "|---|---|---|---|---|---|---|---|---|"]
     for key in ["all", *TYPE_NAMES]:
@@ -399,56 +365,26 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=1, help="同樣的設定跑幾輪（看分數的隨機波動）")
     parser.add_argument("--note", default="", help="這次評估的說明，例如「基準」「改 prompt」")
-    parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / school 學校 / labor 勞動法規")
+    parser.add_argument("--corpus", choices=CORPORA, required=True, help="enterprise 企業 / labor 勞動法規")
     parser.add_argument("--model", help="回答用的模型（不指定就用系統現在的 GENERATION_MODEL），用來比較不同模型")
     parser.add_argument("--answer-base-url",
                         help="回答改接這個 OpenAI 格式的服務，例如 http://localhost:8000/v1（實驗室用 vLLM 架的開源模型，"
                              "docs/decisions/034）；轉向量照設定（環境變數 EMBEDDING_BASE_URL 等，docs/decisions/037）")
-    parser.add_argument("--no-think", action="store_true",
-                        help="搭配 --answer-base-url：關掉開源模型的思考模式（Qwen 系列），直接回答")
     parser.add_argument("--answer-timeout", type=float,
                         help="回答每次最多等幾秒（預設看設定的 answer_timeout，OpenAI 是 15 秒）；本機架的模型比較慢時調大")
-    parser.add_argument("--top-k", type=int,
-                        help="每次搜幾段（不指定就用系統現在的設定 qa_service.SEARCH_LIMIT），用來比較不同段數")
-    parser.add_argument("--planner", choices=["none", "catalog", "oracle"],
-                        help="搜尋前怎麼規劃（不指定就用系統現在的設定 qa_service.PLANNER，docs/decisions/028）；"
-                             "oracle 直接用題目的標準答案指定要去哪幾份文件找，量「找文件做到完美時」的上限（031）")
-    parser.add_argument("--oracle-recall", type=float, default=1.0,
-                        help="搭配 --planner oracle：每份該用的文件被選到的機率，模擬不完美的規劃器（docs/decisions/033）")
-    parser.add_argument("--oracle-wrong", type=int, default=0,
-                        help="搭配 --planner oracle：另外多選幾份不相關的文件")
-    parser.add_argument("--chunker", choices=["fixed", "structured"],
-                        help="切段的方式（不指定就用系統現在的設定 chunker.STRATEGY，docs/decisions/032）")
     parser.add_argument("--split", choices=["dev", "test", "all"],
-                        help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部；"
-                             "不指定的話：有練習題就只跑練習題，沒有（學校）就全部跑")
+                        default="dev", help="dev 練習題（平常改進用）/ test 考試題（只在最後確認時跑）/ all 全部")
     parser.add_argument("--consistency", action="store_true",
                         help="另外請評審判斷每個回答前後有沒有矛盾（docs/decisions/038），每 70 題約多 0.15 美元")
-    parser.add_argument("--per-type", type=int,
-                        help="每種題型只抽幾題（固定隨機種子，每次抽到的一樣）：很慢的設定先小規模試，例如思考模式")
-    parser.add_argument("--ids", nargs="+", help="只跑這幾題（題號），例如只挑真實情境的題目")
-    parser.add_argument("--ideal-rules", action="store_true",
-                        help="回答原則後面加上理想回答的寫法（IDEAL_RULES，docs/decisions/038），線上的回答原則不動")
-    parser.add_argument("--precise-rules", action="store_true",
-                        help="回答原則後面加上講得更精準的規定，問題後面的提醒也換掉（PRECISE_RULES），線上的回答原則不動")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
-    if args.top_k:
-        qa_service.SEARCH_LIMIT = args.top_k
-    if args.chunker:
-        chunker.STRATEGY = args.chunker
-    if args.planner:
-        qa_service.PLANNER = args.planner
     if args.model:
         openai_client.GENERATION_MODEL = args.model
-        # 系統的價目表只有線上用的模型，比較別的模型時補上（每百萬 token 的美元：輸入, 輸出）
-        openai_client.PRICES_PER_MILLION.setdefault("gpt-4o-mini", (Decimal("0.15"), Decimal("0.60")))
     if args.answer_base_url:
         # 自己架的模型不用付 API 的錢（GPU 的成本另外算），價目表記 0
         openai_client.PRICES_PER_MILLION.setdefault(openai_client.GENERATION_MODEL, (Decimal(0), Decimal(0)))
-        extra = dict(QWEN_SAMPLING["no_think" if args.no_think else "think"])
-        if args.no_think:
-            extra["chat_template_kwargs"] = {"enable_thinking": False}
+        # 跟上線一樣：不思考、temperature 0（docs/decisions/036、042）
+        extra = {**QWEN_SAMPLING["no_think"], "chat_template_kwargs": {"enable_thinking": False}}
         openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
     if args.answer_timeout:
         openai_client.ANSWER_TIMEOUT = args.answer_timeout
@@ -457,18 +393,7 @@ def main():
     # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
     usage_service.ensure_within_quota = lambda db, owner_id: None
 
-    questions, split = load_questions(args.corpus, args.split)
-    if args.per_type:
-        questions = sample_per_type(questions, args.per_type)
-    if args.ids:
-        questions = [q for q in questions if q["id"] in set(args.ids)]
-    if args.ideal_rules:
-        openai_client.ANSWER_RULES += IDEAL_RULES
-    if args.precise_rules:
-        openai_client.ANSWER_RULES += PRECISE_RULES
-        openai_client.CITATION_REMINDER = PRECISE_REMINDER
-    if args.planner == "oracle":
-        qa_service._plan = oracle_plan(questions, args.oracle_recall, args.oracle_wrong)
+    questions = load_questions(args.corpus, args.split)
     client = OpenAI(api_key=settings.openai_api_key)
     db, user, workspace, chunks = setup_knowledge_base(args.corpus)
 
@@ -483,82 +408,35 @@ def main():
 
     meta = {"time": datetime.now(TAIWAN).strftime("%Y-%m-%d %H:%M"), "note": args.note or "（無說明）",
             "corpus": args.corpus, "title": corpus["title"], "commit": current_commit(), "chunks": chunks,
-            "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": split,
-            "planner": qa_service.PLANNER if args.planner != "oracle" or args.oracle_recall == 1 and not args.oracle_wrong
-            else f"oracle（選對 {args.oracle_recall:.0%}、多選 {args.oracle_wrong} 份）",
-            "chunker": chunker.STRATEGY,
+            "top_k": qa_service.SEARCH_LIMIT, "model": openai_client.GENERATION_MODEL, "split": args.split,
             "answer_endpoint": args.answer_base_url or settings.answer_base_url or "OpenAI",
             # 轉向量的模型看設定（環境變數 EMBEDDING_BASE_URL 等，docs/decisions/037），預設是 OpenAI
             "embedding": openai_client.EMBEDDING_MODEL,
-            # 有沒有開思考模式：接 OpenAI 時沒有這回事；接自己的服務時看送出去的參數（命令列或環境變數設定的）
-            "thinking": None if openai_client.answer_client is openai_client.client else
-            (openai_client.answer_extra_body or {}).get("chat_template_kwargs", {}).get("enable_thinking", True),
-            "ideal_rules": args.ideal_rules,
-            "precise_rules": args.precise_rules,
             "answer_sampling": openai_client.answer_extra_body}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
 
 
-# 完美的規劃器（docs/decisions/031）：換掉 qa_service._plan，參數跟它一樣
-# 照題目標準答案的出處（sources），每一份該用的文件各搜一次（只在那份文件裡搜），再跟原本的問題輪流合併
-# 量的是「該用的文件一定找得到時，答案最多能好多少」
-#
-# recall、wrong：模擬「不完美的規劃器」（docs/decisions/033）
-#   全部題目該用的文件合起來，剛好拿掉 (1 - recall) 的份數（題目不多，逐份擲骰子會偏離設定的比例），
-#   另外每題多選 wrong 份不相關的文件
-#   量的是「模型要準到幾成，才換得到分數」。隨機種子固定，每次跑選到的文件都一樣
-def oracle_plan(questions: list[dict], recall: float = 1.0, wrong: int = 0):
-    by_question = {q["question"]: q for q in questions}
-    pairs = sorted((q["id"], code) for q in questions for code in {doc_code(s) for s in q["sources"]})
-    random.Random(f"drop-{recall}").shuffle(pairs)
-    dropped = set(pairs[:round(len(pairs) * (1 - recall))])
-
-    def plan(db, workspace_id, question, deadline, on_usage):
-        filenames = {doc_code(f): f for f, _ in chunk_repo.document_headers(db, workspace_id, 10_000)}
-        q = by_question.get(question)
-        if q is None:
-            return []
-        required = sorted({doc_code(s) for s in q["sources"]})
-        picked = [code for code in required if (q["id"], code) not in dropped]
-        others = sorted(code for code in filenames if code not in required)
-        picked += random.Random(f"{q['id']}-wrong-{wrong}").sample(others, min(wrong, len(others)))
-        return [openai_client.PlannedSearch(question, filenames[code]) for code in picked]
-    return plan
-
-
-# 讀題目：不指定 split 的話，有練習題就只跑練習題，沒有（學校）就全部跑
-def load_questions(corpus: str, split: str | None) -> tuple[list[dict], str]:
+# 讀題目：split 是 dev（練習題）、test（考試題）或 all（全部）
+def load_questions(corpus: str, split: str = "dev") -> list[dict]:
     lines = (EVAL / corpus / "questions.jsonl").read_text(encoding="utf-8").splitlines()
     questions = [json.loads(line) for line in lines if line]
-    split = split or ("dev" if any(q["split"] == "dev" for q in questions) else "all")
-    if split != "all":
-        questions = [q for q in questions if q["split"] == split]
-    return questions, split
-
-
-# 每種題型各抽 n 題，題型的比例跟整套一樣；順序照原本的題目順序
-def sample_per_type(questions: list[dict], n: int) -> list[dict]:
-    rng = random.Random(2026)
-    picked = set()
-    for qtype in TYPE_NAMES:
-        group = [q["id"] for q in questions if q["type"] == qtype]
-        picked.update(rng.sample(group, min(n, len(group))))
-    return [q for q in questions if q["id"] in picked]
+    return questions if split == "all" else [q for q in questions if q["split"] == split]
 
 
 def current_commit() -> str:
     return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
 
 
-# 存逐題明細（eval/data/results/，不進 git），並把摘要加到 docs/eval-results.md 最上面
+# 存逐題明細（eval/data/results/，不進 git），並把摘要加到 docs/eval-log.md 最上面
 def save_results(meta: dict, summaries: list[dict], all_rows: list[list[dict]], tag: str) -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
     out = RESULTS / f"{datetime.now(TAIWAN):%Y%m%d-%H%M}_{meta['corpus']}_{tag}.json"
     out.write_text(json.dumps({"meta": meta, "summaries": summaries, "runs": all_rows}, ensure_ascii=False, indent=1),
                    encoding="utf-8")
     markdown = report_markdown(summaries, meta)
-    header = "# 評估結果\n\n每次評估的結果。題目和評分方式見 docs/decisions/016、017；逐題的明細在 eval/data/results/（不進 git）。\n\n"
+    header = ("# 評估紀錄\n\n每次跑 eval/run.py 自動加在最上面的原始紀錄，包括試過不用的做法。"
+              "整理過的結果見 docs/eval-results.md；逐題的明細在 eval/data/results/（不進 git）。\n\n")
     old = REPORT.read_text(encoding="utf-8").removeprefix(header) if REPORT.exists() else ""
     REPORT.write_text(header + markdown + "\n" + old, encoding="utf-8")
     print("\n" + markdown)

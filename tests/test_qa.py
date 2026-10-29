@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from app.core import openai_client, s3_client
-from app.repositories import chunk_repo
 from app.services import qa_service
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
@@ -25,7 +24,7 @@ def _fake_s3(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_queries（問題和規劃出來的搜尋句子一起送），兩個都擋掉
+    # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_queries，兩個都擋掉
     monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
     monkeypatch.setattr(openai_client, "embed_queries", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
 
@@ -257,136 +256,3 @@ def test_ask_with_no_documents_returns_empty_citations(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["citations"] == []
-
-
-# ---------- 搜尋前的規劃（docs/decisions/028）----------
-
-# 測試：每一句搜到的段落輪流各拿一段，重複的跳過，拿滿就停
-def test_merge_round_robin():
-    a, b, c, d, e = (SimpleNamespace(id=i) for i in range(5))
-    results = [[a, b, c], [b, d], [e]]  # 原本的問題搜到 a b c；第二句搜到 b d；第三句搜到 e
-
-    # 第一輪：各句的第 1 名 a b e；第二輪：第一句的第 2 名 b 已經拿過、跳過，換第二句的第 2 名 d，拿滿 4 段
-    assert qa_service._merge_round_robin(results, 4) == [a, b, e, d]
-    # 全部加起來不到 10 段，有幾段給幾段（第三輪才輪到第一句的第 3 名 c）
-    assert qa_service._merge_round_robin(results, 10) == [a, b, e, d, c]
-    assert qa_service._merge_round_robin([[a, b, c]], 2) == [a, b]  # 只有一句（不規劃）：就是原本的前幾名
-
-
-# 測試：規劃的 JSON 照規定的格式和模型偶爾用的別種格式都接受，去掉空白和重複，最多 4 筆；格式不對就當作沒有規劃
-P = openai_client.PlannedSearch
-
-
-@pytest.mark.parametrize(
-    ("content", "expected"),
-    [
-        ('{"queries": ["特休天數", "特休 例外"]}', [P("特休天數"), P("特休 例外")]),
-        ('{"queries": [{"item": "主要規定", "query": "特休天數"}]}', [P("特休天數", item="主要規定")]),
-        (('{"searches": [{"item": "例外與不適用", "document": "約聘.pdf", "query": "特休"}, '
-          '{"item": "主要規定", "document": null, "query": "特休"}]}'),
-         [P("特休", "約聘.pdf", "例外與不適用"), P("特休", None, "主要規定")]),
-        ('{"queries": [" a ", "a", "", "b", "c", "d", "e"]}', [P("a"), P("b"), P("c"), P("d")]),
-        ('{"queries": "不是清單"}', []),
-        ("不是 JSON", []),
-        (None, []),
-    ],
-)
-def test_parse_plan(content, expected):
-    assert openai_client._parse_plan(content) == expected
-
-
-# 記下送去轉向量的句子：看得出搜了哪幾句
-def _record_embedded(monkeypatch) -> list:
-    embedded = []
-
-    def fake_embed(texts, **kwargs):
-        embedded.append(texts)
-        return [[0.1] * 1536 for _ in texts]
-
-    monkeypatch.setattr(openai_client, "embed_queries", fake_embed)
-    monkeypatch.setattr(openai_client, "generate_answer", lambda question, context, **kwargs: "答案[1]")
-    return embedded
-
-
-# 測試：開了規劃，原本的問題和規劃出來的句子都會拿去搜
-def test_planned_queries_are_searched(client, monkeypatch):
-    embedded = _record_embedded(monkeypatch)
-    monkeypatch.setattr(qa_service, "PLANNER", "catalog")
-    monkeypatch.setattr(openai_client, "plan_queries", lambda question, catalog, **kwargs: [P("方法"), P("限制")])
-    token = _register_and_login(client, "erin@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id)
-
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "方法是什麼？"}, headers=_auth_headers(token))
-
-    assert response.status_code == 200
-    assert embedded == [["方法是什麼？", "方法", "限制"]]
-
-
-# 測試：規劃失敗不算問答失敗，退回只用問題搜
-def test_planner_failure_falls_back_to_question(client, monkeypatch):
-    embedded = _record_embedded(monkeypatch)
-    monkeypatch.setattr(qa_service, "PLANNER", "catalog")
-
-    def broken_planner(question, catalog, **kwargs):
-        raise openai_client.OpenAITemporaryError()
-
-    monkeypatch.setattr(openai_client, "plan_queries", broken_planner)
-    token = _register_and_login(client, "frank@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id)
-
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "方法是什麼？"}, headers=_auth_headers(token))
-
-    assert response.status_code == 200
-    assert embedded == [["方法是什麼？"]]
-
-
-
-# 測試：catalog 規劃會拿到文件清單；指定的檔名在清單裡，就只在那份文件裡搜，
-# 不在清單裡（模型抄錯、編出來的）就改成整個 workspace 都搜
-def test_catalog_planner_targets_listed_documents_only(client, monkeypatch):
-    _record_embedded(monkeypatch)
-    monkeypatch.setattr(qa_service, "PLANNER", "catalog")
-    seen = {}
-
-    def fake_planner(question, catalog, **kwargs):
-        seen["catalog"] = catalog
-        return [P("方法", "thesis.pdf"), P("限制", "編出來的.pdf")]
-
-    monkeypatch.setattr(openai_client, "plan_queries", fake_planner)
-    searched_in = []
-    real_search = chunk_repo.search_similar
-
-    def recording_search(db, workspace_id, embedding, limit=5, filename=None):
-        searched_in.append(filename)
-        return real_search(db, workspace_id, embedding, limit=limit, filename=filename)
-
-    monkeypatch.setattr(chunk_repo, "search_similar", recording_search)
-    token = _register_and_login(client, "heidi@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id)
-
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "方法是什麼？"}, headers=_auth_headers(token))
-
-    assert response.status_code == 200
-    assert [filename for filename, _ in seen["catalog"]] == ["thesis.pdf"]
-    assert "Multi-hop retrieval" in seen["catalog"][0][1]  # 清單附上文件開頭
-    assert searched_in == [None, "thesis.pdf", None]  # 原本的問題、指定的文件、編出來的檔名改成不限
-
-# 測試：預設不規劃（線上現在的行為），不會多花一次呼叫
-def test_no_planning_by_default(client, monkeypatch):
-    embedded = _record_embedded(monkeypatch)
-
-    def must_not_call(question, catalog, **kwargs):
-        raise AssertionError("不規劃時不該呼叫")
-
-    monkeypatch.setattr(openai_client, "plan_queries", must_not_call)
-    token = _register_and_login(client, "grace@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id)
-
-    client.post(f"/workspaces/{ws_id}/ask", json={"question": "方法是什麼？"}, headers=_auth_headers(token))
-
-    assert qa_service.PLANNER == "none"
-    assert embedded == [["方法是什麼？"]]

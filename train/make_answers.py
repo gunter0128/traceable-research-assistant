@@ -2,9 +2,9 @@
 #
 # 每一題：
 #   1. 系統搜段落：跟真實使用一模一樣（本機的轉向量模型、只拿問題搜、找 5 段、照文件分組、附檔名和文件開頭）
-#   2. 老師寫示範答案：Qwen 思考模式，回答原則加上理想回答的寫法（eval/run.py 的 IDEAL_RULES）和下面的第 15～20 條
+#   2. 老師寫示範答案：Qwen 思考模式，回答原則加上理想回答的寫法（IDEAL_RULES）和下面的第 15～20 條
 #   3. 篩選，全部通過才留下：
-#      - 評審（Qwen 不思考，train/judge_check.py 量過跟 gpt-4o 一致 96%）對照標準答案：完全正確
+#      - 評審（Qwen 不思考，量過跟 gpt-4o 一致 96%，docs/decisions/039）對照標準答案：完全正確
 #      - 有答案的題目至少標到一份出題時設定的文件；沒有答案的題目一個都不標
 #      - 引用對得上：每句的數字都在它標的那段（eval/common.py citation_checks）
 #      - 有答案的題目：依據那一行之前每一句都標了段落編號、依據另起一行（第 2 版，041）
@@ -27,7 +27,7 @@ import os
 os.environ["EVAL_DATABASE_URL"] = os.environ.get("TRAIN_DATABASE_URL", "postgresql+psycopg://postgres:test@localhost:55433/train")
 
 # isort: off
-from eval.run import CONSISTENCY_PROMPT, IDEAL_RULES, JUDGE_PROMPT, QWEN_SAMPLING, build_knowledge_base, seen_passage
+from eval.run import CONSISTENCY_PROMPT, JUDGE_PROMPT, QWEN_SAMPLING, _align, build_knowledge_base, seen_passage
 # isort: on
 
 import argparse
@@ -49,7 +49,6 @@ from app.models.workspace import Workspace
 from app.repositories import chunk_repo
 from app.services import qa_service
 from eval.common import citation_checks
-from train.judge_check import correct_from
 from train.llm import RETRIES, RETRY_WAIT, chat, parse_json
 from train.make_questions import SIMPLIFIED
 
@@ -86,18 +85,17 @@ def existing_knowledge_base(expected: int):
 
 # 跟 qa_service.ask_with_passages 同一套步驟：搜段落、照文件分組、組成給模型看的資料
 def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list[str]]:
-    searches = [openai_client.PlannedSearch(question)]
     # 轉向量的服務也一樣：連不上就等一下再試（第二次跑時轉向量的模型停了，程式一開始就中斷）
     for attempt in range(RETRIES):
         try:
-            embeddings = openai_client.embed_queries([question])
+            [embedding] = openai_client.embed_queries([question])
             break
         except openai_client.OpenAITemporaryError:
             if attempt == RETRIES - 1:
                 raise
             print(f"  （連不上轉向量的模型，{RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）", flush=True)
             time.sleep(RETRY_WAIT)
-    chunks = qa_service._search(db, workspace_id, searches, embeddings, qa_service.SEARCH_LIMIT)
+    chunks = chunk_repo.search_similar(db, workspace_id, embedding, limit=qa_service.SEARCH_LIMIT)
     # 相連的段落合併，跟線上一樣（docs/decisions/043；第 2 版以前的資料是沒合併的）
     groups = qa_service._merge_adjacent(qa_service._group_by_document(chunks))
     headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
@@ -120,6 +118,18 @@ def evidence_retrieved(item: dict) -> bool:
         return sum(gram in context for gram in grams) / len(grams) >= 0.25
 
     return not item["q"].get("evidence") or any(found(e) for e in item["q"]["evidence"])
+
+
+# 理想回答的寫法（docs/decisions/038），接在回答原則第 7 條後面，只給老師看：學生（上線的模型）從示範答案學這些習慣
+# 跟回答原則一樣只放通用的寫法，不放任何領域的詞（docs/decisions/019）
+IDEAL_RULES = """
+8. 第一句直接給結論，不要先鋪陳背景或重述問題。
+9. 用自己的話整理重點，不要整段照抄資料的原文；同一件事只講一次。
+10. 結論只有一個：不要寫到一半改口或更正自己，前後的數字要一致。
+11. 只詳細說明適用於提問者的規定；不適用的（舊版、草案、還沒生效、別的單位），用一句話說明為什麼不適用，不要列出它的內容。
+12. 問題沒說明對象或情況、答案又因此不同時，每種情況各用一句話說明。
+13. 每一句標的段落編號，那一段裡要真的寫著這句話講的內容。
+14. 整個回答盡量在 150 字以內，需要分情況時可以稍長；不要加「結論」「說明」這類標題。"""
 
 
 def user_message(context: str, question: str) -> str:
@@ -157,6 +167,14 @@ def teach(client: OpenAI, item: dict, attempt: int) -> str:
 
 
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+
+
+# 照評分程式的算法，從評審的判斷算出「全對」（跟 eval/run.py 的 score 一樣）
+def correct_from(verdict: dict, q: dict) -> bool:
+    included = _align(q["must_include"], verdict.get("must_include", []))
+    violated = _align(q["must_not"], verdict.get("must_not", []))
+    refusal_ok = bool(verdict.get("refused")) == q["should_refuse"]
+    return refusal_ok and not any(violated) and (not included or all(included))
 
 # 人工抽查判不合格的示範答案：{題號: {第幾次寫的}}，那幾次的答案丟掉，讓老師再寫
 # 第 1 版判掉的是 t0132 第 2 次、t0046 第 4 次（第 2 版全部重寫，那幾次的答案已經不用）；
@@ -248,7 +266,7 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
     return not reasons, reasons, detail
 
 
-# 不矛盾的評審：量過（train/judge_check.py --consistency），gpt-4o 判成矛盾的 19 個，不思考放過 7 個、思考放過 3 個
+# 不矛盾的評審：量過（docs/decisions/039），gpt-4o 判成矛盾的 19 個，不思考放過 7 個、思考放過 3 個
 # 都不夠準，所以兩個都判，任何一個判矛盾就丟掉；思考的比較慢，只判其他檢查都通過的
 def contradicts(client: OpenAI, question: str, answer: str, extra: dict, detail: dict, key: str) -> bool:
     verdict = parse_json(chat(client, [{"role": "user", "content": CONSISTENCY_PROMPT.format(
