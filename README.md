@@ -2,7 +2,7 @@
 
 A question-answering service over your own PDFs. Every sentence in an answer cites the passage it came from, so readers can check it themselves. It runs on AWS with OpenAI, or fully on-premises with a fine-tuned open model, so confidential documents never leave the company.
 
-> **中文摘要**　把碩士論文（RAG 失敗分析）做成可以實際使用的知識問答服務：上傳 PDF 後提問，回答逐句附上出處。先用 OpenAI 在 AWS 上做出可靠的後端（背景處理、自動重試、故障演練、成本控制、CI/CD、告警），再換成資料不出公司的地端版本：本機的轉向量模型，加上自己用 LoRA 訓練的 Qwen3.5-9B。用兩套考卷量出地端版跟 gpt-4o 的差距。所有設計決策照主線整理在 [`docs/decisions/`](docs/decisions/)（中文）。
+> **中文摘要**　把碩士論文（RAG 失敗分析）做成可以實際使用的知識問答服務：上傳 PDF 後提問，回答逐句附上出處。先用 OpenAI 在 AWS 上做出可靠的後端（背景處理、自動重試、故障演練、成本控制、CI/CD、告警），再換成資料不出公司的地端版本：本機的轉向量模型，加上自己用 LoRA 訓練的 Qwen3.5-9B。用兩套考卷跟 gpt-4o 比：在沒看過的考試題上，地端版每一項都不輸 gpt-4o。所有設計決策照主線整理在 [`docs/decisions/`](docs/decisions/)（中文）。
 
 ## What it does
 
@@ -100,15 +100,16 @@ Questions are split into a practice set (94) used while improving the system and
 The same code switches by configuration: embeddings and answers can point at any OpenAI-compatible server. On one RTX 3090 with vLLM, it runs Qwen3-Embedding-0.6B and Qwen3.5-9B with a LoRA adapter I trained.
 
 - **Training data stays on-premises too.** Questions come from Taipei City Government internal regulations, which do not overlap with the exams. Qwen in thinking mode writes the questions, which I reviewed one by one, and the example answers. Each example must pass a local judge, the citation check and a consistency check, and a sample was checked by hand.
-- **Results on the practice set:**
+- **Final evaluation on the held-out test set** (46 questions never used while improving the on-premises version; both editions run on the same day with the same code):
 
-| | Correct | Key facts | Citations complete | Citations match | Misuse | Consistent | Avg. length |
-|---|---|---|---|---|---|---|---|
-| gpt-4o (2 runs) | 71% | 76% | 65% | 95% | 5% | 98% | 86 |
-| Qwen3.5-9B, untrained (2 runs) | 73% | 82% | 64% | 87% | 7% | 97% | 265 |
-| Qwen3.5-9B + LoRA (1 run) | 74% | 80% | 65% | 82% | 7% | 97% | 92 |
+| | Correct | Key facts | Citations complete | Citations match | Misuse | Consistent | Avg. length | Seconds |
+|---|---|---|---|---|---|---|---|---|
+| gpt-4o | 70% | 76% | 65% | 93% | 9% | 98% | 95 | 1.7 |
+| Qwen3.5-9B + LoRA, on-premises | 83% | 85% | 72% | 97% | 2% | 98% | 93 | 4.2 |
 
-Training cut answers from 265 to 92 characters without losing accuracy. A rule split across two adjacent chunks was the main cause of wrong citations; merging adjacent passages raised *citations match* to 91% (code-checked, 4 runs each). The final held-out evaluation is still to do. Details: [`docs/eval-results.md`](docs/eval-results.md).
+On unseen questions the on-premises model is not worse than gpt-4o on any metric. Only 12 questions differ between the two (9 to 3), which could still be chance, so the claim is "not worse", not "better". On the practice set (2 runs) it falls short of the release bar I set beforehand on three metrics, by 1 to 6 points: citations complete 61% vs 65%, citations match 89% vs 95%, misuse 6% vs 5%. The bar was not changed after seeing the results.
+
+Training cut answers from 265 to about 93 characters without losing accuracy. A rule split across two adjacent chunks was the main cause of wrong citations; merging adjacent passages fixed most of them. Details: [`docs/eval-results.md`](docs/eval-results.md), [decision 044](docs/decisions/044-最後驗收.md).
 
 ## Design decisions
 
@@ -127,6 +128,7 @@ Every non-trivial choice has a short decision record in [`docs/decisions/`](docs
 | 039 | How training data is generated and filtered |
 | 042 | Temperature 0, and the release bar: no worse than gpt-4o on any metric |
 | 043 | Merge adjacent passages of the same document |
+| 044 | Final evaluation on the held-out test set |
 
 ## Tech stack
 
@@ -190,10 +192,9 @@ pytest
 - Summary questions ("what is this paper about?") are a poor fit for top-5 passage retrieval.
 - The free-tier database sleeps after 5 minutes idle, so the first request afterwards takes about 2 s longer.
 - Evaluation is run manually when Q&A code changes. It is not in CI because it costs money and its results vary between runs.
-- The on-premises model still lags gpt-4o slightly on citation accuracy and misuse. When a question does not say which company the asker works for, it sometimes gives only the subsidiary's rule instead of listing both.
-- The on-premises version answers in about 4 s, gpt-4o in about 2 s. Even at temperature 0, vLLM does not always return the same answer twice.
+- The comparison with gpt-4o covers this task only (Chinese regulation Q&A with this system's retrieval and prompt), and the test set was run once. When a question does not say which company the asker works for, the on-premises model sometimes gives only the subsidiary's rule instead of listing both.
+- The on-premises version answers in about 4 s, gpt-4o in under 2 s. Even at temperature 0, vLLM does not always return the same answer twice.
 
 ## What's next
 
-- The final held-out evaluation of the on-premises version.
-- Package the on-premises version with docker-compose and deploy it on the lab machine.
+- Package the on-premises version with docker-compose so it starts with one command on a company GPU server.
