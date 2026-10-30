@@ -37,7 +37,7 @@ def test_query_prefix_only_on_questions(monkeypatch):
     monkeypatch.setattr(openai_client, "embedding_client", service)
     monkeypatch.setattr(settings, "embedding_query_prefix", "Instruct: 找出回答問題的段落\nQuery:")
 
-    openai_client.embed_queries(["特休幾天？"])
+    openai_client.embed_query("特休幾天？")
     openai_client.embed_texts(["第一段", "第二段"])
 
     assert service.calls[0]["input"] == ["Instruct: 找出回答問題的段落\nQuery:特休幾天？"]
@@ -50,7 +50,7 @@ def test_no_prefix_by_default(monkeypatch):
     monkeypatch.setattr(openai_client, "embedding_client", service)
     monkeypatch.setattr(settings, "embedding_query_prefix", "")
 
-    openai_client.embed_queries(["特休幾天？"])
+    openai_client.embed_query("特休幾天？")
 
     assert service.calls[0]["input"] == ["特休幾天？"]
 
@@ -62,7 +62,7 @@ def test_answer_uses_configured_service(monkeypatch):
     monkeypatch.setattr(openai_client, "answer_extra_body", {"chat_template_kwargs": {"enable_thinking": False}})
     monkeypatch.setattr(openai_client, "ANSWER_TIMEOUT", 45)
 
-    answer = openai_client.generate_answer("特休幾天？", "資料")
+    answer = openai_client.generate_answer("回答原則", "資料和問題")
 
     assert answer == "答案 [1]。"
     assert service.calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}

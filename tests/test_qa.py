@@ -6,27 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core import openai_client, s3_client
+from app.core import openai_client
 from app.services import qa_service
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
 
 
-# autouse=True 的意思是：「不用等有人在參數列表裡點名要你，這個檔案裡每一個測試開始前，自動先跑我」
-# 所以這個 fixture 不會看到有人呼叫他
-@pytest.fixture(autouse=True)
-def _fake_s3(monkeypatch):
-    fake_bucket = {}
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
-
-
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_queries，兩個都擋掉
+    # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_query，兩個都擋掉
     monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
-    monkeypatch.setattr(openai_client, "embed_queries", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
 
 
 def _register_and_login(client, email):
@@ -89,8 +79,8 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
     # 把丟給模型的資料記下來，最後檢查裡面有檔名和今天日期
     sent = {}
 
-    def fake_generate(question, context, **kwargs):
-        sent["context"] = context
+    def fake_generate(system, user, **kwargs):
+        sent["user"] = user
         return "這是生成的答案[1]"
 
     monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
@@ -114,15 +104,15 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
     assert body["citations"][0]["number"] == 1
     assert body["citations"][0]["filename"] == "thesis.pdf"
     assert "Multi-hop retrieval" in body["citations"][0]["content"]
-    assert "今天日期" in sent["context"]
-    assert "【文件】thesis.pdf" in sent["context"]
+    assert "今天日期" in sent["user"]
+    assert "【文件】thesis.pdf" in sent["user"]
 
 
 # 測試：答案沒有標任何來源（例如說找不到）時，不附引用（docs/decisions/021）
 # 以前會把搜到的段落全部當引用，變成「答案說找不到，下面卻附了一份文件」
 def test_answer_without_markers_has_no_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda question, context, **kwargs: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda system, user, **kwargs: "文件中找不到相關資訊"
     )
     token = _register_and_login(client, "erin@example.com")
     ws_id = _create_workspace(client, token)
@@ -140,7 +130,7 @@ def test_answer_without_markers_has_no_citations(client, monkeypatch):
 
 # 測試：模型有回答、卻忘了標編號時，退回列出搜到的段落（安全網，docs/decisions/021）
 def test_answer_without_markers_falls_back_to_retrieved_passages(client, monkeypatch):
-    monkeypatch.setattr(openai_client, "generate_answer", lambda question, context, **kwargs: "核心方法是多跳檢索")
+    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, **kwargs: "核心方法是多跳檢索")
     token = _register_and_login(client, "frank@example.com")
     ws_id = _create_workspace(client, token)
     _upload_pdf(client, token, ws_id, text="Multi-hop retrieval is the core method")
@@ -186,7 +176,7 @@ def test_context_groups_chunks_by_document_with_header_and_date():
     headers = {1: "員工手冊（2026 年版）\n生效日期：2026 年 1 月 1 日", 2: "員工手冊（2025 年版）"}
 
     groups = qa_service._group_by_document(chunks)
-    context = qa_service._build_context(groups, headers, date(2026, 10, 20))
+    context = qa_service.build_context(groups, headers, date(2026, 10, 20))
 
     assert context == (
         "今天日期：2026 年 10 月 20 日\n\n"
@@ -203,7 +193,7 @@ def test_context_header_is_truncated():
     doc = SimpleNamespace(id=1, filename="a.pdf")
     chunk = SimpleNamespace(document_id=1, document=doc, chunk_index=5, content="內容")
 
-    context = qa_service._build_context(qa_service._group_by_document([chunk]), {1: "字" * 500}, date(2026, 1, 1))
+    context = qa_service.build_context(qa_service._group_by_document([chunk]), {1: "字" * 500}, date(2026, 1, 1))
 
     assert "文件開頭：" + "字" * qa_service.DOCUMENT_HEADER_CHARS + "\n" in context
     assert "字" * (qa_service.DOCUMENT_HEADER_CHARS + 1) not in context
@@ -222,7 +212,7 @@ def test_merge_adjacent_chunks_of_same_document():
     ]
 
     groups = qa_service._merge_adjacent(qa_service._group_by_document(chunks))
-    context = qa_service._build_context(groups, {}, date(2026, 1, 1))
+    context = qa_service.build_context(groups, {}, date(2026, 1, 1))
 
     assert [[p.content for p in passages] for _, passages in groups] == [
         ["第 15 條拒絕受理。第 16 條失業給付按月發給，最長發給九個月。", "第 18 條"],
@@ -242,7 +232,7 @@ def test_join_overlap_without_overlap():
 # 測試：workspace 裡還沒有任何文件時問問題，不會噴錯，只是 citations 是空的
 def test_ask_with_no_documents_returns_empty_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda question, context, **kwargs: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda system, user, **kwargs: "文件中找不到相關資訊"
     )
 
     token = _register_and_login(client, "dave@example.com")

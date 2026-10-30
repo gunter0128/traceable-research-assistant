@@ -46,7 +46,6 @@ from app.core import openai_client
 from app.core.db import SessionLocal
 from app.models.document import Document
 from app.models.workspace import Workspace
-from app.repositories import chunk_repo
 from app.services import qa_service
 from eval.common import citation_checks
 from train.llm import RETRIES, RETRY_WAIT, chat, parse_json
@@ -83,23 +82,20 @@ def existing_knowledge_base(expected: int):
     return None, None
 
 
-# 跟 qa_service.ask_with_passages 同一套步驟：搜段落、照文件分組、組成給模型看的資料
+# 跟線上問答用同一個函式搜段落、組成給模型看的資料（qa_service.retrieve、build_context）
+# 相連的段落合併也跟線上一樣（docs/decisions/043；第 2 版以前的資料是沒合併的）
 def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list[str]]:
     # 轉向量的服務也一樣：連不上就等一下再試（第二次跑時轉向量的模型停了，程式一開始就中斷）
     for attempt in range(RETRIES):
         try:
-            [embedding] = openai_client.embed_queries([question])
+            groups, headers = qa_service.retrieve(db, workspace_id, question)
             break
         except openai_client.OpenAITemporaryError:
             if attempt == RETRIES - 1:
                 raise
             print(f"  （連不上轉向量的模型，{RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）", flush=True)
             time.sleep(RETRY_WAIT)
-    chunks = chunk_repo.search_similar(db, workspace_id, embedding, limit=qa_service.SEARCH_LIMIT)
-    # 相連的段落合併，跟線上一樣（docs/decisions/043；第 2 版以前的資料是沒合併的）
-    groups = qa_service._merge_adjacent(qa_service._group_by_document(chunks))
-    headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
-    context = qa_service._build_context(groups, headers, TODAY)
+    context = qa_service.build_context(groups, headers, TODAY)
     ordered = [(document, chunk) for document, group in groups for chunk in group]
     seen = [seen_passage(document.filename, headers.get(document.id, ""), chunk.content) for document, chunk in ordered]
     codes = [document.filename.split("_")[0] for document, _ in ordered]
@@ -132,10 +128,6 @@ IDEAL_RULES = """
 14. 整個回答盡量在 150 字以內，需要分情況時可以稍長；不要加「結論」「說明」這類標題。"""
 
 
-def user_message(context: str, question: str) -> str:
-    return f"資料：\n{context}\n\n問題：{question}\n\n{openai_client.CITATION_REMINDER}"
-
-
 # 第 1 版漏了一條：文件找不到答案時，老師會寫「找不到……[1][3][4]」，拿段落當沒有答案的證據（沒有答案的題目 42 題只 1 題合格）
 NO_ANSWER_RULE = "\n15. 文件裡找不到答案時，直接說「文件中找不到相關資訊」，並說明缺什麼；這時不要標段落編號。"
 
@@ -159,9 +151,9 @@ TEACHER_RULES = """
 # attempt：第幾次寫（0 開始）。不合格的題目會再寫，每次換一個隨機種子，寫出不同的版本，有一次合格就留下
 # 第 1 版第 15、16 條是第 2、4 次寫起才加（為了用上存好的答案）；第 2 版舊題目也全部重寫，所有規定從第 1 次就給
 def teach(client: OpenAI, item: dict, attempt: int) -> str:
-    rules = openai_client.ANSWER_RULES + IDEAL_RULES + NO_ANSWER_RULE + FORMAT_RULE + TEACHER_RULES
+    rules = qa_service.ANSWER_RULES + IDEAL_RULES + NO_ANSWER_RULE + FORMAT_RULE + TEACHER_RULES
     messages = [{"role": "system", "content": rules},
-                {"role": "user", "content": user_message(item["context"], item["q"]["question"])}]
+                {"role": "user", "content": qa_service.user_message(item["context"], item["q"]["question"])}]
     extra = QWEN_SAMPLING["think"] if attempt == 0 else {**QWEN_SAMPLING["think"], "seed": attempt}
     return chat(client, messages, extra, timeout=900)
 
@@ -346,8 +338,8 @@ def main():
         if passed:
             # 訓練時給的是線上的回答原則（不含理想回答的寫法），跟上線時模型看到的一模一樣
             examples.append({"id": q["id"], "type": q["type"], "messages": [
-                {"role": "system", "content": openai_client.ANSWER_RULES},
-                {"role": "user", "content": user_message(item["context"], q["question"])},
+                {"role": "system", "content": qa_service.ANSWER_RULES},
+                {"role": "user", "content": qa_service.user_message(item["context"], q["question"])},
                 {"role": "assistant", "content": item["answer"]}]})
     suffix = "_pilot" if args.ids else ""
     (DATA / f"answers{suffix}.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out),

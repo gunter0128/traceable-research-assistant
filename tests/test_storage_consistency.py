@@ -16,20 +16,17 @@ from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
 
 
-# 假的 S3：比其他測試檔多記一個「最後修改時間」，對帳要靠它判斷檔案放多久了
+# 對帳要靠「最後修改時間」判斷檔案放多久了：conftest.py 的 fake_s3 把每個檔案都當成剛放進去，
+# 這裡改成照 modified 記的時間（key → 最後修改時間），沒記的才當成剛放進去
 @pytest.fixture
-def bucket(monkeypatch):
-    files = {}
-    now = datetime.now(timezone.utc)
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: files.__setitem__(key, now))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: valid_pdf_bytes())
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: files.pop(key, None))
+def modified(monkeypatch, fake_s3):
+    times = {}
     monkeypatch.setattr(
         s3_client,
         "list_files",
-        lambda prefix: [(key, modified) for key, modified in files.items() if key.startswith(prefix)],
+        lambda prefix: [(key, times.get(key, datetime.now(timezone.utc))) for key in fake_s3 if key.startswith(prefix)],
     )
-    return files
+    return times
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +57,7 @@ def _s3_error(*args, **kwargs):
 
 
 # 測試：檔案存進 S3 了，建紀錄卻失敗 → 把剛存的檔案刪掉，不留孤兒檔案
-def test_upload_removes_file_when_record_fails(client, monkeypatch, bucket):
+def test_upload_removes_file_when_record_fails(client, monkeypatch, fake_s3):
     token = _register_and_login(client, "alice@example.com")
     ws_id = _create_workspace(client, token)
 
@@ -73,11 +70,11 @@ def test_upload_removes_file_when_record_fails(client, monkeypatch, bucket):
     with pytest.raises(RuntimeError):
         _upload(client, token, ws_id)
 
-    assert bucket == {}
+    assert fake_s3 == {}
 
 
 # 測試：刪文件時 S3 出錯 → 紀錄還是要刪掉（先刪紀錄），只留下孤兒檔案，不會留下「看得到卻壞掉」的文件
-def test_delete_document_succeeds_even_if_s3_fails(client, monkeypatch, bucket):
+def test_delete_document_succeeds_even_if_s3_fails(client, monkeypatch, fake_s3):
     token = _register_and_login(client, "bob@example.com")
     ws_id = _create_workspace(client, token)
     document_id = _upload(client, token, ws_id).json()["id"]
@@ -87,43 +84,45 @@ def test_delete_document_succeeds_even_if_s3_fails(client, monkeypatch, bucket):
 
     assert response.status_code == 204
     assert client.get(f"/documents/{document_id}", headers=_auth_headers(token)).status_code == 404
-    assert len(bucket) == 1  # 孤兒檔案，等對帳清
+    assert len(fake_s3) == 1  # 孤兒檔案，等對帳清
 
 
 # 測試：刪 workspace → 底下文件的 S3 檔案也一起刪（以前只刪資料庫紀錄，檔案會一直留著）
-def test_delete_workspace_removes_files(client, bucket):
+def test_delete_workspace_removes_files(client, fake_s3):
     token = _register_and_login(client, "carol@example.com")
     ws_id = _create_workspace(client, token)
     _upload(client, token, ws_id)
     _upload(client, token, ws_id)
-    assert len(bucket) == 2
+    assert len(fake_s3) == 2
 
     client.delete(f"/workspaces/{ws_id}", headers=_auth_headers(token))
 
-    assert bucket == {}
+    assert fake_s3 == {}
 
 
 # 測試：對帳 → 只刪「沒有紀錄、而且放超過 1 天」的檔案；有紀錄的、剛放進去的都不動
-def test_orphan_cleanup_only_deletes_old_unreferenced_files(client, db_session, bucket):
+def test_orphan_cleanup_only_deletes_old_unreferenced_files(client, db_session, fake_s3, modified):
     token = _register_and_login(client, "dave@example.com")
     ws_id = _create_workspace(client, token)
     _upload(client, token, ws_id)
-    referenced_key = next(iter(bucket))
+    referenced_key = next(iter(fake_s3))
     two_days_ago = datetime.now(timezone.utc) - timedelta(days=2)
-    bucket[referenced_key] = two_days_ago  # 有紀錄的檔案，就算很舊也不能刪
-    bucket["documents/old_orphan.pdf"] = two_days_ago  # 孤兒、而且很舊 → 刪
-    bucket["documents/new_orphan.pdf"] = datetime.now(timezone.utc)  # 孤兒、但剛放進去（可能正在上傳）→ 不刪
+    modified[referenced_key] = two_days_ago  # 有紀錄的檔案，就算很舊也不能刪
+    fake_s3["documents/old_orphan.pdf"] = b""
+    modified["documents/old_orphan.pdf"] = two_days_ago  # 孤兒、而且很舊 → 刪
+    fake_s3["documents/new_orphan.pdf"] = b""  # 孤兒、但剛放進去（可能正在上傳）→ 不刪
 
     deleted = document_service.delete_orphan_files(db_session)
 
     assert deleted == 1
-    assert set(bucket) == {referenced_key, "documents/new_orphan.pdf"}
+    assert set(fake_s3) == {referenced_key, "documents/new_orphan.pdf"}
 
 
 # 測試：每小時的 sweeper 會順便對帳，回傳值裡有刪了幾個
-def test_sweep_also_cleans_orphans(monkeypatch, db_session, bucket):
+def test_sweep_also_cleans_orphans(monkeypatch, db_session, fake_s3, modified):
     monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
-    bucket["documents/old_orphan.pdf"] = datetime.now(timezone.utc) - timedelta(days=2)
+    fake_s3["documents/old_orphan.pdf"] = b""
+    modified["documents/old_orphan.pdf"] = datetime.now(timezone.utc) - timedelta(days=2)
 
     result = worker.handle_sweep(None, None)
 
@@ -131,6 +130,9 @@ def test_sweep_also_cleans_orphans(monkeypatch, db_session, bucket):
 
 
 # ---------- S3 錯誤的分類（docs/failure-modes.md 的缺口 1、2）----------
+# 這裡要測真的 download_file：conftest.py 的 fake_s3 每個測試開始前會把它換成假的，
+# 所以在載入這個檔案時（還沒被換掉）先記下真的那個；它裡面呼叫的 client.get_object 再換成丟錯誤的假函式
+REAL_DOWNLOAD_FILE = s3_client.download_file
 
 
 def _client_error(code, status):
@@ -158,11 +160,11 @@ def test_s3_errors_are_classified(monkeypatch, exc, expected):
     monkeypatch.setattr(s3_client.client, "get_object", fake_get_object)
 
     with pytest.raises(expected):
-        s3_client.download_file("documents/x.pdf")
+        REAL_DOWNLOAD_FILE("documents/x.pdf")
 
 
 # 測試：處理時檔案不見了 → 標失敗，訊息叫使用者重新上傳（不能叫他「稍後重試」，重試永遠不會成功）
-def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch, bucket):
+def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch):
     token = _register_and_login(client, "erin@example.com")
     ws_id = _create_workspace(client, token)
     monkeypatch.setattr(s3_client, "download_file", _raise(s3_client.FileMissing("NoSuchKey")))
@@ -176,7 +178,7 @@ def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch, b
 
 
 # 測試：雲端、處理時 S3 暫時連不上 → 跟 OpenAI 一樣，留在處理中等下一回合
-def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch, bucket):
+def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch):
     monkeypatch.setattr(settings, "sqs_queue_url", "https://fake-queue")
     monkeypatch.setattr(document_service.sqs_client, "send_process_message", lambda document_id: None)
     token = _register_and_login(client, "frank@example.com")
@@ -194,7 +196,7 @@ def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch
 
 
 # 測試：上傳完成、API 去 S3 確認檔案時 S3 暫時連不上 → 回 503 和看得懂的訊息（不是 500），不建紀錄
-def test_upload_returns_503_when_storage_unavailable(client, monkeypatch, bucket):
+def test_upload_returns_503_when_storage_unavailable(client, monkeypatch):
     token = _register_and_login(client, "grace@example.com")
     ws_id = _create_workspace(client, token)
     monkeypatch.setattr(s3_client, "file_size", _raise(s3_client.StorageTemporaryError("模擬")))

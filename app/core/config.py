@@ -32,8 +32,7 @@ class Settings(BaseSettings): # BaseModel的子類別 不用給他明確的資�
     # 回答每次最多等幾秒：本機的模型比 OpenAI 慢，長的回答會超過 15 秒
     answer_timeout: float = 15
 
-    # 這兩個改成選填：本機開發用 trace-app-s3 的金鑰（.env 裡有值）；
-    # 部署在 Fargate 上時不會有這兩個環境變數，改靠 Task Role 自動取得憑證
+    # 本機開發用 trace-app-s3 的金鑰（.env 裡有值）；Lambda 上由 AWS 自動放進環境變數（見 core/aws_clients.py）
     aws_access_key_id: str | None = None
     aws_secret_access_key: str | None = None
     # Lambda 上才會有：臨時憑證的一部分，跟上面兩個一起用（見 core/aws_clients.py）

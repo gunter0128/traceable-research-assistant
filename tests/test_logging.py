@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from app.core import log, openai_client, s3_client, sqs_client
+from app.core import log, openai_client, sqs_client
 from app.core.config import settings
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
@@ -37,11 +37,6 @@ def logs():
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    fake_bucket = {}
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
-
     # 跟真的 embed_texts 一樣，呼叫 OpenAI 之前先呼叫 on_attempt（試一次就成功）
     def fake_embed(texts, on_attempt=None, **kwargs):
         if on_attempt is not None:
@@ -135,8 +130,8 @@ def test_queue_message_carries_request_id(client, logs, monkeypatch):
 
 # 測試：log 裡沒有使用者的檔名和問題內容
 def test_no_user_content_in_logs(client, logs, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_queries", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
-    monkeypatch.setattr(openai_client, "generate_answer", lambda question, context, **kwargs: "答案")
+    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, **kwargs: "答案")
     headers = _login(client)
     ws_id = _upload(client, headers).json()["workspace_id"]
 

@@ -1,5 +1,5 @@
 # 背景處理（雲端模式）的測試：送工單、Lambda 收工單、手動重試、定期掃描
-# 真的 SQS 換成一個記錄「送了哪些工單」的 list，跟 _fake_s3 用 dict 假裝 S3 是同一個道理
+# 真的 SQS 換成一個記錄「送了哪些工單」的 list，跟 conftest.py 的 fake_s3 用 dict 假裝 S3 是同一個道理
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -8,23 +8,13 @@ import pytest
 from botocore.exceptions import EndpointConnectionError
 
 from app import worker
-from app.core import openai_client, s3_client, sqs_client
+from app.core import openai_client, sqs_client
 from app.core.config import settings
 from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
-
-
-@pytest.fixture(autouse=True)
-def _fake_s3(monkeypatch):
-    fake_bucket = {}
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
-    # sweeper 現在也會對帳、列出 S3 檔案；這裡回空的，不碰真的 S3（對帳另外在 test_storage_consistency.py 測）
-    monkeypatch.setattr(s3_client, "list_files", lambda prefix: [])
 
 
 @pytest.fixture(autouse=True)

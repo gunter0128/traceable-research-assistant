@@ -18,7 +18,6 @@ HERE = Path(__file__).parent
 RAW = HERE / "raw"
 DOCS = HERE / "docs"
 SITE = "https://law.moj.gov.tw/LawClass/"
-DOWNLOADED = "2026 年 10 月 24 日"
 
 # (代號, 全國法規資料庫的 pcode, 檔名, 舊版的日期)
 # 舊版的日期是歷史法規頁面的 lnndate；None = 現行版

@@ -1,5 +1,6 @@
-# 虛構公司「青嶼科技」的規則表：整份企業知識庫的「真相」（B3，docs/decisions/016）
-# 18 份文件照這裡的規則寫，題目的標準答案也從這裡算出來，所以兩者一定一致，不靠 AI 判斷
+# 虛構公司「青嶼科技」的規則表（docs/decisions/016、026）
+# 文件裡的數字照這裡寫；題目的標準答案、「不能說」的錯誤說法，要算的數字都從這裡算，兩者才會一致，不靠 AI 判斷
+# 只留題目用得到的規定
 # 「現在」設定為 2026 年 10 月：2026 年版的規定是現行版本
 
 from dataclasses import dataclass
@@ -17,10 +18,6 @@ class Person:
     department: str = "研發部"  # 研發部 / 業務部 / 人力資源部 / 財務部 / 資訊部 / 行政部
     site: str = "台北"  # 台北（總公司）/ 台中（分公司）/ 高雄（研發中心）
     age: int = 30
-
-    @property
-    def is_manager(self) -> bool:
-        return self.level.startswith("M")
 
     @property
     def on_probation(self) -> bool:
@@ -50,21 +47,7 @@ def regional_flex_leave(person: Person) -> int:
     return 1 if person.site == "台中" and person.employment == "正職" else 0
 
 
-# ---------- 上班時間（HR-01 / HR-02 第 5 條、HR-04 第 4 條）----------
-def flex_start_window(person: Person, year: int = 2026) -> tuple[str, str]:
-    if person.site == "台中":
-        return ("08:00", "09:00")
-    return ("08:30", "09:30") if year == 2025 else ("08:00", "10:00")
-
-
-# ---------- 加班（HR-05、HR-03 第 4、5 條、HR-04 第 3 條）----------
-def overtime_pay_allowed(person: Person) -> bool | None:
-    # True：可選加班費或補休；False：主管職不給加班費、只能補休；None：實習生不得加班
-    if person.employment == "實習生":
-        return None
-    return not person.is_manager
-
-
+# ---------- 加班（HR-05、HR-04 第 3 條）----------
 def overtime_meal(person: Person) -> int:
     # 平日加班到晚上 8 點以後，每次的餐費補助
     return 200 if person.site == "台中" else 150
@@ -107,12 +90,6 @@ def domestic_lodging(level: str, city: str, on: date = TODAY) -> int:
     return taipei if city == "台北" else other
 
 
-# ---------- 國外差旅（FIN-02）----------
-def business_class(level: str, one_way_hours: float) -> bool:
-    # 兩個條件同時成立：單程表定飛行 8 小時以上「且」職級 M2 以上
-    return one_way_hours >= 8 and level in ("M2", "M3")
-
-
 # ---------- 費用報銷（FIN-03）----------
 def reimbursement_deadline(days_after: int) -> str:
     if days_after <= 30:
@@ -122,30 +99,12 @@ def reimbursement_deadline(days_after: int) -> str:
     return "不予受理"
 
 
-def reimbursement_approvers(amount: int) -> list[str]:
-    return ["直屬主管", "財務長"] if amount >= 10000 else ["直屬主管"]
-
-
-# ---------- 資訊設備（IT-01）、資安（IT-02）、軟體採購（IT-03）----------
-def laptop_refresh_years(person: Person) -> int | None:
-    if person.employment == "實習生":
-        return None  # 實習生用公用借用機，不配發
-    return 2 if person.department == "研發部" else 3
-
-
+# ---------- 資訊設備（IT-01）----------
 def monitors(person: Person) -> int:
     return 2 if person.department == "研發部" else 1
 
 
-def byod_email_allowed(person: Person) -> bool:
-    return person.department != "研發部"
-
-
-def software_approvers(unit_price: int) -> list[str]:
-    return ["部門主管"] if unit_price <= 5000 else ["資訊部審核", "部門主管"]
-
-
-# ---------- 福利（GEN-03）、教育訓練（GEN-04）、停車（GEN-02）----------
+# ---------- 福利（GEN-03）、教育訓練（GEN-04）----------
 def health_check_subsidy(person: Person) -> int:
     if person.employment == "實習生":
         return 0
@@ -154,19 +113,11 @@ def health_check_subsidy(person: Person) -> int:
     return 5000 if person.age >= 40 else 3000
 
 
-def wedding_gift(person: Person) -> int:
-    return 6000 if person.employment == "正職" else 0
-
-
 def training_cap(person: Person) -> int:
     # 限到職滿 1 年的正職
     if person.employment != "正職" or person.months < 12:
         return 0
     return {"P1-P3": 15000, "P4-P5": 25000, "M": 40000}[level_band(person.level)]
-
-
-def taipei_parking_eligible(person: Person, pregnant: bool = False, disabled: bool = False) -> bool:
-    return person.site == "台北" and (person.level in ("M1", "M2", "M3") or pregnant or disabled)
 
 
 # ---------- 題目調整成每種題型 10 題時，新題目用到的規定（docs/decisions/031）----------
@@ -181,14 +132,12 @@ MANAGER_COMP_LEAVE_CAP_HOURS = 16  # HR-05 第 5 條：主管職不支給加班�
 # 這些數字都「不是」現在對青嶼科技員工有效的答案，寫在這裡是為了：
 #   1. 文件照這裡寫，數字有唯一的來源
 #   2. 題目的「不能說」用這裡的數字算，抓出把干擾文件當成答案的錯
-SUBSIDIARY = "青嶼雲端服務股份有限公司"
 
 # HR-08 員工手冊 2024 年版（被 2025、2026 年版取代）
 LEAVE_TABLE_2024 = [(120, 15), (60, 13), (12, 10), (6, 3), (0, 0)]
 
 # SUB-01 子公司員工手冊（只適用子公司員工）
 SUB_LEAVE_TABLE = [(120, 17), (60, 15), (12, 13), (6, 3), (0, 0)]
-SUB_FLEX_START = ("09:00", "10:30")
 
 # SUB-02 子公司國內出差旅費要點
 SUB_LODGING = {"P1-P3": (2600, 2200), "P4-P5": (3200, 2600), "M": (4000, 3300)}
@@ -206,7 +155,6 @@ DOMESTIC_MEAL_2022 = 500
 
 # FIN-14 公告：2027 年 1 月 1 日起的住宿費上限（已公告、還沒生效）
 LODGING_2027 = {"P1-P3": (3000, 2500), "P4-P5": (3600, 3000), "M": (4500, 3800)}
-LODGING_2027_EFFECTIVE = date(2027, 1, 1)
 
 # HR-22 勞資會議紀錄：加班餐費提高到 180 元的提案，決議暫緩（沒有通過）
 MEAL_PROPOSAL_REJECTED = 180
@@ -214,6 +162,3 @@ MEAL_PROPOSAL_REJECTED = 180
 # HR-23 員工福利辦法修正草案（徵詢意見中，還沒生效）
 DRAFT_HEALTH_CHECK = (4000, 6000)  # 未滿 40 歲、40 歲以上
 DRAFT_CONTRACT_WEDDING_GIFT = 3000
-
-# FIN-05 一般採購作業辦法：一般物品單筆 1 萬元以上要總經理核准；軟體不適用，依 IT-03
-GENERAL_PURCHASE_GM_THRESHOLD = 10000

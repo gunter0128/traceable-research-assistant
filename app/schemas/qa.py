@@ -18,6 +18,6 @@ class CitationOut(BaseModel):
 
 class AskResponse(BaseModel):
     # 回給客戶端的：LLM 生成的答案 + 答案裡真的標到的來源（逐句引用，docs/decisions/021）
-    # 答案沒標任何來源時（例如「文件中找不到相關資訊」）是空的，不會把搜到但沒用到的段落當成依據
+    # 說找不到時是空的；模型有回答卻忘了標編號時，退回列出搜到的全部段落（qa_service.ask_with_passages）
     answer: str
     citations: list[CitationOut]

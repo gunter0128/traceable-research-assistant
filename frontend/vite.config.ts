@@ -15,7 +15,7 @@ export default defineConfig({
   server: {
     // 開發時 Vite 開在 5173、FastAPI 開在 8000，瀏覽器看是不同來源(CORS)。
     // 讓 Vite 把這幾個路徑的請求轉送到後端，瀏覽器就只看到同一個來源，不用在 FastAPI 那邊另外設定 CORS。
-    // 正式環境是同一個 container 直接 serve 靜態檔案，本來就是同源，不需要這段。
+    // 正式環境由 CloudFront 把 API 的路徑轉給 Lambda、其他轉給前端檔案，本來就是同源，不需要這段。
     proxy: {
       '/auth': 'http://localhost:8000',
       '/workspaces': 'http://localhost:8000',

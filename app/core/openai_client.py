@@ -1,5 +1,5 @@
-# 包 OpenAI SDK 的呼叫。純計算，不碰 DB / HTTP，跟 security.py 同一種角色
-# 負責兩件事：
+# 包 OpenAI SDK 的呼叫（轉向量、生成答案），不碰資料庫，跟 s3_client.py 同一種角色
+# 送什麼內容（回答原則、資料、問題）由呼叫的 service 決定，這裡只負責送出去，另外負責兩件事：
 #   1. 把 OpenAI 的各種錯誤分成「暫時性」和「永久性」兩類（見 docs/decisions/005）
 #   2. 自己做重試（見 docs/decisions/008）：SDK 內建的重試會照 OpenAI 的「請等 N 秒」最多等 120 秒，
 #      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法在重試之間報平安、也沒辦法控制總時間
@@ -222,14 +222,14 @@ def embed_texts(
 # 何時呼叫：qa_service 把使用者的問題轉成向量，拿去跟 chunk 比相似度
 # deadline：整個問答共用的截止時間（qa_service 算好傳進來）
 # 問題前面加上模型要求的說明（設定的 embedding_query_prefix，OpenAI 不用加）；文件段落不加，見 embed_texts
-def embed_queries(
-    texts: list[str],
+def embed_query(
+    text: str,
     deadline: float | None = None,
     on_usage: Callable[[Usage], None] | None = None,
-) -> list[list[float]]:
+) -> list[float]:
     def call(timeout: float):
         return embedding_client.with_options(timeout=timeout).embeddings.create(
-            model=EMBEDDING_MODEL, input=[settings.embedding_query_prefix + text for text in texts]
+            model=EMBEDDING_MODEL, input=[settings.embedding_query_prefix + text]
         )
 
     response = _with_retries(
@@ -241,23 +241,7 @@ def embed_queries(
         deadline=deadline,
     )
     _report_embedding_usage(response, on_usage)
-    return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
-
-
-# 給模型的回答原則（system prompt，docs/decisions/019）
-# 原本只有「只能照資料回答、答不出來就說找不到」，沒教模型怎麼讀：一碰到「不適用」「分情況」就退回「找不到」
-# 每一條都要是通用的閱讀原則：套到租屋合約、學校規章、論文上也成立才能放
-# 刻意不放任何領域的詞（年資、職級、學年度…）和例子，避免只對某一種文件有效
-ANSWER_RULES = """你是一個根據使用者提供的文件回答問題的助手。
-
-回答原則：
-1. 只能根據「資料」回答，不能用你自己的知識補充，也不能推測文件沒寫的內容。
-2. 先給結論。問題沒有條件、資料也沒有分情況時，直接回答，不要加「視情況而定」之類的保留。
-3. 答案會因為對象、情況或時間而不同時：問題已經說明是誰、什麼情況，就給適用的那一個；沒說明的話，列出每種情況各自的答案。
-4. 資料寫明某條規定「不適用」某些人或情況時，這本身就是答案：直接說不適用和依據，資料有寫替代的做法也一起說。不要因此說找不到。
-5. 多份資料說法不同時，看各自的日期、版本、有沒有被修訂或廢止，用今天的日期判斷哪一個現在有效，並說明舊的為什麼不適用。修訂只改一部分時，沒改到的部分照原本的。只找到可能已經過時的版本時，要明白說出來。
-6. 用到資料的句子，句尾標上依據的段落編號，例如「……[2]。」，用到好幾段就寫「[1][3]」。結論後面再寫一行依據：文件名稱、條次；有生效日期就一起寫。
-7. 資料完全沒有相關資訊時，才說「文件中找不到相關資訊」；只有一部分資訊時，回答有的部分，並說明缺什麼。"""
+    return response.data[0].embedding
 
 
 # 回答用的模型服務（docs/decisions/034、037）：看設定，沒設定就是 OpenAI
@@ -274,14 +258,11 @@ def use_answer_endpoint(base_url: str, extra_body: dict | None = None) -> None:
     answer_extra_body = extra_body
 
 
-# 放在問題後面的提醒：模型對離問題最近的指示比較會照做
-CITATION_REMINDER = "（回答時，用到資料的句子，句尾要標上依據的段落編號，例如 [1]。）"
-
-
-# 何時呼叫：qa_service 把問題跟搜到的 chunk 內容組成 context 之後，丟給 LLM 生成答案
+# 何時呼叫：qa_service 組好要給模型看的內容之後，丟給 LLM 生成答案
+# system：回答原則（開發者給模型的規則）；user：資料 + 問題。兩段的內容都由 qa_service 決定，這裡只負責送出去
 def generate_answer(
-    question: str,
-    context: str,
+    system: str,
+    user: str,
     deadline: float | None = None,
     on_usage: Callable[[Usage], None] | None = None,
 ) -> str:
@@ -289,11 +270,7 @@ def generate_answer(
         return answer_client.with_options(timeout=timeout).chat.completions.create( # 對話生成的功能
             model=GENERATION_MODEL,
             extra_body=answer_extra_body,
-            messages=[
-                {"role": "system", "content": ANSWER_RULES}, # 開發者給 LLM 的規則
-                # 真正的使用者輸入。最後再提醒一次標引用：只寫在 system 的原則裡，約三成的回答會忘記標（docs/decisions/021）
-                {"role": "user", "content": f"資料：\n{context}\n\n問題：{question}\n\n{CITATION_REMINDER}"},
-            ],
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         )
 
     response = _with_retries(

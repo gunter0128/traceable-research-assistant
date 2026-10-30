@@ -1,5 +1,5 @@
-# 包 boto3（AWS SDK）的呼叫。純計算，不碰 DB / HTTP，跟 openai_client.py 同一種角色
-# 取代原本 document_service.py 直接寫本機硬碟（storage/documents/）那段
+# 包 boto3（AWS SDK）的 S3 呼叫，不碰資料庫，跟 openai_client.py 同一種角色
+# PDF 不經過 API：瀏覽器拿這裡簽的上傳許可直接傳到 S3（docs/decisions/013），worker 處理時再從 S3 下載
 # 跟 openai_client.py 一樣，也負責把 S3 的錯誤分類，分類完怎麼處理由呼叫的 service 決定
 
 from collections.abc import Iterator
@@ -12,7 +12,7 @@ from app.core.aws_clients import make_client
 from app.core.config import settings
 
 # client 只需要建立一次，跟 openai_client.py 的 client 是同樣的道理
-# 憑證怎麼拿（本機 / Fargate / Lambda 各不同）統一在 aws_clients.py 處理
+# 憑證怎麼拿（本機 / Lambda 不同）統一在 aws_clients.py 處理
 client = make_client("s3")
 
 
@@ -56,12 +56,6 @@ def _translate_errors() -> Iterator[None]:
     # 根本沒收到回應：連不上、超時
     except BotoCoreError as exc:
         raise StorageTemporaryError(str(exc)) from exc
-
-
-# 何時呼叫：document_service 上傳 PDF 時，把檔案內容存進 S3（取代寫本機硬碟）
-def upload_file(key: str, content: bytes) -> None:
-    with _translate_errors():
-        client.put_object(Bucket=settings.s3_bucket_name, Key=key, Body=content)
 
 
 # 何時呼叫：document_service 要解析 PDF 文字之前，把檔案內容從 S3 抓回來

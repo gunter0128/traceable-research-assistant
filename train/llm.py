@@ -1,5 +1,4 @@
-# 問實驗室的 Qwen（出題、寫示範答案、評審都用這個）：結果存起來、連不上就等一下再試
-# 原本寫在 make_answers.py；第 2 批出題（041）也要用，搬出來兩邊共用
+# 問實驗室的 Qwen（出題、寫示範答案、評審都用這個，make_questions.py、make_answers.py 共用）：結果存起來、連不上就等一下再試
 
 import hashlib
 import json

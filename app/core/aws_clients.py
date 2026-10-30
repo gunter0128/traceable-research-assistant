@@ -1,7 +1,6 @@
 # 建 boto3 client 的共用寫法，s3_client.py、sqs_client.py 都用這個，憑證規則只寫一次
-# 三種環境拿憑證的方式不一樣：
+# 兩種環境拿憑證的方式不一樣：
 #   本機開發：.env 裡有 trace-app-s3 的金鑰（沒有 session token），明確交給 boto3
-#   Fargate：沒有金鑰環境變數，不傳，boto3 自己去問 Task Role 要臨時憑證
 #   Lambda：Lambda 自動把 Role 的臨時憑證放進 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
 #           臨時憑證少了 session token 就無效，所以三個要一起傳
 

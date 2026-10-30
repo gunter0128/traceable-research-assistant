@@ -5,19 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
-from app.api.usage import quota_error
+from app.api.errors import WORKSPACE_ERRORS, quota_error, workspace_error
 from app.core.db import get_db
 from app.models.user import User
 from app.schemas.qa import AskRequest, AskResponse
-from app.services import qa_service, usage_service, workspace_service
+from app.services import qa_service, usage_service
 
 router = APIRouter(tags=["qa"])
-
-
-def _workspace_error(exc: Exception):
-    if isinstance(exc, workspace_service.WorkspaceNotFound):
-        raise HTTPException(status_code=404, detail="workspace not found") from None
-    raise HTTPException(status_code=403, detail="not your workspace") from None
 
 
 @router.post("/workspaces/{workspace_id}/ask", response_model=AskResponse)
@@ -29,11 +23,8 @@ def ask(
 ):
     try:
         return qa_service.ask(db, workspace_id, current_user.id, data.question)
-    except (
-        workspace_service.WorkspaceNotFound,
-        workspace_service.NotWorkspaceOwner,
-    ) as exc:
-        _workspace_error(exc)
+    except WORKSPACE_ERRORS as exc:
+        workspace_error(exc)
     except usage_service.QuotaExceeded as exc:
         quota_error(exc)
     # 503 Service Unavailable：「服務暫時無法提供」，表示問題不在使用者的請求本身

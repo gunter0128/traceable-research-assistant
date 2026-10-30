@@ -1,5 +1,5 @@
 # 結構化 log（docs/decisions/010）：每一筆 log 是一行 JSON，API 和 Lambda 共用這一份
-# 印到 stdout 就好：ECS 和 Lambda 都會把 stdout 自動收進 CloudWatch
+# 印到 stdout 就好：Lambda 會把 stdout 自動收進 CloudWatch
 # 檔名不叫 logging.py：會跟 Python 內建的 logging 撞名
 
 import json

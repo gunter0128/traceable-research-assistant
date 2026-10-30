@@ -1,5 +1,5 @@
 # pytest 自動載入這個檔（名字固定叫 conftest.py）裡面的 fixture 不用 import
-# 所有 test_*.py 都能用 這裡提供 db_session / client 兩個 fixture
+# 所有 test_*.py 都能用 這裡提供 db_session / client / fake_s3 三個 fixture
 # 在 import app 的任何東西之前，先把 DATABASE_URL 換成測試分支
 # 這樣 app.core.config 的 settings 讀到的才是測試資料庫，不是正式的 Neon
 
@@ -17,6 +17,8 @@ if os.path.exists(".env.test"):
     os.environ["DATABASE_URL"] = _test_env["DATABASE_URL"]
     os.environ["SECRET_KEY"] = _test_env["SECRET_KEY"]
 
+from datetime import datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -24,6 +26,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base, get_db
 from app.main import app
+from tests.upload_helpers import bucket
 
 engine = create_engine(os.environ["DATABASE_URL"])
 TestSessionLocal = sessionmaker(bind=engine)
@@ -63,22 +66,31 @@ def client(db_session):
     app.dependency_overrides.clear()  # 收尾：移除上面的替換，app 恢復正常
 
 
-# 上傳改成瀏覽器直接傳到 S3（docs/decisions/013），測試裡用假的取代兩個 S3 呼叫，所有測試都自動套用
+# 假的 S3：用記憶體裡的 dict（upload_helpers.bucket）取代真的 S3，跟隔離測試資料庫是同一個道理：測試不該碰到正式的 bucket
+# autouse=True：不用在參數列表裡點名，每一個測試開始前都自動先跑這個；要直接看 bucket 的測試，參數寫 fake_s3 拿到它
+#   上傳是瀏覽器直接傳到 S3（docs/decisions/013）：測試裡「傳上去」就是放進 dict，見 upload_helpers.upload_pdf
 #   create_upload_form：假的上傳許可（真的那個只在本機計算，但需要 AWS 憑證）
-#   file_size：去各測試自己的假 bucket 查檔案大小。寫成 s3_client.download_file(key)
-#     而不是直接拿某個 dict，是因為每個測試檔的假 bucket 都不一樣，這樣會用到「當下被換掉的那個」
+#   list_files：每個檔案都當成剛放進去的；要測「放很久的檔案」的，自己再換掉（test_storage_consistency.py）
 @pytest.fixture(autouse=True)
-def _fake_upload_form(monkeypatch):
+def fake_s3(monkeypatch):
     from app.core import s3_client
 
-    def file_size(key):
-        try:
-            return len(s3_client.download_file(key))
-        except KeyError:
-            raise s3_client.FileMissing("404") from None
+    bucket.clear()
 
+    def file_size(key):
+        if key not in bucket:
+            raise s3_client.FileMissing("404")
+        return len(bucket[key])
+
+    monkeypatch.setattr(s3_client, "download_file", lambda key: bucket[key])
+    monkeypatch.setattr(s3_client, "delete_file", lambda key: bucket.pop(key, None))
+    monkeypatch.setattr(
+        s3_client, "list_files",
+        lambda prefix: [(key, datetime.now(timezone.utc)) for key in bucket if key.startswith(prefix)],
+    )
+    monkeypatch.setattr(s3_client, "file_size", file_size)
     monkeypatch.setattr(
         s3_client, "create_upload_form",
         lambda key, max_bytes, expires_seconds: {"url": "https://fake-bucket", "fields": {"key": key}},
     )
-    monkeypatch.setattr(s3_client, "file_size", file_size)
+    return bucket

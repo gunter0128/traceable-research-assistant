@@ -3,7 +3,7 @@
 
 import pytest
 
-from app.core import openai_client, s3_client
+from app.core import openai_client
 from tests.pdf_fixtures import valid_pdf_bytes
 from tests.upload_helpers import upload_pdf
 
@@ -11,16 +11,6 @@ from tests.upload_helpers import upload_pdf
 # Arrange ：把系統弄到需要的狀態(不是在測這個 可省略)。
 # Act     ：真正要驗證行為的那一個呼叫 存成 response
 # Assert  ：檢查 response 對不對
-
-
-# 上傳現在會呼叫真的 S3 API。這裡用一個記憶體裡的 dict 假裝 S3（upload 存進去、
-# download 讀出來、delete 拿掉），跟隔離測試資料庫是同一個道理：測試不該碰到正式的 S3 bucket
-@pytest.fixture(autouse=True) # autouse=True 這個檔裡每個測試都自動套用，不用每個測試自己寫進參數列表
-def _fake_s3(monkeypatch):
-    fake_bucket = {}
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
 
 
 # 上傳現在會觸發 process_document()，裡面會呼叫真的 OpenAI embedding API。
@@ -137,11 +127,11 @@ def test_finish_without_file_rejected(client):
 
 # 測試：拿別的 workspace 的 key 來「認領」檔案 → 400
 # （不然 B 只要知道 A 的 key，就能把 A 的檔案建進自己的 workspace 讀內容）
-def test_cannot_claim_key_of_other_workspace(client):
+def test_cannot_claim_key_of_other_workspace(client, fake_s3):
     token_a = _register_and_login(client, "mia_a@example.com")
     ws_a = _create_workspace(client, token_a)
     key_a = _start(client, token_a, ws_a)["key"]
-    s3_client.upload_file(key_a, valid_pdf_bytes())  # A 真的傳上去了
+    fake_s3[key_a] = valid_pdf_bytes()  # A 真的傳上去了
     token_b = _register_and_login(client, "mia_b@example.com")
     ws_b = _create_workspace(client, token_b)
 
@@ -152,11 +142,11 @@ def test_cannot_claim_key_of_other_workspace(client):
 
 # 測試：同一個檔案說兩次「傳好了」→ 第二次 400，不會有兩筆紀錄指向同一個檔案
 # （不然刪掉其中一筆，另一筆的檔案也跟著不見了）
-def test_same_key_cannot_be_finished_twice(client, db_session):
+def test_same_key_cannot_be_finished_twice(client, db_session, fake_s3):
     token = _register_and_login(client, "nina@example.com")
     ws_id = _create_workspace(client, token)
     key = _start(client, token, ws_id)["key"]
-    s3_client.upload_file(key, valid_pdf_bytes())
+    fake_s3[key] = valid_pdf_bytes()
 
     first = _finish(client, token, ws_id, key)
     second = _finish(client, token, ws_id, key)

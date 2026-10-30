@@ -2,9 +2,8 @@
 # test_documents.py 測的是「正常情況下能動」，這裡測的是「出事時資料還是對的」
 
 
-import pytest
 
-from app.core import openai_client, s3_client
+from app.core import openai_client
 from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
@@ -14,14 +13,6 @@ from tests.upload_helpers import upload_pdf
 # 夠長的文字 切下去會變成好幾段 chunk（chunk_size 是 500 token，這裡約 2000 token）
 # 只有一段的話測不出「做到一半」的情況
 LONG_TEXT = "retrieval " * 2000
-
-
-@pytest.fixture(autouse=True)
-def _fake_s3(monkeypatch):
-    fake_bucket = {}
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
 
 
 def _register_and_login(client, email):

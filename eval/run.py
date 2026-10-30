@@ -185,7 +185,7 @@ def judge_consistency(client: OpenAI, question: str, response: str) -> dict:
     return {"contradiction": bool(verdict.get("contradiction")), "contradiction_reason": verdict.get("reason", "")}
 
 
-# 模型看到的 [n]：檔名、文件開頭（跟 qa_service._build_context 一樣取前面一段），加上那一段的內容
+# 模型看到的 [n]：檔名、文件開頭（跟 qa_service.build_context 一樣取前面一段），加上那一段的內容
 def seen_passage(filename: str, header: str, content: str) -> str:
     return f"{filename}\n{' '.join(header.split())[:qa_service.DOCUMENT_HEADER_CHARS]}\n{content}"
 
@@ -234,7 +234,7 @@ def _ask(db, workspace, user, question, today):
 def run_once(db, user, workspace, questions, client, domain, today, evidence=None, consistency=False) -> list[dict]:
     rows = []
     for q in questions:
-        # 今天日期固定成知識庫設定的「現在」（2026-10-20），分數才不會因為哪天跑評估而變
+        # 今天日期固定成知識庫設定的「現在」（rules.py 的 TODAY），分數才不會因為哪天跑評估而變
         response, passages, seconds = _ask(db, workspace, user, q["question"], today)
         retrieved = sorted({doc_code(p.filename) for p in passages})
         # 引用：自己從答案裡數 [n]，不看 response.citations（模型忘了標時，系統會退回列出全部搜到的段落，會灌水）

@@ -1,4 +1,5 @@
 # 問答的流程：確認 workspace 是你的 → 問題轉向量 → 搜相關 chunk → 組 context 丟給 LLM → 整理成答案 + 引用來源
+# 給模型的回答原則（prompt）也在這裡：要送什麼給模型是問答的規則，openai_client 只負責送出去
 # 不寫 SQL 不碰 HTTP
 
 import logging
@@ -24,6 +25,28 @@ DOCUMENT_HEADER_CHARS = 200
 
 # 每次問答搜幾段給模型看（docs/decisions/020）
 SEARCH_LIMIT = 5
+
+# 給模型的回答原則（system prompt，docs/decisions/019）
+# 原本只有「只能照資料回答、答不出來就說找不到」，沒教模型怎麼讀：一碰到「不適用」「分情況」就退回「找不到」
+# 每一條都要是通用的閱讀原則：套到租屋合約、學校規章、論文上也成立才能放
+# 刻意不放任何領域的詞（年資、職級、學年度…）和例子，避免只對某一種文件有效
+ANSWER_RULES = """你是一個根據使用者提供的文件回答問題的助手。
+
+回答原則：
+1. 只能根據「資料」回答，不能用你自己的知識補充，也不能推測文件沒寫的內容。
+2. 先給結論。問題沒有條件、資料也沒有分情況時，直接回答，不要加「視情況而定」之類的保留。
+3. 答案會因為對象、情況或時間而不同時：問題已經說明是誰、什麼情況，就給適用的那一個；沒說明的話，列出每種情況各自的答案。
+4. 資料寫明某條規定「不適用」某些人或情況時，這本身就是答案：直接說不適用和依據，資料有寫替代的做法也一起說。不要因此說找不到。
+5. 多份資料說法不同時，看各自的日期、版本、有沒有被修訂或廢止，用今天的日期判斷哪一個現在有效，並說明舊的為什麼不適用。修訂只改一部分時，沒改到的部分照原本的。只找到可能已經過時的版本時，要明白說出來。
+6. 用到資料的句子，句尾標上依據的段落編號，例如「……[2]。」，用到好幾段就寫「[1][3]」。結論後面再寫一行依據：文件名稱、條次；有生效日期就一起寫。
+7. 資料完全沒有相關資訊時，才說「文件中找不到相關資訊」；只有一部分資訊時，回答有的部分，並說明缺什麼。"""
+
+# 資料裡找不到答案時，模型會說的話（跟上面第 7 條的說法一樣）
+NOT_FOUND = "文件中找不到相關資訊"
+
+# 放在問題後面的提醒：只寫在 system 的原則裡，約三成的回答會忘記標（docs/decisions/021）
+# 模型對離問題最近的指示比較會照做
+CITATION_REMINDER = "（回答時，用到資料的句子，句尾要標上依據的段落編號，例如 [1]。）"
 
 
 # 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
@@ -59,23 +82,16 @@ def ask_with_passages(
 
     # 整個問答共用 50 秒的時間預算（docs/decisions/008）：轉向量跟生成答案各自的重試加起來，也不會超過
     deadline = time.monotonic() + ANSWER_BUDGET_SECONDS
-    # 每一段各記花多久，回答「問答慢在哪」（docs/decisions/010）
-    # 問題只記字數、不記內容：使用者的問題可能是未發表的研究
     try:
-        with log.timed("qa_embed", question_chars=len(question)):
-            [embedding] = openai_client.embed_queries([question], deadline=deadline, on_usage=record_usage)
-        with log.timed("qa_search") as fields:
-            chunks = chunk_repo.search_similar(db, workspace_id, embedding, limit=SEARCH_LIMIT)
-            groups = _merge_adjacent(_group_by_document(chunks))
-            headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
-            fields["chunks"] = len(chunks)
-            fields["documents"] = len(groups)
+        groups, headers = retrieve(db, workspace_id, question, deadline=deadline, on_usage=record_usage)
         today = today or datetime.now(usage_service.TAIWAN).date()
-        context = _build_context(groups, headers, today)
+        context = build_context(groups, headers, today)
         with log.timed("qa_generate") as fields:
-            answer = openai_client.generate_answer(question, context, deadline=deadline, on_usage=record_usage)
-            fields["answer_chars"] = len(answer or "")
-        # 給模型看的全部段落，number 就是給模型看的編號 [1] [2]…（順序跟 _build_context 一樣）
+            answer = openai_client.generate_answer(
+                ANSWER_RULES, user_message(context, question), deadline=deadline, on_usage=record_usage
+            )
+            fields["answer_chars"] = len(answer)
+        # 給模型看的全部段落，number 就是給模型看的編號 [1] [2]…（順序跟 build_context 一樣）
         # 放在 try 裡面：要在下面 finally 寫入用量（commit）之前讀完段落的內容
         passages = [
             CitationOut(number=number, document_id=chunk.document_id, filename=document.filename, content=chunk.content)
@@ -97,7 +113,7 @@ def ask_with_passages(
             usage_service.record(db, owner_id, "qa", usage)
 
     # 逐句引用（docs/decisions/021）：只回傳答案裡真的標到的段落
-    answer, cited = _extract_citations(answer or "", len(passages))
+    answer, cited = _extract_citations(answer, len(passages))
     if cited:
         citations = [passage for passage in passages if passage.number in cited]
     elif NOT_FOUND in answer:
@@ -110,12 +126,30 @@ def ask_with_passages(
     return AskResponse(answer=answer, citations=citations), passages
 
 
+# 搜段落：問題轉向量 → 搜最像的幾段 → 照文件分組、相連的合併 → 查每份文件的開頭
+# 回傳 (分好組的段落, {document_id: 文件開頭})。訓練資料也用這個（train/make_answers.py），給模型看的資料跟線上一樣
+# 每一段各記花多久，回答「問答慢在哪」（docs/decisions/010）；問題只記字數、不記內容：使用者的問題可能是未發表的研究
+def retrieve(
+    db: Session, workspace_id: int, question: str, deadline: float | None = None, on_usage=None
+) -> tuple[list[tuple], dict[int, str]]:
+    with log.timed("qa_embed", question_chars=len(question)):
+        embedding = openai_client.embed_query(question, deadline=deadline, on_usage=on_usage)
+    with log.timed("qa_search") as fields:
+        chunks = chunk_repo.search_similar(db, workspace_id, embedding, limit=SEARCH_LIMIT)
+        groups = _merge_adjacent(_group_by_document(chunks))
+        headers = chunk_repo.first_chunks(db, [document.id for document, _ in groups])
+        fields["chunks"] = len(chunks)
+        fields["documents"] = len(groups)
+    return groups, headers
+
+
+# 給模型的 user 訊息：資料 + 問題，最後再提醒一次標引用
+def user_message(context: str, question: str) -> str:
+    return f"資料：\n{context}\n\n問題：{question}\n\n{CITATION_REMINDER}"
+
+
 def _date_text(day: date) -> str:
     return f"{day.year} 年 {day.month} 月 {day.day} 日"
-
-
-# 資料裡找不到答案時，模型會說的話（跟 openai_client.ANSWER_RULES 第 7 條的說法一樣）
-NOT_FOUND = "文件中找不到相關資訊"
 
 
 # 答案裡的引用標記：[1]、[1][2]、[1, 2]、全形的［1］都算
@@ -152,10 +186,10 @@ def _group_by_document(chunks) -> list[tuple]:
 
 # 給模型看的一段：可能是好幾個相連的 chunk 合併成的（_merge_adjacent）
 # 欄位名稱跟 chunk 一樣（document_id、content），後面組 context、組引用的程式不用分是哪一種
+# last_index：最後一個 chunk 的編號，下一個 chunk 接不接得上看它
 @dataclass
 class Passage:
     document_id: int
-    first_index: int
     last_index: int
     content: str
 
@@ -172,7 +206,7 @@ def _merge_adjacent(groups) -> list[tuple]:
                 passages[-1].content = _join_overlap(passages[-1].content, chunk.content)
                 passages[-1].last_index = chunk.chunk_index
             else:
-                passages.append(Passage(chunk.document_id, chunk.chunk_index, chunk.chunk_index, chunk.content))
+                passages.append(Passage(chunk.document_id, chunk.chunk_index, chunk.content))
         merged.append((document, passages))
     return merged
 
@@ -193,7 +227,7 @@ def _join_overlap(first: str, second: str) -> str:
 #     開頭直接給模型讀，不自己解析日期：民國年、西元年、學年度各種寫法，模型都讀得懂
 #   文件不編號、只標檔名：編了號，模型會寫「依據：文件 1」，使用者看不到文件 1 是哪一份
 #   段落編號 [1] [2]… 跨文件連續編，跟 citations 的順序一樣
-def _build_context(groups, headers: dict[int, str], today: date) -> str:
+def build_context(groups, headers: dict[int, str], today: date) -> str:
     blocks = [f"今天日期：{_date_text(today)}"]
     number = 0
     for document, group in groups:

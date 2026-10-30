@@ -1,4 +1,5 @@
-# document 的規則：存檔案、透過 workspace 判斷 ownership、CRUD 流程
+# document 的規則：上傳（發許可、建紀錄）、背景處理（解析 → 切段 → 轉向量）、重試、取消、刪除、卡住的偵測
+# ownership 透過 workspace 判斷
 # 不寫 SQL 不碰 HTTP
 
 import contextlib
@@ -315,7 +316,7 @@ def process_document(db: Session, document: Document) -> Document:
         return _fail(db, document, lease, _GAVE_UP)
 
     try:
-        # document.storage_path 現在存的是 S3 key，不是本機路徑，要先把內容抓下來
+        # document.storage_path 存的是 S3 key，先把內容抓下來
         with log.timed("downloaded") as fields:
             content = s3_client.download_file(document.storage_path)
             # 執行完才知道檔案多大，中途補進這筆 log 的欄位
@@ -326,8 +327,7 @@ def process_document(db: Session, document: Document) -> Document:
         duplicate = document_repo.find_duplicate(db, document.workspace_id, content_hash, document.id)
         if duplicate:
             raise DuplicateDocument(duplicate.filename)
-        # pdf_parser.extract_text 要的是一個「檔案物件」，io.BytesIO 把一包 bytes 包裝成檔案物件，
-        # 跟上傳那邊 file.file（UploadFile 的底層）是同一種東西
+        # pdf_parser.extract_text 要的是一個「檔案物件」，io.BytesIO 把一包 bytes 包裝成檔案物件
         with log.timed("parsed") as fields:
             text = pdf_parser.extract_text(io.BytesIO(content), max_pages=MAX_PAGES)
             fields["chars"] = len(text)

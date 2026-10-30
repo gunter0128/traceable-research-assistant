@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.core import openai_client, s3_client
+from app.core import openai_client
 from app.core.openai_client import Usage
 from app.models.document import Document
 from app.models.usage_record import UsageRecord
@@ -19,29 +19,24 @@ from tests.upload_helpers import upload_pdf
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    fake_bucket = {}
-    monkeypatch.setattr(s3_client, "upload_file", lambda key, content: fake_bucket.__setitem__(key, content))
-    monkeypatch.setattr(s3_client, "download_file", lambda key: fake_bucket[key])
-    monkeypatch.setattr(s3_client, "delete_file", lambda key: fake_bucket.pop(key, None))
-
     # 假的 OpenAI：跟真的一樣，成功之後把用了多少交給 on_usage
     def embed_texts(texts, on_attempt=None, on_usage=None):
         if on_usage:
             on_usage(Usage(openai_client.EMBEDDING_MODEL, 1000 * len(texts)))
         return [[0.1] * 1536 for _ in texts]
 
-    def embed_queries(texts, deadline=None, on_usage=None):
+    def embed_query(text, deadline=None, on_usage=None):
         if on_usage:
-            on_usage(Usage(openai_client.EMBEDDING_MODEL, 20 * len(texts)))
-        return [[0.1] * 1536 for _ in texts]
+            on_usage(Usage(openai_client.EMBEDDING_MODEL, 20))
+        return [0.1] * 1536
 
-    def generate_answer(question, context, deadline=None, on_usage=None):
+    def generate_answer(system, user, deadline=None, on_usage=None):
         if on_usage:
             on_usage(Usage(openai_client.GENERATION_MODEL, 2500, 300))
         return "答案"
 
     monkeypatch.setattr(openai_client, "embed_texts", embed_texts)
-    monkeypatch.setattr(openai_client, "embed_queries", embed_queries)
+    monkeypatch.setattr(openai_client, "embed_query", embed_query)
     monkeypatch.setattr(openai_client, "generate_answer", generate_answer)
 
 
@@ -110,7 +105,7 @@ def test_processing_records_usage_for_owner(client, db_session):
 
 # 測試：生成答案失敗，問題轉向量已經花掉的錢還是要記
 def test_failed_ask_still_records_spent_usage(client, db_session, monkeypatch):
-    def broken(question, context, deadline=None, on_usage=None):
+    def broken(system, user, deadline=None, on_usage=None):
         raise openai_client.OpenAITemporaryError("down")
 
     monkeypatch.setattr(openai_client, "generate_answer", broken)
