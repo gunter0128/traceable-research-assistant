@@ -198,4 +198,4 @@ pytest
 
 ## What's next
 
-- Run the docker-compose package (`onprem/`) on the lab GPU machine with the two models inside it. It already runs on a laptop, with the models reached through an SSH tunnel.
+- Start the two models from docker-compose as well. The package (`onprem/`) already runs on the lab GPU machine, with the models started by hand; this needs the NVIDIA Container Toolkit on the host.

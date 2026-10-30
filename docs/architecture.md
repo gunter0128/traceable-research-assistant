@@ -188,7 +188,7 @@ qa_service.ask
       └─ storage-init：只跑一次，建好放文件的 bucket
 ```
 
-跟公開展示版只差設定：檔案存 SeaweedFS 不是 S3（上傳許可的網址換成 `/storage`，由 nginx 轉過去）、沒有 SQS 和 sweeper。300 頁的 PDF 處理約 9 秒，所以上傳時直接處理就夠了。目前在筆電上跑通了（模型透過 SSH 通道用實驗室的 RTX 3090），下一步是搬到實驗室、把模型也放進去。
+跟公開展示版只差設定：檔案存 SeaweedFS 不是 S3（上傳許可的網址換成 `/storage`，由 nginx 轉過去）、沒有 SQS 和 sweeper。300 頁的 PDF 處理約 9 秒，所以上傳時直接處理就夠了。目前在實驗室的主機上跑（模型是主機上手動開的兩個 vLLM，等裝好 NVIDIA Container Toolkit 再改成由 docker-compose 開），從筆電用 SSH 通道看。
 
 ---
 
