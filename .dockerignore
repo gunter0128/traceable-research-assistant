@@ -11,3 +11,5 @@ tests/
 frontend/
 docs/
 deploy/
+# 地端版的部署設定，後端 image 用不到
+onprem/

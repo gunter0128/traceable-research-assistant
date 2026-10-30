@@ -24,6 +24,7 @@
 | `eval/` | 考試：兩套考卷、評分程式（017） | 否 |
 | `train/` | 訓練回答模型：出題、寫示範答案、篩選、LoRA 訓練（039、040） | 否，在實驗室的 GPU 上跑 |
 | `deploy/` | AWS 的設定檔（JSON）、建告警的腳本，指令見 [deployment-commands.md](deployment-commands.md) | — |
+| `onprem/` | 地端版的 docker-compose：資料庫、檔案儲存（SeaweedFS）、API、網頁、兩個模型（045） | 是，公司的 GPU 主機 |
 | `frontend/` | 網頁（React + Vite + TypeScript + Tailwind） | 是，放在 S3、經過 CloudFront |
 | `docs/` | 文件：這份、決策紀錄、評估結果、故障清單、部署指令、維運紀錄 | — |
 
@@ -173,7 +174,21 @@ qa_service.ask
   └─ openai_client.generate_answer ──▶ vLLM：Qwen3.5-9B + LoRA adapter（不思考、temperature 0）
 ```
 
-向量欄位的維度跟著 `EMBEDDING_DIMENSION`（migration `e5a1b7c9d2f4`）。目前在實驗室的 RTX 3090 上跑，筆電透過 SSH 轉接連過去。
+向量欄位的維度跟著 `EMBEDDING_DIMENSION`（migration `e5a1b7c9d2f4`）。
+
+整套用 docker-compose 打包（`onprem/`，045），一個指令開起來：
+
+```
+公司的 GPU 主機（只開給主機自己，127.0.0.1:8080）
+ └─ nginx（web）：前端檔案；API 的路徑轉給 api；/storage 轉給 storage
+      ├─ api：同一份程式、同一個 Dockerfile，沒設定 SQS → 上傳完直接處理
+      │     ├─ db：PostgreSQL + pgvector
+      │     ├─ storage：SeaweedFS，跟 S3 用法一樣（S3_ENDPOINT_URL）
+      │     └─ vllm-embed、vllm-answer（--profile gpu 才開；沒開的話連設定的網址）
+      └─ storage-init：只跑一次，建好放文件的 bucket
+```
+
+跟公開展示版只差設定：檔案存 SeaweedFS 不是 S3（上傳許可的網址換成 `/storage`，由 nginx 轉過去）、沒有 SQS 和 sweeper。300 頁的 PDF 處理約 9 秒，所以上傳時直接處理就夠了。目前在筆電上跑通了（模型透過 SSH 通道用實驗室的 RTX 3090），下一步是搬到實驗室、把模型也放進去。
 
 ---
 

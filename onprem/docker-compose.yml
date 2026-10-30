@@ -1,0 +1,166 @@
+# 地端版：一個指令把整套系統開起來（docs/decisions/045）
+#
+# 用法（在 onprem/ 資料夾）：
+#   1. 複製 .env.example 成 .env，填好密碼和模型的網址
+#   2. docker compose up -d --build                 模型已經在別的地方跑（例如筆電透過 SSH 通道連實驗室）
+#      docker compose --profile gpu up -d --build   有顯示卡的主機：連兩個模型一起開
+#   3. 瀏覽器打開 http://localhost:8080
+# 只開給這台主機自己（127.0.0.1）；從別台電腦看，用 SSH 通道把 8080 轉過去
+
+name: trace-onprem
+
+services:
+  # 資料庫：PostgreSQL + pgvector，資料存在 volume 裡，關掉重開不會不見
+  db:
+    image: pgvector/pgvector:0.8.7-pg16
+    environment:
+      POSTGRES_DB: trace
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d trace"]
+      interval: 2s
+      retries: 30
+
+  # 檔案儲存：SeaweedFS，用法跟 S3 一樣（S3 的 API 在 8333）
+  # 帳號密碼要寫成設定檔給它，啟動時用 .env 裡的值產生
+  storage:
+    image: chrislusf/seaweedfs:4.48
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf '{"identities":[{"name":"app","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","List","Write"]}]}' \
+          "$$STORAGE_ACCESS_KEY" "$$STORAGE_SECRET_KEY" > /tmp/s3.json
+        exec weed server -dir=/data -s3 -s3.port=8333 -s3.config=/tmp/s3.json
+    environment:
+      STORAGE_ACCESS_KEY: ${STORAGE_ACCESS_KEY}
+      STORAGE_SECRET_KEY: ${STORAGE_SECRET_KEY}
+    volumes:
+      - storage-data:/data
+
+  # 只跑一次：等儲存服務起來，建好放文件的 bucket（已經有了就跳過），確認建好了才結束
+  storage-init:
+    image: chrislusf/seaweedfs:4.48
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until wget -q -O /dev/null http://storage:9333/cluster/status; do sleep 2; done
+        sleep 5
+        echo "s3.bucket.create -name documents" | weed shell -master=storage:9333 || true
+        echo "s3.bucket.list" | weed shell -master=storage:9333 | grep -q documents
+    depends_on:
+      - storage
+    restart: "no"
+
+  # API：跟公開展示版同一份程式、同一個 Dockerfile，只是設定不同
+  # 啟動前先把資料表更新到最新版（alembic upgrade head）
+  api:
+    build:
+      context: ..
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@db:5432/trace
+      SECRET_KEY: ${SECRET_KEY}
+      # 檔案存在 SeaweedFS；上傳許可的網址換成 /storage，由 nginx 轉過去
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_SECRET_KEY}
+      S3_BUCKET_NAME: documents
+      S3_ENDPOINT_URL: http://storage:8333
+      S3_PUBLIC_URL: /storage
+      # 轉向量、回答都接自己架的模型（docs/decisions/037），設定跟驗收時一樣（042、044）
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL}
+      EMBEDDING_MODEL: qwen3-embedding
+      EMBEDDING_DIMENSION: "1024"
+      EMBEDDING_QUERY_PREFIX: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+      ANSWER_BASE_URL: ${ANSWER_BASE_URL}
+      ANSWER_MODEL: taipei-all-e1
+      ANSWER_EXTRA_BODY: '{"temperature": 0, "top_p": 0.8, "top_k": 20, "min_p": 0, "presence_penalty": 1.5, "chat_template_kwargs": {"enable_thinking": false}}'
+      ANSWER_TIMEOUT: "45"
+    # host.docker.internal = 這台主機本身：模型在主機上跑（或透過 SSH 通道）時，容器從這裡連過去
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+
+  # 網頁入口：nginx 放前端檔案，API、檔案上傳都轉到後面，瀏覽器只看到一個網址
+  web:
+    build:
+      context: ../frontend
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+
+  # ---------- 兩個模型：只有加上 --profile gpu 才會開（主機要裝 NVIDIA Container Toolkit）----------
+  # 模型檔不包進 image：放在主機的 MODELS_DIR，掛進容器讀（HF_HOME）；adapter 放在 ADAPTERS_DIR
+  # 參數跟實驗室手動開的一樣（docs/decisions/036、040、042）
+  vllm-answer:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:${VLLM_VERSION:-unset}
+    entrypoint: ["vllm", "serve"]
+    command:
+      - Qwen/Qwen3.5-9B
+      - --served-model-name=qwen3.5-9b
+      - --max-model-len=16384
+      - --gpu-memory-utilization=0.84
+      - '--limit-mm-per-prompt={"image": 0, "video": 0}'
+      - --max-num-seqs=4
+      - --max-num-batched-tokens=8192
+      - --enforce-eager
+      - --reasoning-parser=qwen3
+      - --enable-lora
+      - --max-lora-rank=16
+      - --lora-modules=taipei-all-e1=/adapters/taipei-all/epoch-1
+      - --port=8000
+    environment:
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+      - ${ADAPTERS_DIR:-./adapters}:/adapters:ro
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vllm-embed:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:${VLLM_VERSION:-unset}
+    entrypoint: ["vllm", "serve"]
+    command:
+      - Qwen/Qwen3-Embedding-0.6B
+      - --served-model-name=qwen3-embedding
+      - --runner=pooling
+      - --max-model-len=2048
+      - --gpu-memory-utilization=0.10
+      - --enforce-eager
+      - --port=8001
+    environment:
+      HF_HOME: /models
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  db-data:
+  storage-data:

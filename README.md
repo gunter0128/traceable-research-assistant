@@ -53,6 +53,7 @@ The backend uses four layers, `api → services → repositories → models`, so
 | `eval/` | The two exam sets and the scoring script |
 | `train/` | Training data pipeline and LoRA training for the on-premises model |
 | `deploy/` | AWS configuration files and the alarm setup script |
+| `onprem/` | docker-compose for the on-premises version: database, S3-compatible storage (SeaweedFS), API, web server and the two models |
 | `frontend/` | React web app |
 | `docs/` | [Architecture](docs/architecture.md), [decision records](docs/decisions/README.md), [results](docs/eval-results.md), [failure modes](docs/failure-modes.md), deployment commands |
 
@@ -75,7 +76,7 @@ Token usage and cost are recorded for every call. Daily limits apply per user (U
 
 ### CI/CD
 GitHub Actions ([`ci-cd.yml`](.github/workflows/ci-cd.yml)) runs on every push:
-- Lint (ruff) and 154 tests against a real PostgreSQL + pgvector service container, plus a frontend type check and build.
+- Lint (ruff) and 156 tests against a real PostgreSQL + pgvector service container, plus a frontend type check and build.
 - On `main`, it deploys only what changed. AWS access uses short-lived OIDC credentials, so no keys are stored in GitHub.
 - Database migrations run before the Lambdas are updated, and must stay compatible with the previous version.
 - After deploying, it warms up the new image and checks that the API responds, failing the run if it does not.
@@ -169,7 +170,7 @@ npm run dev                       # http://localhost:5173, proxies API calls to 
 pytest
 ```
 
-154 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
+156 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
 
 ## API
 
@@ -197,4 +198,4 @@ pytest
 
 ## What's next
 
-- Package the on-premises version with docker-compose so it starts with one command on a company GPU server.
+- Run the docker-compose package (`onprem/`) on the lab GPU machine with the two models inside it. It already runs on a laptop, with the models reached through an SSH tunnel.

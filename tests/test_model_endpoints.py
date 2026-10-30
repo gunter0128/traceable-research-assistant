@@ -1,10 +1,14 @@
-# 轉向量、回答可以接 OpenAI 以外的服務（docs/decisions/037）：企業內部版接公司內部用 vLLM 架的模型
+# 外部服務可以換成自己架的：企業內部版接公司內部用 vLLM 架的模型（docs/decisions/037）、檔案存在自己架的儲存服務（045）
 # 真的服務換成假的物件，只檢查「送了什麼出去」
 
 from types import SimpleNamespace
 
-from app.core import openai_client
+from app.core import openai_client, s3_client
+from app.core.aws_clients import make_client
 from app.core.config import settings
+
+# conftest.py 的 fake_s3 每個測試開始前會把它換成假的，載入這個檔案時（還沒被換掉）先記下真的那個
+REAL_CREATE_UPLOAD_FORM = s3_client.create_upload_form
 
 
 # 假的服務：記下每次呼叫送了什麼，回傳跟 OpenAI SDK 一樣形狀的結果
@@ -74,3 +78,35 @@ def test_client_for():
     assert openai_client._client_for(None) is openai_client.client
     local = openai_client._client_for("http://gpu-server:8000/v1")
     assert str(local.base_url) == "http://gpu-server:8000/v1/"
+
+
+# 地端版自己架的儲存服務要給網址和憑證，上傳許可只在本機計算，不會真的連過去
+def _use_local_storage(monkeypatch, public_url=None):
+    monkeypatch.setattr(settings, "s3_endpoint_url", "http://storage:8333")
+    monkeypatch.setattr(settings, "s3_public_url", public_url)
+    monkeypatch.setattr(settings, "s3_bucket_name", "documents")
+    monkeypatch.setattr(settings, "aws_access_key_id", "storage-user")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "storage-password")
+
+
+# 測試：設定了 S3 網址就連那裡（地端的儲存服務），而且用 path 的網址寫法；沒設定就是 AWS 的 S3
+def test_s3_client_uses_configured_endpoint(monkeypatch):
+    assert "amazonaws.com" in make_client("s3").meta.endpoint_url
+
+    _use_local_storage(monkeypatch)
+    client = make_client("s3")
+
+    assert client.meta.endpoint_url == "http://storage:8333"
+    assert client.meta.config.s3["addressing_style"] == "path"
+
+
+# 測試：地端版的上傳網址換成網頁底下的路徑（nginx 轉給儲存服務），表單欄位（含簽名）不變
+def test_upload_form_uses_public_url(monkeypatch):
+    _use_local_storage(monkeypatch, public_url="/storage")
+    monkeypatch.setattr(s3_client, "client", make_client("s3"))
+
+    form = REAL_CREATE_UPLOAD_FORM("documents/1/abc.pdf", 1000, 600)
+
+    assert form["url"] == "/storage/documents"
+    assert form["fields"]["key"] == "documents/1/abc.pdf"
+    assert "x-amz-signature" in form["fields"]

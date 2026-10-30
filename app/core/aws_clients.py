@@ -1,6 +1,7 @@
 # 建 boto3 client 的共用寫法，s3_client.py、sqs_client.py 都用這個，憑證規則只寫一次
 # 兩種環境拿憑證的方式不一樣：
 #   本機開發：.env 裡有 trace-app-s3 的金鑰（沒有 session token），明確交給 boto3
+#             地端版一樣，放的是自己架的儲存服務的帳號密碼（docs/decisions/045）
 #   Lambda：Lambda 自動把 Role 的臨時憑證放進 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
 #           臨時憑證少了 session token 就無效，所以三個要一起傳
 
@@ -17,7 +18,12 @@ def make_client(service: str):
         #   signature_version="s3v4"：新版的簽名方式（預設會用已經淘汰的舊版 SigV2）
         #   addressing_style="virtual"：網址是 bucket名稱.s3.ap-southeast-1.amazonaws.com，直接指向新加坡
         #     不設的話會用全球入口 s3.amazonaws.com，瀏覽器會被轉址到新加坡，跨網域的轉址會被瀏覽器擋掉
-        options["config"] = Config(signature_version="s3v4", s3={"addressing_style": "virtual"})
+        # 地端版連自己架的儲存服務（docs/decisions/045）：網址照設定，而且要用 path（網址/bucket名稱）：
+        #   virtual 要把 bucket 名稱當成網域，得另外設定 DNS
+        style = "path" if settings.s3_endpoint_url else "virtual"
+        options["config"] = Config(signature_version="s3v4", s3={"addressing_style": style})
+        if settings.s3_endpoint_url:
+            options["endpoint_url"] = settings.s3_endpoint_url
     if settings.aws_access_key_id and settings.aws_secret_access_key:
         options.update(
             aws_access_key_id=settings.aws_access_key_id,

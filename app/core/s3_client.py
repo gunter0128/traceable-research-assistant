@@ -93,12 +93,17 @@ def list_files(prefix: str) -> list[tuple[str, datetime]]:
 #   條件是 S3 自己檢查的，就算有人改了前端程式，也傳不了超過上限的檔案、或存到別的位置
 def create_upload_form(key: str, max_bytes: int, expires_seconds: int) -> dict:
     with _translate_errors():
-        return client.generate_presigned_post(
+        form = client.generate_presigned_post(
             Bucket=settings.s3_bucket_name,
             Key=key,
             Conditions=[["content-length-range", 1, max_bytes]],
             ExpiresIn=expires_seconds,
         )
+    # 地端版（docs/decisions/045）：上傳網址換成瀏覽器連得到的路徑，由 nginx 轉給儲存服務
+    # 許可的簽名只簽表單裡的條件（policy），沒有簽網址，所以換掉網址不影響儲存服務的檢查
+    if settings.s3_public_url:
+        form["url"] = f"{settings.s3_public_url}/{settings.s3_bucket_name}"
+    return form
 
 
 # 何時呼叫：瀏覽器說「傳好了」之後，確認檔案真的在 S3 上，順便拿到實際大小
