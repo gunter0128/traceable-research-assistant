@@ -198,4 +198,4 @@ pytest
 
 ## What's next
 
-- Start the two models from docker-compose as well. The package (`onprem/`) already runs on the lab GPU machine, with the models started by hand; this needs the NVIDIA Container Toolkit on the host.
+- Start the two models from docker-compose as well. The package (`onprem/`) already runs on the lab GPU machine with the models started by hand; the NVIDIA Container Toolkit is installed, but the shared machine needs about 20 GB more disk space for the vLLM image.
