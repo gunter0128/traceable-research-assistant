@@ -6,6 +6,7 @@
 #      docker compose --profile gpu up -d --build   有顯示卡的主機：連兩個模型一起開
 #   3. 瀏覽器打開 http://localhost:8080
 # 只開給這台主機自己（127.0.0.1）；從別台電腦看，用 SSH 通道把 8080 轉過去
+# restart: unless-stopped：主機重開機、Docker 重開之後自己起來；用 docker compose down 關掉的不會
 
 name: trace-onprem
 
@@ -13,6 +14,7 @@ services:
   # 資料庫：PostgreSQL + pgvector，資料存在 volume 裡，關掉重開不會不見
   db:
     image: pgvector/pgvector:0.8.7-pg16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: trace
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -27,6 +29,7 @@ services:
   # 帳號密碼要寫成設定檔給它，啟動時用 .env 裡的值產生
   storage:
     image: chrislusf/seaweedfs:4.48
+    restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -58,6 +61,7 @@ services:
   api:
     build:
       context: ..
+    restart: unless-stopped
     command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log"]
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@db:5432/trace
@@ -91,6 +95,7 @@ services:
   web:
     build:
       context: ../frontend
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8080:80"
     volumes:
@@ -101,9 +106,14 @@ services:
   # ---------- 兩個模型：只有加上 --profile gpu 才會開（主機要裝 NVIDIA Container Toolkit）----------
   # 模型檔不包進 image：放在主機的 MODELS_DIR，掛進容器讀（HF_HOME）；adapter 放在 ADAPTERS_DIR
   # 參數跟實驗室手動開的一樣（docs/decisions/036、040、042）
+# 兩個同時開會搶顯示卡記憶體，所以先開轉向量的，它的 /health 回應了才開回答的
   vllm-answer:
     profiles: ["gpu"]
     image: vllm/vllm-openai:${VLLM_VERSION:-unset}
+    restart: unless-stopped
+    depends_on:
+      vllm-embed:
+        condition: service_healthy
     entrypoint: ["vllm", "serve"]
     command:
       - Qwen/Qwen3.5-9B
@@ -119,6 +129,9 @@ services:
       - --max-lora-rank=16
       - --lora-modules=taipei-all-e1=/adapters/taipei-all/epoch-1
       - --port=8000
+    # 也開給主機自己：評估、訓練的程式從筆電透過 SSH 通道連這個埠（eval/run.py --answer-base-url）
+    ports:
+      - "127.0.0.1:8000:8000"
     environment:
       HF_HOME: /models
       HF_HUB_OFFLINE: "1"
@@ -138,6 +151,11 @@ services:
   vllm-embed:
     profiles: ["gpu"]
     image: vllm/vllm-openai:${VLLM_VERSION:-unset}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      start_period: 300s
     entrypoint: ["vllm", "serve"]
     command:
       - Qwen/Qwen3-Embedding-0.6B
@@ -147,6 +165,8 @@ services:
       - --gpu-memory-utilization=0.10
       - --enforce-eager
       - --port=8001
+    ports:
+      - "127.0.0.1:8001:8001"
     environment:
       HF_HOME: /models
       HF_HUB_OFFLINE: "1"
