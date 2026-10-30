@@ -46,6 +46,16 @@ All three Lambdas run from one Docker image. Nothing runs when nobody is using i
 
 The backend uses four layers, `api → services → repositories → models`, so ownership rules live in one place and only repositories touch the database.
 
+| Folder | What it holds |
+|---|---|
+| `app/` | The service. `api/` (HTTP) → `services/` (business rules, including the answer prompt) → `repositories/` (SQL) → `models/`. `core/` holds config, logging, PDF parsing, chunking and the OpenAI / S3 / SQS clients |
+| `tests/` | Automated tests, with OpenAI, S3 and SQS replaced by fakes |
+| `eval/` | The two exam sets and the scoring script |
+| `train/` | Training data pipeline and LoRA training for the on-premises model |
+| `deploy/` | AWS configuration files and the alarm setup script |
+| `frontend/` | React web app |
+| `docs/` | [Architecture](docs/architecture.md), [decision records](docs/decisions/README.md), [results](docs/eval-results.md), [failure modes](docs/failure-modes.md), deployment commands |
+
 ## Engineering highlights
 
 ### Background processing that recovers on its own

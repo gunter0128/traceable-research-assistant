@@ -14,8 +14,8 @@
 |---|---|---|---|
 | 檢查 | 不是 PDF | 回 400，什麼都不存 | 測試（test_upload_non_pdf_rejected） |
 | 檢查 | 超過 20 MB | 回 413，什麼都不存 | 測試（test_file_too_large_rejected） |
-| 存 S3 | S3 暫時連不上 | 回 503「儲存服務暫時無法使用，請稍後再試」，什麼都不存 | 測試（test_upload_returns_503_when_storage_unavailable） |
-| 建紀錄 | 資料庫寫入失敗 | 把剛存的 S3 檔案刪掉，回 500 | 測試（test_upload_removes_file_when_record_fails） |
+| 確認檔案 | S3 暫時連不上 | 回 503「儲存服務暫時無法使用，請稍後再試」，不建紀錄 | 測試（test_upload_returns_503_when_storage_unavailable） |
+| 建紀錄 | 資料庫寫入失敗 | 把剛傳上去的 S3 檔案刪掉，回 500 | 測試（test_upload_removes_file_when_record_fails） |
 | 建紀錄 | 連刪檔案也失敗 | 留下孤兒檔案，每小時對帳清掉 | 測試（test_orphan_cleanup_only_deletes_old_unreferenced_files） |
 | 送工單 | SQS 送不出去 | 標失敗「排入處理佇列失敗，可以重試」 | 測試（test_upload_marks_failed_when_send_fails） |
 | 送工單 | 記錄送出時間時資料庫失敗 | 紀錄停在處理中、沒送出工單；看上傳時間，15 分鐘後標「處理逾時，請按重試」 | 測試（test_sweep_expires_document_without_queued_at） |
@@ -57,18 +57,20 @@
 | 哪一步 | 故障 | 系統的反應 | 證據 |
 |---|---|---|---|
 | 搜尋 | 只有失敗或處理中的文件 | 搜不到，回「文件中找不到相關資訊」 | 測試（test_search_similar_skips_unprocessed_documents） |
-| 轉向量 / 生成 | OpenAI 暫時連不上 | 每次最多等 15 秒、重試 1 次，整個問答共用 60 秒的預算，回 503 | 測試（test_ask_returns_503_when_ai_unavailable、test_stops_when_deadline_passed）、本機演練（32 秒回 503） |
+| 轉向量 / 生成 | OpenAI 暫時連不上 | 每次最多等 15 秒、重試 1 次，整個問答共用 50 秒的預算，回 503 | 測試（test_ask_returns_503_when_ai_unavailable、test_stops_when_deadline_passed）、本機演練（32 秒回 503） |
 | 轉向量 / 生成 | OpenAI 說「請等 N 秒」 | 5 秒以內照做，超過就直接回 503，不讓使用者乾等（以前套件會照做最多 120 秒） | 測試（test_qa_gives_up_on_long_retry_after） |
 | 任何 API | 資料庫連不上 | 回 503「服務暫時無法使用，請稍後再試」（以前是 500） | — |
 | 轉向量 / 生成 | OpenAI 永久性錯誤 | 回 503「系統設定有誤」 | 測試（test_ask_returns_503_when_misconfigured）、本機真的 OpenAI（演練 2：0.8 秒回 503，沒有白白重試） |
 
-## 5. 目前偵測不到的（留給主線 C）
+## 5. 需要人處理時，怎麼知道
 
-系統能自己處理，但**沒有人會知道發生了**，要靠 C 的監控和告警：
+系統自己處理不了的，寄告警 email（decisions/015，`deploy/setup_monitoring.py`）：
 
 - dead-letter queue 裡出現工單（代表有東西壞到自己處理不了）
 - OpenAI 永久性錯誤（key 失效、沒錢了，所有新文件都會失敗）
-- 處理失敗的比例突然升高
+- 程式錯誤的 log（預料之外的錯誤）
+- 全系統當天的用量到上限
+- 每小時的 sweeper 沒有跑
 
 ## 6. 已知、接受的限制
 
