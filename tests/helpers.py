@@ -2,6 +2,8 @@
 # 每個測試檔都要做的準備步驟放在這裡，各檔直接 import，不用各自再寫一份
 # 這裡只放一般函式（不是 fixture）：在測試裡看到呼叫，按一下就能跳到這裡看它做什麼
 
+from app.core.openai_client import EMBEDDING_MODEL, Usage
+
 # 測試帳號共用的密碼
 PASSWORD = "pw123456"
 
@@ -47,15 +49,15 @@ def upload_pdf(client, headers, workspace_id, content, filename="doc.pdf"):
 
 # ---------- 假的 OpenAI ----------
 # 用 monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts) 換掉真的：不花錢、不用網路、每次結果一樣
-# **kwargs：真的函式還有其他參數（例如 on_usage），假的用不到，收下來不理它
 
 
-# 文件的每一段都轉成同一個 1536 維的向量
-def fake_embed_texts(texts, **kwargs):
-    return [[0.1] * 1536 for _ in texts]
+# 跟真的 embed_texts 一樣回傳 (向量, 用量)：每一段都轉成同一個 1536 維的向量，用量記 0 個 token
+def fake_embed_texts(texts):
+    return [[0.1] * 1536 for _ in texts], Usage(EMBEDDING_MODEL, 0)
 
 
 # 問題轉成同一個 1536 維的向量
+# **kwargs：真的 embed_query 還有其他參數（deadline、on_usage），假的用不到，收下來不理它
 def fake_embed_query(text, **kwargs):
     return [0.1] * 1536
 

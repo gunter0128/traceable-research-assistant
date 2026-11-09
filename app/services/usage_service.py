@@ -70,7 +70,9 @@ def today(db: Session, user_id: int) -> UsageToday:
     )
 
 
-# 何時呼叫：OpenAI 回應成功之後（openai_client 的 on_usage）
+# 何時呼叫：OpenAI 回應成功之後。文件處理：每轉完一批向量（document_service.process_document）；
+# 問答：最後一起記（qa_service 透過 openai_client 的 on_usage 收集）
+# 寫一筆就 commit（usage_repo.add）：呼叫的人要用一個不會影響其他寫入的 session
 def record(
     db: Session, user_id: int, purpose: str, usage: Usage, document_id: int | None = None
 ) -> None:

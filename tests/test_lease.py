@@ -1,5 +1,5 @@
-# 租約、心跳、進度（docs/decisions/008）
-# 測的是：同一份文件同時只有一個 Lambda 能處理；處理中一直報平安；停止報平安就判定中斷；
+# 租約、心跳（docs/decisions/008、046）
+# 測的是：同一份文件同時只有一個 Lambda 能處理；處理中每轉完一批報一次平安；超過 10 分鐘沒報平安就判定中斷；
 # 租約被搶走的那個 Lambda 會放棄，不會跟接手的存出兩份內容
 
 from datetime import datetime, timedelta, timezone
@@ -16,7 +16,7 @@ from app.services import document_service
 from tests.helpers import create_workspace, fake_embed_texts, login_headers, upload_pdf
 from tests.pdf_fixtures import valid_pdf_bytes
 
-# 夠長的文字，切下去會變成好幾段，進度才看得出來
+# 夠長的文字，切下去會變成好幾段
 LONG_TEXT = "retrieval " * 2000
 
 
@@ -45,22 +45,11 @@ def _minutes_ago(minutes):
     return datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
 
-# 測試：處理完之後，進度是「全部段數 / 全部段數」
-def test_progress_recorded(client, db_session):
-    _, _, document_id = _upload(client, "alice@example.com")
-
-    document = db_session.get(Document, document_id)
-    chunk_count = db_session.query(Chunk).filter(Chunk.document_id == document_id).count()
-    assert document.status == "processed"
-    assert document.progress_total == chunk_count > 1
-    assert document.progress_done == chunk_count
-
-
 # 測試：兩個 Lambda 同時搶同一份文件的租約 → 只有一個成功
 def test_claim_is_exclusive(client, db_session):
     _, _, document_id = _upload(client, "bob@example.com")
     _set(db_session, document_id, status="uploaded")
-    stale_before = _minutes_ago(5)
+    stale_before = _minutes_ago(10)
 
     first = document_repo.claim(db_session, document_id, uuid4().hex, stale_before)
     second = document_repo.claim(db_session, document_id, uuid4().hex, stale_before)
@@ -69,26 +58,26 @@ def test_claim_is_exclusive(client, db_session):
     assert second is False
 
 
-# 測試：處理中、但上一個 Lambda 已經超過 5 分鐘沒報平安（判定它死了）→ 可以接手
+# 測試：處理中、但上一個 Lambda 已經超過 10 分鐘沒報平安（判定它死了）→ 可以接手
 def test_stale_lease_can_be_taken_over(client, db_session):
     _, _, document_id = _upload(client, "carol@example.com")
-    _set(db_session, document_id, status="processing", claim_token="old", heartbeat_at=_minutes_ago(6))
+    _set(db_session, document_id, status="processing", claim_token="old", heartbeat_at=_minutes_ago(11))
 
-    assert document_repo.claim(db_session, document_id, "new", _minutes_ago(5)) is True
+    assert document_repo.claim(db_session, document_id, "new", _minutes_ago(10)) is True
 
 
-# 測試：處理中、上一個 Lambda 4 分鐘前才報過平安（還活著）→ 不能搶
+# 測試：處理中、上一個 Lambda 9 分鐘前才報過平安（還活著）→ 不能搶
 def test_fresh_lease_cannot_be_taken_over(client, db_session):
     _, _, document_id = _upload(client, "dave@example.com")
-    _set(db_session, document_id, status="processing", claim_token="old", heartbeat_at=_minutes_ago(4))
+    _set(db_session, document_id, status="processing", claim_token="old", heartbeat_at=_minutes_ago(9))
 
-    assert document_repo.claim(db_session, document_id, "new", _minutes_ago(5)) is False
+    assert document_repo.claim(db_session, document_id, "new", _minutes_ago(10)) is False
 
 
-# 測試：使用者查看時，處理中超過 5 分鐘沒報平安 → 「處理中斷，請按重試」
+# 測試：使用者查看時，處理中超過 10 分鐘沒報平安 → 「處理中斷，請按重試」
 def test_listing_marks_silent_document_interrupted(client, db_session):
     headers, ws_id, document_id = _upload(client, "erin@example.com")
-    _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(6))
+    _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(11))
 
     documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
@@ -96,10 +85,10 @@ def test_listing_marks_silent_document_interrupted(client, db_session):
     assert documents[0]["error_message"] == "處理中斷，請按重試"
 
 
-# 測試：處理中、4 分鐘前才報過平安 → 不動（不能把還活著的誤判成中斷）
+# 測試：處理中、9 分鐘前才報過平安 → 不動（不能把還活著的誤判成中斷）
 def test_listing_keeps_document_with_recent_heartbeat(client, db_session):
     headers, ws_id, document_id = _upload(client, "frank@example.com")
-    _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(4))
+    _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(9))
 
     documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
@@ -109,15 +98,15 @@ def test_listing_keeps_document_with_recent_heartbeat(client, db_session):
 # 測試：每小時的 sweeper 也會把沒報平安的標中斷
 def test_sweep_marks_silent_document_interrupted(client, db_session):
     _, _, document_id = _upload(client, "grace@example.com")
-    _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(6))
+    _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(11))
 
     assert document_service.expire_overdue_documents(db_session) == 1
     db_session.refresh(db_session.get(Document, document_id))
     assert db_session.get(Document, document_id).error_message == "處理中斷，請按重試"
 
 
-# 測試：處理到一半，租約被別人接手了（自己被判定中斷）→ 放棄這次處理，這次寫的 chunk 一段都不留，
-# 也不碰文件狀態（現在是接手的人的）
+# 測試：處理到一半，租約被別人接手了（自己被判定中斷）→ 轉完這一批、報平安時發現，放棄這次處理：
+# chunk 一段都不留，也不碰文件狀態（現在是接手的人的）
 def test_worker_gives_up_when_lease_is_taken(client, db_session, monkeypatch):
     _, _, document_id = _upload(client, "henry@example.com")
     document = _set(db_session, document_id, status="uploaded")
@@ -148,17 +137,19 @@ def test_finish_rejected_with_wrong_token(client, db_session):
     _, _, document_id = _upload(client, "ivy@example.com")
     _set(db_session, document_id, status="processing", claim_token="real", heartbeat_at=datetime.now(timezone.utc))
 
-    assert document_repo.finish_processed(db_session, document_id, "fake") is False
+    assert document_repo.mark_processed(db_session, document_id, "fake", "hash") is False
+    db_session.commit()  # 就算 commit 了也沒有東西被改到
+    db_session.refresh(db_session.get(Document, document_id))
     assert db_session.get(Document, document_id).status == "processing"
 
 
 # 測試：被判定中斷之後，那個其實只是很慢的 Lambda 再來報平安 → 失敗（租約已經收回），不會把文件「救活」
 def test_heartbeat_rejected_after_interrupted(client, db_session):
     headers, ws_id, document_id = _upload(client, "jack@example.com")
-    _set(db_session, document_id, status="processing", claim_token="slow", heartbeat_at=_minutes_ago(6))
+    _set(db_session, document_id, status="processing", claim_token="slow", heartbeat_at=_minutes_ago(11))
     client.get(f"/workspaces/{ws_id}/documents", headers=headers)  # 觸發判定中斷
 
-    assert document_repo.heartbeat(db_session, document_id, "slow") is False
+    assert document_repo.update_heartbeat(db_session, document_id, "slow") is False
     db_session.refresh(db_session.get(Document, document_id))
     assert db_session.get(Document, document_id).status == "failed"
 

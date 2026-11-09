@@ -2,7 +2,7 @@
 # 送什麼內容（回答原則、資料、問題）由呼叫的 service 決定，這裡只負責送出去，另外負責兩件事：
 #   1. 把 OpenAI 的各種錯誤分成「暫時性」和「永久性」兩類（見 docs/decisions/005）
 #   2. 自己做重試（見 docs/decisions/008）：SDK 內建的重試會照 OpenAI 的「請等 N 秒」最多等 120 秒，
-#      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法在重試之間報平安、也沒辦法控制總時間
+#      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法限制等多久、也沒辦法控制問答的總時間（B3 再改成 SDK 內建的）
 # 分類完怎麼處理（標失敗、回 503）由呼叫的 service 決定，這裡不管
 
 import logging
@@ -67,6 +67,8 @@ def _client_for(base_url: str | None) -> OpenAI:
 embedding_client = _client_for(settings.embedding_base_url)
 
 # 文件處理（背景執行，沒人在等）：每次最多等 30 秒、最多試 5 次；OpenAI 叫我們等，最多等 60 秒
+# 一批最久 = 5 × 30 + 4 × 60 = 390 秒。document_service.HEARTBEAT_TIMEOUT 要比它長，改這三個數字時要一起檢查
+# （test_processing_transactions.py 的 test_heartbeat_timeout_covers_one_batch_with_all_retries 會擋）
 PROCESSING_TIMEOUT = 30
 PROCESSING_ATTEMPTS = 5
 PROCESSING_MAX_WAIT = 60
@@ -140,7 +142,6 @@ T = TypeVar("T")
 # attempts：最多試幾次；timeout：每次最多等幾秒；max_wait：OpenAI 叫我們等的上限
 # give_up_on_long_wait：OpenAI 叫我們等超過上限時，True = 直接放棄（問答），False = 等上限那麼久就好（文件處理）
 # deadline：time.monotonic() 的截止時間，超過就放棄（問答用來控制總時間）；None = 不限
-# on_attempt：每次嘗試前呼叫（文件處理用來報平安）
 def _with_retries(
     call: Callable[[float], T],
     *,
@@ -149,7 +150,6 @@ def _with_retries(
     max_wait: float,
     give_up_on_long_wait: bool,
     deadline: float | None = None,
-    on_attempt: Callable[[], None] | None = None,
 ) -> T:
     for attempt in range(attempts):
         this_timeout = timeout
@@ -159,8 +159,6 @@ def _with_retries(
             if remaining < 1:
                 raise OpenAITemporaryError("時間預算用完了")
             this_timeout = min(timeout, remaining)
-        if on_attempt is not None:
-            on_attempt()
         try:
             return call(this_timeout)
         except openai.OpenAIError as exc:
@@ -191,32 +189,29 @@ def _with_retries(
 
 # 何時呼叫：document_service 處理文件時，一次把一批 chunk 送去轉向量
 # 一次送很多段，比一段一段送少很多次來回（300 頁約 330 段，每批 100 段只要呼叫 4 次）
-# on_attempt：每次嘗試前呼叫，document_service 用它報平安（docs/decisions/008）
-# on_usage：成功之後呼叫，把這次用了多少交給呼叫的人記錄（docs/decisions/012）
-#   只有成功才會呼叫：失敗的請求 OpenAI 不收錢
-def embed_texts(
-    texts: list[str],
-    on_attempt: Callable[[], None] | None = None,
-    on_usage: Callable[[Usage], None] | None = None,
-) -> list[list[float]]:
+# 回傳 (每一段的向量, 這次用了多少)。用量交給呼叫的人記錄（docs/decisions/012）：只有成功才有，失敗的請求 OpenAI 不收錢
+def embed_texts(texts: list[str]) -> tuple[list[list[float]], Usage]:
+    # call(timeout)：_with_retries 每次嘗試時呼叫它，傳入這次最多等幾秒（B3 改用 SDK 內建的重試時拿掉）
     def call(timeout: float):
         # with_options(timeout=...)：只有這一次呼叫用這個等待上限，不影響其他地方
         return embedding_client.with_options(timeout=timeout).embeddings.create(
             model=EMBEDDING_MODEL, input=texts
         )
 
-    response = _with_retries(
+    response = _with_retries(                                                   # ← 呼叫 OpenAI
         call,
         attempts=PROCESSING_ATTEMPTS,
         timeout=PROCESSING_TIMEOUT,
         max_wait=PROCESSING_MAX_WAIT,
         give_up_on_long_wait=False,
-        on_attempt=on_attempt,
     )
-    _report_embedding_usage(response, on_usage)
-    # response.data 是「每一段各自的結果」，每筆帶一個 index 對應它是第幾段輸入
-    # 照 index 排好再取向量，保證第 i 個向量一定對應第 i 段文字
-    return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+    # response.data 是「每一段各自的結果」，每筆帶一個 index（它是第幾段輸入）
+    # 照 index 放回原本的位置，保證第 i 個向量一定對應第 i 段文字
+    vectors = [None] * len(texts)
+    for item in response.data:
+        vectors[item.index] = item.embedding
+    usage = Usage(EMBEDDING_MODEL, response.usage.prompt_tokens)
+    return vectors, usage
 
 
 # 何時呼叫：qa_service 把使用者的問題轉成向量，拿去跟 chunk 比相似度

@@ -25,11 +25,11 @@ from tests.pdf_fixtures import valid_pdf_bytes
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    # 假的 OpenAI：跟真的一樣，成功之後把用了多少交給 on_usage
-    def embed_texts(texts, on_attempt=None, on_usage=None):
-        if on_usage:
-            on_usage(Usage(openai_client.EMBEDDING_MODEL, 1000 * len(texts)))
-        return fake_embed_texts(texts)
+    # 假的 OpenAI，跟真的一樣回報用了多少：
+    #   文件處理（embed_texts）直接回傳 (向量, 用量)；問答（embed_query、generate_answer）成功之後交給 on_usage
+    def embed_texts(texts):
+        vectors, _ = fake_embed_texts(texts)
+        return vectors, Usage(openai_client.EMBEDDING_MODEL, 1000 * len(texts))
 
     def embed_query(text, deadline=None, on_usage=None):
         if on_usage:

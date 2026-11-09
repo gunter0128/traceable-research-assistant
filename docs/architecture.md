@@ -89,9 +89,10 @@ API 跑在 Lambda 上，一次只能收 6 MB，上限是 20 MB，所以檔案不
 SQS 工單 ──▶ Lambda：worker（worker.handle_process_message → document_service.process_document）
                1. 取得租約（同一份文件同時只有一個 Lambda 能處理，008）
                2. 從 S3 下載 → 算內容的 SHA-256，跟同一個 workspace 已處理好的一樣就標失敗（022）
-               3. 解析 PDF → 切段（500 token、重疊 50）→ 每 100 段送去轉向量 → 存進 chunks 表
-                  每次呼叫 OpenAI 前都報平安、更新進度
+               3. 解析 PDF → 切段（500 token、重疊 50）→ 每 100 段送去轉向量，向量先放在記憶體
+                  每轉完一批：另開 session 記用量（馬上 commit）、報一次平安（046）
                4. 「所有 chunk + 狀態改成完成」在同一個 transaction 一起生效
+               下載、呼叫 OpenAI 的時候不持有資料庫的 transaction（046）
 
 EventBridge 每小時 ──▶ Lambda：sweeper（worker.handle_sweep）
                把卡住的文件標失敗、清掉 S3 上沒有紀錄的舊檔案
@@ -104,7 +105,7 @@ EventBridge 每小時 ──▶ Lambda：sweeper（worker.handle_sweep）
 | 處理到一半失敗 | 整份文件一個 transaction，rollback，不留半套 chunk |
 | 同一份文件被處理兩次 | 先刪舊 chunk 再存新的，結果一樣；已完成、已失敗的文件搶不到租約，直接跳過 |
 | OpenAI / S3 暫時連不上 | 秒級重試，還是不行就標失敗「…暫時無法使用，請稍後按重試」，使用者按重試（046；原本 005 是叫 SQS 2 分鐘後再送，最多 3 回合） |
-| Lambda 處理到一半死掉 | 超過 5 分鐘沒報平安就標「處理中斷，請按重試」（008） |
+| Lambda 處理到一半死掉 | 超過 10 分鐘沒報平安就標「處理中斷，請按重試」（008、046：每轉完一批報一次平安） |
 | 工單送出去之後一直沒人處理 | 排隊中超過 15 分鐘就標「處理逾時，請按重試」（007） |
 | 使用者按取消 | 收回租約；正在處理的 Lambda 下次報平安時發現不是自己的了，自己停下來（009） |
 | 掃描檔、超過 300 頁、壞掉的 PDF | 標失敗並寫明原因，前端顯示 |

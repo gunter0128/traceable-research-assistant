@@ -34,11 +34,14 @@
 | 下載 PDF | 檔案不見了 | 標失敗「找不到上傳的檔案，請刪除後重新上傳」，不重試 | 測試（test_missing_file_fails_with_clear_reason）；真的 S3 回的錯誤也確認會被分類成「檔案不存在」 |
 | 下載 PDF | 沒權限讀檔案 | 標失敗「系統設定有誤」，不重試 | 測試（test_s3_errors_are_classified） |
 | 解析 | PDF 壞掉 / 超過 300 頁 / 抓不到字 | 標失敗並寫明原因，不重試 | 測試（test_corrupt_pdf_has_reason 等三個） |
-| 轉向量 | OpenAI 暫時連不上 | 自己寫的重試：每次嘗試前報平安，最多 5 次；還是不行就標失敗「AI 服務暫時無法使用，請稍後按重試」，已經寫的 chunk 全部撤回，工單不延後（decisions/046；以前是 2 分鐘後再一回合，最多 3 回合） | 測試（test_temporary_error_*、test_worker_finishes_normally_on_temporary_error、test_temporary_failure_can_be_retried、test_retries_with_growing_backoff）；雲端的演練 1 是改之前的做法 |
-| 轉向量 | OpenAI 說「請等 N 秒」 | 照做，但最多等 60 秒（以前套件會照做最多 120 秒，而且中間沒辦法報平安） | 測試（test_processing_caps_long_retry_after） |
+| 轉向量 | OpenAI 暫時連不上 | 自己寫的重試，最多 5 次；還是不行就標失敗「AI 服務暫時無法使用，請稍後按重試」，工單不延後（decisions/046；以前是 2 分鐘後再一回合，最多 3 回合）。chunks 最後才寫，所以一段都不會留；前面幾批已經花掉的用量照樣有紀錄 | 測試（test_temporary_error_*、test_worker_finishes_normally_on_temporary_error、test_temporary_failure_can_be_retried、test_failed_second_batch_keeps_usage_and_saves_no_chunks、test_retries_with_growing_backoff）；雲端的演練 1 是改之前的做法 |
+| 轉向量 | OpenAI 說「請等 N 秒」 | 照做，但最多等 60 秒（以前套件會照做最多 120 秒） | 測試（test_processing_caps_long_retry_after） |
 | 轉向量 | OpenAI 永久性錯誤（key 無效、餘額不足） | 立刻標失敗「系統設定有誤」 | 測試（test_permanent_error_fails_immediately）、本機真的 OpenAI（演練 2） |
+| 轉向量 | 轉得很慢 | 每轉完一批報一次平安；一批加上所有重試最多 6.5 分鐘，比 10 分鐘的期限短，不會被誤判（decisions/046） | 測試（test_heartbeat_timeout_covers_one_batch_with_all_retries） |
 | 存 chunk | 中途任何錯誤 | rollback，一段都不留 | 測試（test_failed_processing_leaves_no_chunks） |
-| 整個執行 | Lambda 處理到一半被強制中斷（超時、記憶體不夠） | 沒 commit 的資料隨連線中斷自動丟棄；停止報平安，5 分鐘後標「處理中斷，請按重試」（decisions/008） | 測試（test_listing_marks_silent_document_interrupted）、雲端（演練 3 重做：上傳後 5.3 分鐘標中斷） |
+| 存 chunk | 最後一次報平安之後才被判定中斷 | 存結果時有條件的 UPDATE 改不到，整批放棄，一段都不留 | 測試（test_lease_lost_after_last_heartbeat_saves_no_chunks） |
+| 報平安 | 資料庫出錯 | 標失敗，不存 chunks | 測試（test_heartbeat_error_fails_document_without_saving_chunks） |
+| 整個執行 | Lambda 處理到一半被強制中斷（超時、記憶體不夠） | 沒 commit 的資料隨連線中斷自動丟棄；停止報平安，10 分鐘後標「處理中斷，請按重試」（decisions/008、046） | 測試（test_listing_marks_silent_document_interrupted）；雲端的演練 3 重做時是 5 分鐘的期限（上傳後 5.3 分鐘標中斷） |
 | 整個執行 | 在取得租約之前就被中斷 | 文件還在排隊中，15 分鐘後標「處理逾時」 | 雲端（演練 3 發現的，decisions/007），測試（test_listing_expires_overdue_document） |
 | 整個執行 | 使用者按「取消處理」 | 狀態改成已取消、收回租約；正在處理的 Lambda 下次報平安時發現代碼對不上，自己停下來，寫到一半的全部丟掉（decisions/009） | 測試（test_cancel_stops_running_worker、test_cancelled_document_is_skipped_by_worker） |
 | 整個執行 | 其實沒死只是很慢，被判定中斷後使用者按了重試 | 舊的 Lambda 報平安或存結果時發現租約不是自己的，放棄這次處理，不會存出兩份 | 測試（test_worker_gives_up_when_lease_is_taken、test_heartbeat_rejected_after_interrupted） |

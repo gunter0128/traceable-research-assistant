@@ -108,21 +108,15 @@ def claim(db: Session, document_id: int, token: str, stale_before: datetime) -> 
     return claimed == 1
 
 
-# 何時呼叫：處理過程中報平安。done / total 有給的話順便更新進度
-# 回傳 False 代表租約已經不是自己的了（被判定中斷、或別人接手了），呼叫的人要放棄這次處理
-def heartbeat(
-    db: Session, document_id: int, token: str, done: int | None = None, total: int | None = None
-) -> bool:
-    values = {Document.heartbeat_at: datetime.now(timezone.utc)}
-    if done is not None:
-        values[Document.progress_done] = done
-    if total is not None:
-        values[Document.progress_total] = total
+# 何時呼叫：處理過程中報平安（解析切段完、每轉完一批向量），更新「最後一次有進度的時間」（docs/decisions/046）
+# 一句 UPDATE、馬上 commit：自己一個很短的交易
+# 回傳 False 代表租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉、別人接手），呼叫的人要停下來
+def update_heartbeat(db: Session, document_id: int, token: str) -> bool:
     updated = (
         db.query(Document)
         .filter(Document.id == document_id, Document.claim_token == token)
         .filter(Document.status == "processing")
-        .update(values, synchronize_session=False)
+        .update({Document.heartbeat_at: datetime.now(timezone.utc)}, synchronize_session=False)
     )
     db.commit()
     return updated == 1
@@ -139,11 +133,12 @@ def find_duplicate(db: Session, workspace_id: int, content_hash: str, exclude_id
     )
 
 
-# 何時呼叫：全部處理完，要把「新的 chunk + 狀態改成完成」一起存進去
-# 先下 UPDATE 看租約還是不是自己的，是才 commit（chunk 跟狀態在同一個 transaction，一起生效）；
-# 不是就 rollback，這次寫的 chunk 全部丟掉，不會跟接手的 Lambda 存出兩份
+# 何時呼叫：全部轉完向量、要存結果的時候。把狀態改成「完成」，但「不 commit」：
+#   呼叫的人接著寫 chunks，再一起 commit，chunks 和「完成」才會在同一刻生效
+# 條件：租約還是自己的；改不到（回傳 False）代表租約已經不是自己的了，呼叫的人要 rollback、整批放棄
+# 先改狀態再寫 chunks：UPDATE 會鎖住這一列，到 commit 之前別人（sweeper、使用者查看時）都改不了它
 # content_hash：檔案內容的指紋，處理成功時一起記下（docs/decisions/022）
-def finish_processed(db: Session, document_id: int, token: str, content_hash: str | None = None) -> bool:
+def mark_processed(db: Session, document_id: int, token: str, content_hash: str) -> bool:
     updated = (
         db.query(Document)
         .filter(Document.id == document_id, Document.claim_token == token)
@@ -159,15 +154,11 @@ def finish_processed(db: Session, document_id: int, token: str, content_hash: st
             synchronize_session=False,
         )
     )
-    if updated != 1:
-        db.rollback()
-        return False
-    db.commit()
-    return True
+    return updated == 1
 
 
 # 何時呼叫：處理中出錯要標失敗。一樣要租約還是自己的才標，不然會蓋掉接手的 Lambda 的狀態
-def fail_with_lease(db: Session, document_id: int, token: str, reason: str) -> bool:
+def mark_failed_if_claimed(db: Session, document_id: int, token: str, reason: str) -> bool:
     updated = (
         db.query(Document)
         .filter(Document.id == document_id, Document.claim_token == token)
@@ -204,6 +195,7 @@ def cancel(db: Session, document_id: int) -> bool:
 # 何時呼叫：使用者查文件時、每小時的 sweeper。把卡住的文件標失敗，回傳標了幾份
 #   處理中，最後報平安在 heartbeat_before 之前 → interrupted_reason（程式死了）
 #   排隊中，最後送出工單在 queued_before 之前 → timed_out_reason（一直沒人來處理）
+# 只動「處理中」「排隊中」的文件：已完成、已失敗的不管多久以前都不會被改到
 # document_id / workspace_id 有給就只檢查那些文件，都沒給就全部檢查（sweeper）
 # coalesce(a, b, c)：a 是空的就用 b，再空就用 c。時間沒記到的，往前找一個有的
 def expire_overdue(
@@ -216,16 +208,8 @@ def expire_overdue(
     document_id: int | None = None,
     workspace_id: int | None = None,
 ) -> int:
-    def scoped():
-        query = db.query(Document)
-        if document_id is not None:
-            query = query.filter(Document.id == document_id)
-        if workspace_id is not None:
-            query = query.filter(Document.workspace_id == workspace_id)
-        return query
-
     interrupted = (
-        scoped()
+        _documents_in_scope(db, document_id, workspace_id)
         .filter(Document.status == "processing")
         .filter(func.coalesce(Document.heartbeat_at, Document.queued_at, Document.uploaded_at) < heartbeat_before)
         .update(
@@ -234,7 +218,7 @@ def expire_overdue(
         )
     )
     timed_out = (
-        scoped()
+        _documents_in_scope(db, document_id, workspace_id)
         .filter(Document.status == "uploaded")
         .filter(func.coalesce(Document.queued_at, Document.uploaded_at) < queued_before)
         .update(
@@ -244,6 +228,16 @@ def expire_overdue(
     )
     db.commit()
     return interrupted + timed_out
+
+
+# expire_overdue 要檢查哪些文件：有給 document_id / workspace_id 就只看那些，都沒給就是全部
+def _documents_in_scope(db: Session, document_id: int | None, workspace_id: int | None):
+    query = db.query(Document)
+    if document_id is not None:
+        query = query.filter(Document.id == document_id)
+    if workspace_id is not None:
+        query = query.filter(Document.workspace_id == workspace_id)
+    return query
 
 
 # 何時呼叫：每小時的對帳，拿到「資料庫裡所有文件記錄的 S3 位置」，跟 S3 上實際的檔案比對

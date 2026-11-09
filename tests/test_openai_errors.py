@@ -386,13 +386,3 @@ def test_does_not_wait_past_deadline(sleeps):
         _retry(call, max_wait=5, give_up_on_long_wait=True, deadline=time.monotonic() + 3)
     assert len(record) == 1
     assert sleeps == []
-
-
-# 測試：每次嘗試之前都會呼叫 on_attempt（文件處理用它報平安）
-def test_calls_on_attempt_before_each_try(sleeps):
-    call, _ = _calls(_connection_error(), _connection_error(), "ok")
-    heartbeats = []
-
-    _retry(call, on_attempt=lambda: heartbeats.append(1))
-
-    assert len(heartbeats) == 3

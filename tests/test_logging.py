@@ -43,13 +43,7 @@ def logs():
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    # 跟真的 embed_texts 一樣，呼叫 OpenAI 之前先呼叫 on_attempt（試一次就成功）
-    def fake_embed(texts, on_attempt=None, **kwargs):
-        if on_attempt is not None:
-            on_attempt()
-        return fake_embed_texts(texts)
-
-    monkeypatch.setattr(openai_client, "embed_texts", fake_embed)
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
 
 
 # 建 workspace + 上傳一份。檔名預設是 secret-findings.pdf：test_no_user_content_in_logs 檢查它不會出現在 log 裡
@@ -100,6 +94,7 @@ def test_request_is_logged_with_id(client, logs):
 
 
 # 測試：上傳 → 處理的每一筆 log 都帶著同一個請求編號和文件編號，串得起來
+# openai_usage 是記用量時寫的：用量在另一個 session 寫，log 一樣串得起來
 def test_upload_and_processing_share_ids(client, logs):
     headers = login_headers(client, "alice@example.com")
 
@@ -107,11 +102,12 @@ def test_upload_and_processing_share_ids(client, logs):
 
     request_id = response.headers["X-Request-ID"]
     document_id = response.json()["id"]
-    for event in ("uploaded", "claimed", "downloaded", "parsed", "chunked", "embed_batch", "processed"):
+    for event in ("uploaded", "claimed", "downloaded", "chunked", "openai_usage", "processed"):
         entry = logs.named(event)[-1]
         assert entry["request_id"] == request_id, event
         assert entry["document_id"] == document_id, event
-    assert logs.named("embed_batch")[-1]["openai_attempts"] == 1
+    assert logs.named("downloaded")[-1]["size_bytes"] > 0
+    assert logs.named("chunked")[-1]["chunks"] >= 1
     assert "total_ms" in logs.named("processed")[-1]
 
 
