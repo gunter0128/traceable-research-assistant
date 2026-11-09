@@ -151,6 +151,24 @@ def related(a: dict, b: dict) -> float:
     return similar(BOILERPLATE.sub("", a["name"]), BOILERPLATE.sub("", b["name"]))
 
 
+# 兩份一組的出題工作（版本、適用範圍、跨文件）：(題型, 提示, [兩份文件])
+# rng：plan / plan_more 的隨機數產生器，取段落時用；先取第一份、再取第二份，順序不能換（換了出的題目就不一樣）
+def pair_task(qtype: str, first: dict, second: dict, rng: random.Random) -> tuple[str, str, list[dict]]:
+    prompt = PAIR.format(task=PAIR_TASKS[qtype], rules=COMMON_RULES, qtype=qtype,
+                         file1=first["file"], text1=excerpt(first["text"], rng),
+                         file2=second["file"], text2=excerpt(second["text"], rng))
+    return qtype, prompt, [first, second]
+
+
+# 兩份一組的題型：只配同主題、而且名稱真的相關的（related ≥ minimum），配不到回傳 None
+# 有好幾份符合的話，挑名稱最像的那份（max 的 key：用每一份跟 doc 的相似度來比）
+def best_match(doc: dict, candidates: list[dict], minimum: float = PAIR_MIN_SIMILARITY) -> dict | None:
+    candidates = [c for c in candidates if related(doc, c) >= minimum]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: related(doc, c))
+
+
 # 要問 Qwen 的出題工作：[(題型, 提示, 這次用到的文件)]
 def plan(docs: list[dict], pilot: bool) -> list[tuple[str, str, list[dict]]]:
     rng = random.Random(2026)
@@ -161,34 +179,23 @@ def plan(docs: list[dict], pilot: bool) -> list[tuple[str, str, list[dict]]]:
     for d in singles:
         tasks.append(("single", SINGLE.format(rules=COMMON_RULES, file=d["file"], text=excerpt(d["text"], rng)), [d]))
 
-    def pair(qtype, first, second):
-        prompt = PAIR.format(task=PAIR_TASKS[qtype], rules=COMMON_RULES, qtype=qtype,
-                             file1=first["file"], text1=excerpt(first["text"], rng),
-                             file2=second["file"], text2=excerpt(second["text"], rng))
-        tasks.append((qtype, prompt, [first, second]))
-
-    # 兩份一組的題型：只配同主題、而且名稱真的相關的（related ≥ PAIR_MIN_SIMILARITY），配不到就不出
-    def best(doc, candidates, minimum=PAIR_MIN_SIMILARITY):
-        candidates = [c for c in candidates if related(doc, c) >= minimum]
-        return max(candidates, key=lambda c: related(doc, c)) if candidates else None
-
     # 版本：已廢止的規章配取代它的現行規章
     for old in rng.sample(abolished, min(6 if pilot else len(abolished), len(abolished))):
-        new = best(old, [d for d in current if d["topic"] == old["topic"]])
+        new = best_match(old, [d for d in current if d["topic"] == old["topic"]])
         if new:
-            pair("version", old, new)
+            tasks.append(pair_task("version", old, new, rng))
     # 適用範圍：某個機關的規章配全市府的規章
     bureau = [d for d in current if d["bureau"]]
     for own in rng.sample(bureau, min(6 if pilot else len(bureau), len(bureau))):
-        citywide = best(own, [d for d in current if d["topic"] == own["topic"] and not d["bureau"]], SCOPE_MIN_SIMILARITY)
+        citywide = best_match(own, [d for d in current if d["topic"] == own["topic"] and not d["bureau"]], SCOPE_MIN_SIMILARITY)
         if citywide:
-            pair("scope", citywide, own)
+            tasks.append(pair_task("scope", citywide, own, rng))
     # 跨文件：同主題、名稱相關的兩份現行規章
     topics = sorted({d["topic"] for d in current})
     pairs = [(a, b) for i, a in enumerate(current) for b in current[i + 1:]
              if a["topic"] == b["topic"] and related(a, b) >= PAIR_MIN_SIMILARITY]
     for a, b in rng.sample(pairs, min(3 if pilot else 40, len(pairs))):
-        pair("cross_doc", a, b)
+        tasks.append(pair_task("cross_doc", a, b, rng))
     # 沒有答案：每個主題一次，每次 4 題
     for topic in topics[:1] if pilot else topics:
         listing = "\n".join(f"- {d['name']}：{' '.join(d['text'][:120].split())}" for d in docs if d["topic"] == topic)
@@ -204,34 +211,23 @@ def plan_more(docs: list[dict]) -> list[tuple[str, str, list[dict]]]:
     abolished = [d for d in docs if d["abolished"] and len(d["text"]) >= 300]
     new = {d["file"] for d in docs if d.get("batch") == 2}
     tasks = []
-
-    def pair(qtype, first, second):
-        prompt = PAIR.format(task=PAIR_TASKS[qtype], rules=COMMON_RULES, qtype=qtype,
-                             file1=first["file"], text1=excerpt(first["text"], rng),
-                             file2=second["file"], text2=excerpt(second["text"], rng))
-        tasks.append((qtype, prompt, [first, second]))
-
-    def best(doc, candidates, minimum=PAIR_MIN_SIMILARITY):
-        candidates = [c for c in candidates if related(doc, c) >= minimum]
-        return max(candidates, key=lambda c: related(doc, c)) if candidates else None
-
     for d in current:
         if d["file"] in new:
             tasks.append(("single", SINGLE.format(rules=COMMON_RULES, file=d["file"], text=excerpt(d["text"], rng)), [d]))
     # 版本：新的舊版配現行的；舊的舊版只在配到的現行規章是新的時候才出（配舊的那組第 1 批出過了）
     for old in abolished:
-        newest = best(old, [d for d in current if d["topic"] == old["topic"]])
+        newest = best_match(old, [d for d in current if d["topic"] == old["topic"]])
         if newest and (old["file"] in new or newest["file"] in new):
-            pair("version", old, newest)
+            tasks.append(pair_task("version", old, newest, rng))
     # 適用範圍：同上，有一份是新的才出
     for own in [d for d in current if d["bureau"]]:
-        citywide = best(own, [d for d in current if d["topic"] == own["topic"] and not d["bureau"]], SCOPE_MIN_SIMILARITY)
+        citywide = best_match(own, [d for d in current if d["topic"] == own["topic"] and not d["bureau"]], SCOPE_MIN_SIMILARITY)
         if citywide and (own["file"] in new or citywide["file"] in new):
-            pair("scope", citywide, own)
+            tasks.append(pair_task("scope", citywide, own, rng))
     pairs = [(a, b) for i, a in enumerate(current) for b in current[i + 1:]
              if a["topic"] == b["topic"] and related(a, b) >= PAIR_MIN_SIMILARITY and (a["file"] in new or b["file"] in new)]
     for a, b in rng.sample(pairs, min(30, len(pairs))):
-        pair("cross_doc", a, b)
+        tasks.append(pair_task("cross_doc", a, b, rng))
     for d in current:
         tasks.append(("persona", PERSONA.format(rules=COMMON_RULES, file=d["file"], text=excerpt(d["text"], rng)), [d]))
     return tasks
@@ -303,8 +299,10 @@ def main():
     tasks = plan_more(docs) if args.more else plan(docs, args.pilot)
     print(f"出題工作 {len(tasks)} 個：" + "、".join(f"{t} {sum(x[0] == t for x in tasks)}" for t in dict.fromkeys(x[0] for x in tasks)))
     client = OpenAI(base_url=args.base_url, api_key="not-needed", max_retries=2)
+    # 同時問 4 題：每題交給 pool 一個工作（submit），再照原本的順序一題一題拿回結果
     with ThreadPoolExecutor(max_workers=4) as pool:
-        answers = list(pool.map(lambda task: ask(client, task[1]), tasks))
+        jobs = [pool.submit(ask, client, prompt) for _, prompt, _ in tasks]
+        answers = [job.result() for job in jobs]
 
     # 第 2 批：題號接著編，太像的題目也要跟第 1 批的比
     before = [json.loads(line) for line in (DATA / "questions.jsonl").read_text(encoding="utf-8").splitlines()
