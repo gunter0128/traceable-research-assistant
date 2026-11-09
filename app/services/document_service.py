@@ -1,4 +1,4 @@
-# document 的規則：上傳（發許可、建紀錄）、背景處理（解析 → 切段 → 轉向量）、重試、取消、刪除、卡住的偵測
+# document 的規則：上傳（發許可、建紀錄）、背景處理（解析 → 切段 → 轉向量）、重試、刪除、卡住的偵測
 # ownership 透過 workspace 判斷
 # 不寫 SQL 不碰 HTTP
 
@@ -83,13 +83,9 @@ class UploadTicket:
     key: str
 
 
-# 只有失敗、或使用者自己取消的文件可以手動重試（排隊中、處理中、已完成的不行）
+# 只有失敗的文件可以手動重試（排隊中、處理中、已完成的不行）
+# 已取消（cancelled）的也可以：取消功能拿掉了（docs/decisions/046），但資料庫裡可能還有以前取消的文件
 class DocumentNotRetryable(Exception):
-    pass
-
-
-# 只有排隊中、處理中的文件可以取消（已完成、已失敗的沒有東西可以停）
-class DocumentNotCancellable(Exception):
     pass
 
 
@@ -195,7 +191,7 @@ def dispatch_document(db: Session, document: Document) -> Document:
     return document
 
 
-# 使用者手動按重試：失敗或已取消的文件可以，回到排隊中、次數歸零，重新交出去
+# 使用者手動按重試：失敗（或以前取消）的文件可以，回到排隊中、次數歸零，重新交出去
 # 處理中斷、處理逾時的文件也走這裡：get_owned_document 會先把卡住的標成失敗，就能重試
 def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     document = get_owned_document(db, document_id, owner_id)
@@ -211,21 +207,6 @@ def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
         raise DocumentNotRetryable
     db.refresh(document)
     return dispatch_document(db, document)
-
-
-# 使用者按「取消處理」（docs/decisions/009）：不想等了，先停下來，文件留著之後可以重試或刪掉
-# 跟刪除不一樣：刪除是整份文件不要了；取消是先停下來，等一下再說
-def cancel_document(db: Session, document_id: int, owner_id: int) -> Document:
-    get_owned_document(db, document_id, owner_id)
-    # 判斷「能不能取消」交給資料庫的有條件更新，不在這裡先查狀態再改：
-    # 查和改之間，Lambda 可能剛好處理完，先查再改會把「已完成」的文件誤改成「已取消」
-    if not document_repo.cancel(db, document_id):
-        raise DocumentNotCancellable
-    log.bind_document(document_id)
-    log.event("cancelled")
-    document = document_repo.get_by_id(db, document_id)
-    db.refresh(document)
-    return document
 
 
 # 把卡住的文件標失敗，回傳標了幾份（方便在 log 裡看）。卡住的兩種情況（docs/decisions/008、046）：
@@ -320,7 +301,7 @@ def process_document(db: Session, document: Document) -> Document | None:
             with SessionLocal() as usage_db:
                 usage_service.record(usage_db, owner_id, "document", usage, document_id=document_id)
 
-            # 報平安（commit）。租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉）就停下來，不再花錢
+            # 報平安（commit）。租約已經不是自己的了（被判定中斷、文件被刪掉）就停下來，不再花錢
             if not document_repo.update_heartbeat(db, document_id, token):
                 return _stop_after_losing_claim(db, document_id, started)
 
@@ -361,7 +342,7 @@ def process_document(db: Session, document: Document) -> Document | None:
     return document_repo.get_by_id(db, document_id)
 
 
-# 租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉）：
+# 租約已經不是自己的了（被判定中斷、文件被刪掉）：
 # 停下來，撤回這次還沒 commit 的東西，也不碰文件的狀態（現在是別人的）
 # 回傳資料庫裡最新的樣子；文件被刪掉了就是 None（不用 db.refresh：讀不到已經刪掉的文件會丟出錯誤）
 def _stop_after_losing_claim(db: Session, document_id: int, started: float) -> Document | None:

@@ -2,8 +2,9 @@
 # 測的是：
 #   只有排隊中的文件搶得到租約，同一份文件同時只有一個 Lambda 能處理（包括真的同時搶）
 #   處理中的文件不會被別的 Lambda 接手：超過 10 分鐘沒報平安，由 sweeper / 使用者查看時標成「處理中斷」，再由使用者按重試
-#   租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉）的 Lambda 會停下來，結果存不進去
+#   租約已經不是自己的了（被判定中斷、文件被刪掉）的 Lambda 會停下來，結果存不進去
 #   處理到一半文件被刪掉：worker 正常結束（不算當掉、不寫 ERROR），本機模式上傳的請求回 404
+#   以前取消的文件（取消功能已經拿掉）：照常列出、不會被處理、可以重試；取消的 API 回 404
 
 import json
 import threading
@@ -312,43 +313,34 @@ def test_inline_upload_returns_404_when_document_deleted_while_processing(client
     assert response.status_code == 404
 
 
-# ---------- 取消處理（docs/decisions/009）----------
+# ---------- 以前取消的文件（docs/decisions/009、046）----------
+# 「取消處理」拿掉了，不會再產生新的「已取消」文件；但正式資料庫裡可能還有以前取消的，要照常顯示、可以重試
+# 測試裡直接把狀態改成 cancelled，模擬這些舊資料
 
 
-# 測試：Lambda 正在處理時，使用者按了取消 → Lambda 下次報平安時發現代碼對不上，自己停下來，
-# 寫到一半的 chunk 一段都不留，文件狀態是「已取消」
-def test_cancel_stops_running_worker(client, db_session, monkeypatch):
-    headers, _, document_id = _upload(client, "kate@example.com")
-    document = _set(db_session, document_id, status="uploaded")
-    db_session.query(Chunk).filter(Chunk.document_id == document_id).delete()
-    db_session.commit()
+# 測試：以前取消的文件照常列出來，狀態還是「已取消」（逾時檢查只動排隊中、處理中的，不會把它改掉）
+# 順便確認文件的回應裡已經沒有進度欄位
+def test_old_cancelled_document_is_still_listed(client, db_session):
+    headers, ws_id, document_id = _upload(client, "kate@example.com")
+    _set(db_session, document_id, status="cancelled", claim_token=None, heartbeat_at=_minutes_ago(60))
 
-    # 假的 OpenAI：被呼叫時，模擬「使用者在這時候按了取消」（走真的 API，跟使用者做的事一樣）
-    def cancel_then_embed(texts, **kwargs):
-        response = client.post(f"/documents/{document_id}/cancel", headers=headers)
-        assert response.status_code == 200
-        return fake_embed_texts(texts)
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
-    monkeypatch.setattr(openai_client, "embed_texts", cancel_then_embed)
-
-    document_service.process_document(db_session, document)
-
-    assert db_session.query(Chunk).filter(Chunk.document_id == document_id).count() == 0
-    db_session.refresh(document)
-    assert document.status == "cancelled"
+    assert documents[0]["status"] == "cancelled"
+    assert "progress_done" not in documents[0]
+    assert "progress_total" not in documents[0]
 
 
-# 測試：還在排隊時取消 → 之後 Lambda 拿到工單，搶不到租約，完全不處理
-def test_cancelled_document_is_skipped_by_worker(client, db_session, monkeypatch):
-    headers, _, document_id = _upload(client, "leo@example.com")
-    document = _set(db_session, document_id, status="uploaded")
-    client.post(f"/documents/{document_id}/cancel", headers=headers)
+# 測試：以前取消的文件，又收到工單（例如取消前送出、還在佇列裡的）→ 搶不到租約，完全不處理
+def test_old_cancelled_document_is_skipped_by_worker(client, db_session, monkeypatch):
+    _, _, document_id = _upload(client, "leo@example.com")
+    document = _set(db_session, document_id, status="cancelled", claim_token=None)
 
     # 從這裡開始記錄有沒有呼叫 OpenAI。不在假函式裡直接 raise：
     # process_document 會接住所有錯誤，測試反而看不出「其實呼叫了」
     calls = []
 
-    def record_embed(texts, **kwargs):
+    def record_embed(texts):
         calls.append(texts)
         return fake_embed_texts(texts)
 
@@ -361,33 +353,26 @@ def test_cancelled_document_is_skipped_by_worker(client, db_session, monkeypatch
     assert document.status == "cancelled"
 
 
-# 測試：已經處理完的文件不能取消（409），沒有東西可以停
-def test_cannot_cancel_processed_document(client):
-    headers, _, document_id = _upload(client, "mia@example.com")  # 本機模式，上傳完就處理好了
-
-    response = client.post(f"/documents/{document_id}/cancel", headers=headers)
-
-    assert response.status_code == 409
-
-
-# 測試：不能取消別人的文件（403）
-def test_cannot_cancel_others_document(client, db_session):
-    _, _, document_id = _upload(client, "nina@example.com")
-    _set(db_session, document_id, status="uploaded")
-    other_headers = login_headers(client, "owen@example.com")
-
-    response = client.post(f"/documents/{document_id}/cancel", headers=other_headers)
-
-    assert response.status_code == 403
-
-
-# 測試：取消之後可以按重試，重新處理完成
-def test_cancelled_document_can_be_retried(client, db_session):
+# 測試：以前取消的文件可以按重試，重新處理完成
+def test_old_cancelled_document_can_be_retried(client, db_session):
     headers, _, document_id = _upload(client, "paul@example.com")
-    _set(db_session, document_id, status="uploaded")
-    client.post(f"/documents/{document_id}/cancel", headers=headers)
+    _set(db_session, document_id, status="cancelled", claim_token=None)
+    db_session.query(Chunk).filter(Chunk.document_id == document_id).delete()  # 上傳時處理出來的先清掉，才看得出有沒有重新處理
+    db_session.commit()
 
     response = client.post(f"/documents/{document_id}/retry", headers=headers)
 
     assert response.status_code == 200
     assert response.json()["status"] == "processed"
+    assert db_session.query(Chunk).filter(Chunk.document_id == document_id).count() > 0
+
+
+# 測試：取消的 API 拿掉了 → 404；部署後還開著舊畫面的人按到取消，文件也不會被改到
+def test_cancel_endpoint_is_removed(client, db_session):
+    headers, _, document_id = _upload(client, "mia@example.com")
+    _set(db_session, document_id, status="uploaded")
+
+    response = client.post(f"/documents/{document_id}/cancel", headers=headers)
+
+    assert response.status_code == 404
+    assert db_session.get(Document, document_id).status == "uploaded"

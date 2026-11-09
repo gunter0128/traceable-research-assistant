@@ -57,10 +57,12 @@ def mark_queued(db: Session, document: Document) -> Document:
     return document
 
 
-# 何時呼叫：使用者手動按重試。使用者明確要求重來：回到排隊中，次數歸零，租約、進度、失敗原因清掉
+# 何時呼叫：使用者手動按重試。使用者明確要求重來：回到排隊中，次數歸零，租約、失敗原因清掉
 # 有條件的更新：只有失敗、已取消的文件改得到（跟下面租約的寫法一樣，一句 UPDATE ... WHERE）
+#   已取消：取消功能拿掉了（docs/decisions/046），但資料庫裡可能還有以前取消的文件，要讓它們能重試
 #   兩個重試同時進來（連按兩次），只有一個改得到；第二個不會把已經被 Lambda 拿去處理的文件又改回排隊中
 # 回傳 False 代表這份文件現在不能重試（狀態已經不是失敗、已取消）
+# in_(...)：SQL 的 IN，「狀態是這幾個其中之一」
 def reset_for_retry(db: Session, document_id: int) -> bool:
     updated = (
         db.query(Document)
@@ -71,8 +73,6 @@ def reset_for_retry(db: Session, document_id: int) -> bool:
                 Document.attempts: 0,
                 Document.error_message: None,
                 Document.claim_token: None,
-                Document.progress_done: None,
-                Document.progress_total: None,
             },
             synchronize_session=False,
         )
@@ -94,7 +94,6 @@ def reset_for_retry(db: Session, document_id: int) -> bool:
 #   已完成、已失敗、已取消的也不行：重複的工單、文件已經不需要處理了
 # 取得租約的同時次數 +1（只用來寫 log）、記下開始時間（第一次報平安），跟租約在同一句裡，一定一起成功或一起失敗
 def claim(db: Session, document_id: int, token: str) -> bool:
-    now = datetime.now(timezone.utc)
     claimed = (
         db.query(Document)
         .filter(Document.id == document_id, Document.status == "uploaded")
@@ -102,10 +101,8 @@ def claim(db: Session, document_id: int, token: str) -> bool:
             {
                 Document.status: "processing",
                 Document.claim_token: token,
-                Document.heartbeat_at: now,
+                Document.heartbeat_at: datetime.now(timezone.utc),
                 Document.attempts: Document.attempts + 1,
-                Document.progress_done: None,
-                Document.progress_total: None,
             },
             synchronize_session=False,
         )
@@ -116,7 +113,7 @@ def claim(db: Session, document_id: int, token: str) -> bool:
 
 # 何時呼叫：處理過程中報平安（解析切段完、每轉完一批向量），更新「最後一次有進度的時間」（docs/decisions/046）
 # 一句 UPDATE、馬上 commit：自己一個很短的交易
-# 回傳 False 代表租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉），呼叫的人要停下來
+# 回傳 False 代表租約已經不是自己的了（被判定中斷、文件被刪掉），呼叫的人要停下來
 def update_heartbeat(db: Session, document_id: int, token: str) -> bool:
     updated = (
         db.query(Document)
@@ -171,26 +168,6 @@ def mark_failed_if_claimed(db: Session, document_id: int, token: str, reason: st
         .filter(Document.status == "processing")
         .update(
             {Document.status: "failed", Document.error_message: reason, Document.claim_token: None},
-            synchronize_session=False,
-        )
-    )
-    db.commit()
-    return updated == 1
-
-
-# 何時呼叫：使用者按「取消處理」（docs/decisions/009）
-# 條件不用對代碼：使用者手上沒有代碼，只要文件還在排隊中或處理中就可以取消
-# 收回租約（清掉代碼）就夠了，不用另外通知正在處理的 Lambda：
-#   它下次報平安、或要存結果時，代碼對不上，就會自己停下來、把寫到一半的全部丟掉
-#   還在排隊的，Lambda 拿到工單時搶不到租約（不是排隊中了），直接跳過
-# in_(...)：SQL 的 IN，「狀態是這幾個其中之一」
-def cancel(db: Session, document_id: int) -> bool:
-    updated = (
-        db.query(Document)
-        .filter(Document.id == document_id)
-        .filter(Document.status.in_(("uploaded", "processing")))
-        .update(
-            {Document.status: "cancelled", Document.claim_token: None, Document.error_message: None},
             synchronize_session=False,
         )
     )

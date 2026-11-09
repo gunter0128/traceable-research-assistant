@@ -1,5 +1,5 @@
 import { type ChangeEvent, type FormEvent, useEffect, useRef, useState } from "react"
-import { ArrowLeft, FileText, RotateCw, Send, Trash2, Upload, X } from "lucide-react"
+import { ArrowLeft, FileText, RotateCw, Send, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -22,21 +22,13 @@ import {
 } from "@/lib/api"
 
 // 後端的 status 是給程式看的英文，畫面上換成使用者看得懂的字
+// cancelled：取消功能拿掉了（docs/decisions/046），但以前取消的文件還在，要照常顯示
 const STATUS_LABELS: Record<string, string> = {
   uploaded: "排隊中",
   processing: "處理中",
   processed: "完成",
   failed: "失敗",
   cancelled: "已取消",
-}
-
-// 處理中而且知道總段數的話，顯示進度「處理中 200 / 330」
-function statusText(doc: Document): string {
-  const label = STATUS_LABELS[doc.status] ?? doc.status
-  if (doc.status === "processing" && doc.progress_total) {
-    return `${label} ${doc.progress_done ?? 0} / ${doc.progress_total}`
-  }
-  return label
 }
 
 // 有文件還在排隊或處理中時，每隔多久（毫秒）重新問一次後端狀態
@@ -166,16 +158,6 @@ function DocumentsPanel({
     }
   }
 
-  // 取消處理：不想等了，先停下來，文件留著之後可以重試或刪掉
-  async function handleCancel(id: number) {
-    try {
-      const updated = await api.cancelDocument(id)
-      setDocuments((prev) => prev.map((d) => (d.id === id ? updated : d)))
-    } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "取消失敗")
-    }
-  }
-
   async function handleDelete(id: number) {
     try {
       await api.deleteDocument(id)
@@ -222,7 +204,8 @@ function DocumentsPanel({
               >
                 <div className="flex min-w-0 items-center gap-2">
                   <FileText className="text-muted-foreground size-4 shrink-0" />
-                  {/* 有訊息時在檔名下面多一行：失敗的是原因（紅字），處理中的是提示（灰字，例如「稍後會自動重試」） */}
+                  {/* 有訊息時在檔名下面多一行：失敗的是原因（紅字）
+                      其他狀態現在不會有訊息；舊資料可能留著以前自動重試的提示，顯示成灰字 */}
                   <div className="flex min-w-0 flex-col">
                     <span className="truncate">{doc.filename}</span>
                     {doc.error_message && (
@@ -248,19 +231,9 @@ function DocumentsPanel({
                           : "secondary"
                     }
                   >
-                    {statusText(doc)}
+                    {STATUS_LABELS[doc.status] ?? doc.status}
                   </Badge>
-                  {/* 排隊中、處理中：可以取消；失敗、已取消：可以重試 */}
-                  {(doc.status === "uploaded" || doc.status === "processing") && (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      title="取消處理"
-                      onClick={() => void handleCancel(doc.id)}
-                    >
-                      <X className="size-4" />
-                    </Button>
-                  )}
+                  {/* 失敗、已取消（以前取消的）：可以重試。排隊中、處理中的不想等，可以直接刪掉 */}
                   {(doc.status === "failed" || doc.status === "cancelled") && (
                     <Button
                       variant="ghost"

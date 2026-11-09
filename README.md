@@ -9,7 +9,7 @@ A question-answering service over your own PDFs. Every sentence in an answer cit
 - **Upload PDFs** into a private workspace. Files are parsed, chunked, embedded and indexed in the background.
 - **Ask questions** about those documents. Answers mark each sentence with `[1]`, `[2]`… and return only the passages that were actually cited.
 - **Say "not found"** instead of guessing when the documents do not contain the answer.
-- **Reject duplicate uploads** by content hash, and let users **retry or cancel** anything they are waiting on.
+- **Reject duplicate uploads** by content hash, and let users **retry** any document that failed.
 
 ## Why this project
 
@@ -170,7 +170,7 @@ npm run dev                       # http://localhost:5173, proxies API calls to 
 pytest
 ```
 
-156 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
+173 tests cover ownership checks across users, the processing pipeline, retries, leases, concurrent workers, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
 
 ## API
 
@@ -183,7 +183,7 @@ pytest
 | POST | `/workspaces/{id}/uploads` | Get a presigned S3 upload ticket |
 | POST / GET | `/workspaces/{id}/documents` | Register an uploaded file / list documents |
 | GET / DELETE | `/documents/{id}` | Read / delete a document |
-| POST | `/documents/{id}/retry` · `/documents/{id}/cancel` | Retry a failed document / cancel one in progress |
+| POST | `/documents/{id}/retry` | Retry a failed document |
 | POST | `/workspaces/{id}/ask` | Ask a question, get an answer with citations |
 | GET | `/usage/today` | Today's usage against the daily limit |
 

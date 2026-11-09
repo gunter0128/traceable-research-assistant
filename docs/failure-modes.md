@@ -44,7 +44,8 @@
 | 報平安 | 資料庫出錯 | 標失敗，不存 chunks | 測試（test_heartbeat_error_fails_document_without_saving_chunks） |
 | 整個執行 | Lambda 處理到一半被強制中斷（超時、記憶體不夠） | 沒 commit 的資料隨連線中斷自動丟棄；停止報平安，10 分鐘後標「處理中斷，請按重試」（decisions/008、046） | 測試（test_listing_marks_silent_document_interrupted）；雲端的演練 3 重做時是 5 分鐘的期限（上傳後 5.3 分鐘標中斷） |
 | 整個執行 | 在取得租約之前就被中斷 | 文件還在排隊中，15 分鐘後標「處理逾時」 | 雲端（演練 3 發現的，decisions/007），測試（test_listing_expires_overdue_document） |
-| 整個執行 | 使用者按「取消處理」 | 狀態改成已取消、收回租約；正在處理的 Lambda 下次報平安時發現代碼對不上，自己停下來，寫到一半的全部丟掉（decisions/009） | 測試（test_cancel_stops_running_worker、test_cancelled_document_is_skipped_by_worker） |
+| 整個執行 | 以前取消的文件（取消功能 decisions/046 拿掉了，舊資料還在） | 照常顯示「已取消」；又收到工單時搶不到租約、不處理；可以按重試、刪除。開著舊畫面的人按到取消，API 回 404，文件不會被改到 | 測試（test_old_cancelled_document_is_still_listed、test_old_cancelled_document_is_skipped_by_worker、test_old_cancelled_document_can_be_retried、test_cancel_endpoint_is_removed） |
+| 整個執行 | 舊的工單在使用者按重試之後才出現（例如上一輪的 worker 當掉，SQS 1 小時後重送；或工單其實送到了，但回應遺失） | 跟重試送出的新工單是同一份文件：先到的搶到租約處理，後到的看到不是排隊中就跳過，不會處理兩次、不會存出兩份。限制：可能是舊工單搶先處理，log 裡帶的是舊請求的編號；先到的那次如果失敗，後到的也會跳過，要再按一次重試 | 測試（test_worker_skips_duplicate_message、test_duplicate_message_while_processing_is_skipped、test_only_uploaded_document_can_be_claimed） |
 | 整個執行 | 其實沒死只是很慢，被判定中斷後使用者按了重試 | 舊的 Lambda 報平安或存結果時發現租約不是自己的，放棄這次處理，不會存出兩份 | 測試（test_slow_worker_gives_up_after_retry_started_new_worker、test_heartbeat_rejected_after_interrupted、test_finish_rejected_with_wrong_token） |
 | 整個執行 | 處理到一半，使用者把文件刪掉 | 租約跟著文件一起沒了：報平安、存結果、標失敗都改不到任何東西，停下來；worker 正常結束（不寫 ERROR、工單不重送），本機模式上傳的請求回 404 | 測試（test_worker_stops_quietly_when_document_deleted_while_embedding、test_document_deleted_just_before_saving、test_document_deleted_then_processing_fails、test_inline_upload_returns_404_when_document_deleted_while_processing） |
 | 整個執行 | 使用者連按兩次重試 | 改回排隊中是有條件的更新（只有失敗、已取消的改得到）：第二個請求改不到、回 409，不會把已經在處理的文件又改回排隊中 | 測試（test_retry_race_does_not_reset_document_being_processed） |

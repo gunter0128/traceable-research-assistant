@@ -26,6 +26,8 @@ class UploadFinish(BaseModel):
 
 class DocumentOut(BaseModel):
     # 回給客戶端的 document 資料
+    # status：uploaded 排隊中、processing 處理中、processed 完成、failed 失敗、cancelled 已取消（以前取消的，可以重試）
+    # 以前還有處理進度（progress_done / progress_total），docs/decisions/046 拿掉了：處理中只顯示「處理中」
     id: int
     workspace_id: int
     filename: str
@@ -33,7 +35,5 @@ class DocumentOut(BaseModel):
     uploaded_at: datetime
     processed_at: datetime | None
     error_message: str | None
-    progress_done: int | None
-    progress_total: int | None
 
     model_config = ConfigDict(from_attributes=True)
