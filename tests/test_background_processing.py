@@ -1,7 +1,9 @@
-# 背景處理（雲端模式）的測試：送工單、Lambda 收工單、手動重試、定期掃描
+# 背景處理（雲端模式）的測試：送工單、Lambda 收工單、重複 / 重送的工單、手動重試、定期掃描
 # 真的 SQS 換成一個記錄「送了哪些工單」的 list，跟 conftest.py 的 fake_s3 用 dict 假裝 S3 是同一個道理
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,9 +12,11 @@ from botocore.exceptions import EndpointConnectionError
 from app import worker
 from app.core import openai_client, sqs_client
 from app.core.config import settings
+from app.core.db import SessionLocal
 from app.models.chunk import Chunk
 from app.models.document import Document
-from app.services import document_service
+from app.repositories import document_repo
+from app.services import usage_service
 from tests.helpers import create_workspace, fake_embed_texts, login_headers, upload_pdf
 from tests.pdf_fixtures import valid_pdf_bytes
 
@@ -109,34 +113,49 @@ def test_worker_skips_deleted_document(client, sent, worker_db):
     worker.handle_process_message(_sqs_event(document_id), None)  # 不丟例外就算通過
 
 
-# 測試：次數用完的文件，就算又收到工單，也不會再處理，直接標失敗
-# 自動延後重試拿掉之後（docs/decisions/046），次數只會因為 SQS 重送工單、接手死掉的 Lambda 而增加；
-# 這個上限是「一份會讓程式當掉的文件不會被一直重做」的保險。邊界（第 3 次照常處理）見
-# test_openai_errors.py 的 test_temporary_error_on_last_allowed_attempt_fails_normally
-def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
+# 測試：Lambda 處理到一半死掉（文件停在處理中），SQS 約 1 小時後把同一張工單再送一次（docs/decisions/046）
+# → 不接手：不呼叫 OpenAI、次數不增加、租約不動；之後 sweeper 把它標成「處理中斷」，要不要重來由使用者按重試
+# 以前靠「處理 3 次就不再處理」的次數上限，防止一份會讓程式當掉的文件被一直重做；
+# 現在重送的工單碰到處理中的文件一律跳過，不會重做，次數上限就拿掉了（工單本身重送 3 次後進 DLQ）
+def test_redelivered_message_does_not_reprocess_interrupted_document(client, db_session, monkeypatch, sent, worker_db):
     headers = login_headers(client, "erin@example.com")
     ws_id = create_workspace(client, headers)
     document_id = _upload_pdf(client, headers, ws_id).json()["id"]
+    # 第一個 Lambda 取得租約、處理到一半死掉：處理中、11 分鐘前最後一次報平安
     document = db_session.get(Document, document_id)
-    document.status = "uploaded"
-    document.attempts = document_service.MAX_ATTEMPTS
+    document.status = "processing"
+    document.claim_token = "dead-worker"
+    document.attempts = 1
+    document.heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=11)
     db_session.commit()
 
     # 從這裡開始記錄有沒有呼叫 OpenAI。不在假函式裡直接 raise：
     # process_document 會接住所有錯誤、把文件標失敗，測試反而看不出「其實呼叫了」
     calls = []
 
-    def record_embed(texts, **kwargs):
+    def record_embed(texts):
         calls.append(texts)
         return fake_embed_texts(texts)
 
     monkeypatch.setattr(openai_client, "embed_texts", record_embed)
-    document_service.process_document(db_session, document)
+    # ApproximateReceiveCount：SQS 記的「這張工單第幾次被拿出來」，2 = 重送的
+    redelivered = {
+        "Records": [{"body": json.dumps({"document_id": document_id}), "attributes": {"ApproximateReceiveCount": "2"}}]
+    }
 
-    assert document.attempts == document_service.MAX_ATTEMPTS + 1
-    assert document.status == "failed"
-    assert document.error_message == "處理了 3 次都沒有成功，已停止自動重試"  # 是次數上限擋下來的，不是別的錯誤
-    assert calls == []  # 完全沒有呼叫 OpenAI
+    worker.handle_process_message(redelivered, None)
+
+    assert calls == []
+    skipped = db_session.get(Document, document_id)  # worker 結束時關掉了 session，重新查一次
+    assert skipped.status == "processing"
+    assert skipped.claim_token == "dead-worker"
+    assert skipped.attempts == 1
+
+    worker.handle_sweep(None, None)
+
+    expired = db_session.get(Document, document_id)
+    assert expired.status == "failed"
+    assert expired.error_message == "處理中斷，請按重試"
 
 
 # 測試：失敗的文件可以手動重試，次數歸零並重新送工單
@@ -274,7 +293,7 @@ def test_worker_skips_duplicate_message(client, db_session, monkeypatch, sent, w
     document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     worker.handle_process_message(_sqs_event(document_id), None)
 
-    # 從這裡開始記錄有沒有呼叫 OpenAI（理由同 test_process_stops_after_max_attempts）
+    # 從這裡開始記錄有沒有呼叫 OpenAI（理由同 test_redelivered_message_does_not_reprocess_interrupted_document）
     calls = []
 
     def record_embed(texts, **kwargs):
@@ -287,3 +306,70 @@ def test_worker_skips_duplicate_message(client, db_session, monkeypatch, sent, w
 
     assert calls == []  # 第二次完全沒有呼叫 OpenAI
     assert db_session.get(Document, document_id).status == "processed"
+
+
+# 測試：第一個 Lambda 還在處理（轉向量轉到一半），同一份文件的工單又來一張（SQS 重複送）→
+# 第二個 Lambda 搶不到租約、直接跳過；第一個照常處理完。OpenAI 只被呼叫一次（不會花兩次錢）
+# 兩個 Lambda 用兩條執行緒、各自的資料庫連線（不用 worker_db），跟雲端上一樣真的同時在跑
+def test_duplicate_message_while_processing_is_skipped(client, db_session, monkeypatch, sent, logs):
+    headers = login_headers(client, "paul@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
+    # threading.Event：執行緒之間的信號，set() 發出、wait() 等到有人發出為止（timeout：最多等幾秒，測試不會卡死）
+    first_is_embedding = threading.Event()
+    second_is_done = threading.Event()
+    calls = []
+
+    # 假的 OpenAI：第一個 Lambda 轉向量時先停住，等第二個 Lambda 跑完才繼續
+    def embed_and_wait(texts):
+        calls.append(texts)
+        first_is_embedding.set()
+        second_is_done.wait(timeout=30)
+        return fake_embed_texts(texts)
+
+    monkeypatch.setattr(openai_client, "embed_texts", embed_and_wait)
+
+    # ThreadPoolExecutor：開另一條執行緒跑第一個 Lambda；first.result() 等它跑完，它出錯的話錯誤會在這裡丟出來
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(worker.handle_process_message, _sqs_event(document_id), None)
+        assert first_is_embedding.wait(timeout=30)
+        worker.handle_process_message(_sqs_event(document_id), None)  # 第二個 Lambda，在測試自己的執行緒跑
+        second_is_done.set()
+        first.result()
+
+    assert len(calls) == 1
+    assert logs.named("claim_skipped")[0]["status"] == "processing"  # 第二個是因為「別人正在處理」跳過的
+    document = db_session.get(Document, document_id)
+    db_session.refresh(document)
+    assert document.status == "processed"
+    assert document.attempts == 1
+    assert _chunk_count(db_session, document_id) > 0
+
+
+# 測試：連按兩次重試，兩個請求幾乎同時進來：第二個檢查狀態時還是「失敗」，但在它改之前，
+# 第一個已經把文件改回排隊中、Lambda 也開始處理了 → 第二個改不到、回 409，不會把處理中的文件又改回排隊中
+def test_retry_race_does_not_reset_document_being_processed(client, db_session, monkeypatch, sent):
+    headers = login_headers(client, "quinn@example.com")
+    ws_id = create_workspace(client, headers)
+    monkeypatch.setattr(sqs_client, "send_process_message", _broken_send)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]  # 送不出去 → failed
+    monkeypatch.setattr(sqs_client, "send_process_message", sent.append)
+    real_quota_check = usage_service.ensure_within_quota
+
+    # 重試的流程是「檢查狀態 → 檢查用量 → 改回排隊中」：在檢查用量的時候，插進第一個請求和 Lambda 做的事
+    def first_retry_wins_then_check_quota(db, owner_id):
+        with SessionLocal() as other:
+            document_repo.reset_for_retry(other, document_id)
+            document_repo.claim(other, document_id, "lambda-token")
+        real_quota_check(db, owner_id)
+
+    monkeypatch.setattr(usage_service, "ensure_within_quota", first_retry_wins_then_check_quota)
+
+    response = client.post(f"/documents/{document_id}/retry", headers=headers)
+
+    assert response.status_code == 409
+    document = db_session.get(Document, document_id)
+    db_session.refresh(document)
+    assert document.status == "processing"
+    assert document.claim_token == "lambda-token"
+    assert sent == []  # 第二個請求沒有再送工單

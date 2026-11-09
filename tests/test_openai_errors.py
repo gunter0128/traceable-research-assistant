@@ -131,18 +131,19 @@ def test_temporary_error_fails_in_cloud_and_rolls_back_chunks(client, db_session
     assert cloud == [document_id]  # 只有上傳時送的那一張工單，沒有再送
 
 
-# 測試：第 3 次處理（次數還沒超過上限）遇到暫時性錯誤 → 跟一般的暫時性錯誤一樣標失敗
-# 確認兩件事：次數上限只擋「超過」上限的，第 3 次會真的去處理；暫時性錯誤不管第幾次都一樣，不會延後
-def test_temporary_error_on_last_allowed_attempt_fails_normally(client, db_session, monkeypatch, cloud):
+# 測試：次數已經很多的文件（以前的上限是 3 次，例如舊版自動延後留下的資料）遇到暫時性錯誤 →
+# 跟一般的暫時性錯誤一樣標失敗（docs/decisions/046）
+# 確認兩件事：次數上限拿掉了，次數只寫進 log、不會擋下處理；暫時性錯誤不管第幾次都一樣，不會延後
+def test_attempt_count_does_not_block_processing(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "bob@example.com")
-    document = _pending_document(db_session, document_id, attempts=document_service.MAX_ATTEMPTS - 1)
+    document = _pending_document(db_session, document_id, attempts=3)
     monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
 
     document_service.process_document(db_session, document)
 
-    assert document.attempts == document_service.MAX_ATTEMPTS
+    assert document.attempts == 4
     assert document.status == "failed"
-    # 不是次數上限的「處理了 3 次都沒有成功」：第 3 次有真的去處理，是 OpenAI 的錯誤讓它失敗
+    # 不是以前次數上限的「處理了 3 次都沒有成功」：有真的去處理，是 OpenAI 的錯誤讓它失敗
     assert document.error_message == "AI 服務暫時無法使用，請稍後按重試"
 
 

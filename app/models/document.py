@@ -20,16 +20,18 @@ class Document(Base):
     status = Column(String, nullable=False, server_default="uploaded")
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     processed_at = Column(DateTime(timezone=True), nullable=True)
-    # 被處理過幾次。超過上限就不再重試，避免一份每次都會讓程式當掉的文件被無限重送
+    # 被處理過幾次：取得租約時 +1，使用者按重試歸零，只用來寫 log
+    # 以前有「超過 3 次就不再處理」的上限，docs/decisions/046 拿掉了：只有排隊中的文件搶得到租約、按重試又會歸零，
+    # 次數最多就是 1，上限永遠擋不到
     attempts = Column(Integer, nullable=False, server_default="0")
     # 最近一次送工單的時間。定期掃描靠它判斷「送出去很久了還沒處理完 = 卡住了」
     queued_at = Column(DateTime(timezone=True), nullable=True)
     # 失敗原因，給使用者看的（例如「抓不到文字，可能是掃描檔」）。沒失敗時是空的
     error_message = Column(String, nullable=True)
     # 租約（docs/decisions/008）：正在處理的 Lambda 取得租約時記下的隨機代碼，只有它知道
-    # 報平安、存結果時都要對得上，對不上代表自己被判定中斷、文件交給別人了
+    # 報平安、存結果時都要對得上，對不上代表租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉）
     claim_token = Column(String, nullable=True)
-    # 最後一次報平安的時間。處理中超過 5 分鐘沒報平安，就判定程式死了
+    # 最後一次報平安的時間。處理中超過 10 分鐘沒報平安，就判定程式死了、標成失敗（docs/decisions/046）
     heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     # 進度：已處理幾段 / 總共幾段，前端顯示「處理中 200 / 330」
     progress_done = Column(Integer, nullable=True)

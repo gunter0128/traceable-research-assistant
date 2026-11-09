@@ -1,7 +1,11 @@
-# 測試共用的小工具：登入、建 workspace、照前端的方式上傳、假的 OpenAI、假的 S3
+# 測試共用的小工具：登入、建 workspace、照前端的方式上傳、假的 OpenAI、假的 S3、收集 log
 # 每個測試檔都要做的準備步驟放在這裡，各檔直接 import，不用各自再寫一份
-# 這裡只放一般函式（不是 fixture）：在測試裡看到呼叫，按一下就能跳到這裡看它做什麼
+# 這裡只放一般函式和類別（不是 fixture）：在測試裡看到呼叫，按一下就能跳到這裡看它做什麼
 
+import json
+import logging
+
+from app.core import log
 from app.core.openai_client import EMBEDDING_MODEL, Usage
 
 # 測試帳號共用的密碼
@@ -69,3 +73,24 @@ def always_raise(error: Exception):
         raise error
 
     return fake
+
+
+# ---------- 收集 log ----------
+# 把 "app" 這個 logger 寫出的每一筆，用正式的 JSON 格式轉好、收集到一個 list 裡給測試檢查
+# 測試裡用 conftest.py 的 logs fixture 拿到它（fixture 負責掛上、測試完拿下來）
+class LogCollector(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.setFormatter(log.JsonFormatter())
+        self.entries = []
+
+    def emit(self, record):
+        self.entries.append(json.loads(self.format(record)))
+
+    # 某個事件的所有紀錄，例如 logs.named("lease_lost")
+    def named(self, event):
+        return [entry for entry in self.entries if entry["event"] == event]
+
+    # 所有 ERROR 等級的紀錄：告警看的就是這個（deploy/setup_monitoring.py 的 $.level = "ERROR"）
+    def errors(self):
+        return [entry for entry in self.entries if entry["level"] == "ERROR"]

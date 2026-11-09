@@ -22,10 +22,6 @@ from app.models.document import Document
 from app.repositories import chunk_repo, document_repo
 from app.services import usage_service, workspace_service
 
-# 一份文件最多被處理幾次，超過就直接標成失敗，不再處理（防止一份會讓程式當掉的文件被一直重做、一直花錢）
-# 次數在取得租約時 +1；會讓它增加的是 SQS 重送工單、接手處理到一半死掉的 Lambda。使用者按重試會歸零
-MAX_ATTEMPTS = 3
-_GAVE_UP = f"處理了 {MAX_ATTEMPTS} 次都沒有成功，已停止自動重試"
 # 處理中超過這麼久沒報平安，就判定處理的程式已經不在了（docs/decisions/008、046）
 # 報平安的時間點：取得租約時、解析切段完、每轉完一批向量。兩次之間最長的正常空檔：
 #   下載 + 解析 + 切段：300 頁塞滿文字的 PDF 在筆電上量過約 3 秒（Lambda 比較慢，也在 1 分鐘以內）
@@ -174,13 +170,17 @@ def _check_filename(filename: str) -> None:
         raise InvalidFileType
 
 
-# 把文件交出去處理（上傳、手動重試、定期掃描重送都走這裡）
+# 把文件交出去處理（上傳、手動重試都走這裡）
 # 雲端（有設定 SQS）：送工單，交給 Lambda 背景處理，立刻回傳（status 還是 uploaded）
 # 本機（沒設定 SQS）：直接在這裡處理完才回傳
 def dispatch_document(db: Session, document: Document) -> Document:
     if settings.sqs_queue_url is None:
         log.event("dispatched", mode="inline")
-        return process_document(db, document)
+        processed = process_document(db, document)
+        # 處理到一半，文件被刪掉了（例如使用者在別的分頁按了刪除）：API 回 404
+        if processed is None:
+            raise DocumentNotFound
+        return processed
 
     # 先記時間再送：送出去之後 Lambda 可能馬上就處理完了，順序反過來的話時間會記在處理完之後
     document_repo.mark_queued(db, document)
@@ -195,16 +195,21 @@ def dispatch_document(db: Session, document: Document) -> Document:
     return document
 
 
-# 使用者手動按重試：失敗或已取消的文件可以，次數歸零後重新交出去
+# 使用者手動按重試：失敗或已取消的文件可以，回到排隊中、次數歸零，重新交出去
+# 處理中斷、處理逾時的文件也走這裡：get_owned_document 會先把卡住的標成失敗，就能重試
 def retry_document(db: Session, document_id: int, owner_id: int) -> Document:
     document = get_owned_document(db, document_id, owner_id)
     if document.status not in ("failed", "cancelled"):
         raise DocumentNotRetryable
     # 重試也會呼叫 OpenAI，跟上傳一樣先檢查用量
     usage_service.ensure_within_quota(db, owner_id)
-    log.bind_document(document.id)
+    log.bind_document(document_id)
     log.event("retry_requested", previous_status=document.status)
-    document_repo.reset_for_retry(db, document)
+    # 有條件地改回排隊中（commit）：上面檢查完到這裡之間，狀態可能已經被另一個重試請求改了
+    # 改不到就當作不能重試，不會把已經被 Lambda 拿去處理的文件又改回排隊中
+    if not document_repo.reset_for_retry(db, document_id):
+        raise DocumentNotRetryable
+    db.refresh(document)
     return dispatch_document(db, document)
 
 
@@ -248,7 +253,8 @@ def expire_overdue_documents(db: Session, document_id: int | None = None, worksp
 
 # 處理一份文件：取得租約 → 下載 → 查重複 → 解析、切段 → 轉向量 → 存 chunks 並標完成（docs/decisions/046）
 # 輸入：db（呼叫的人的 session）、document（排隊中的文件）
-# 回傳：處理後的 document（processed / failed；沒搶到租約、或處理到一半租約沒了，就是當時的狀態）
+# 回傳：處理完之後，資料庫裡這份文件最新的樣子（processed / failed；沒搶到租約、或處理到一半租約沒了，就是當時的狀態）
+#   處理期間文件被刪掉了，回傳 None
 #
 # 資料庫的交易都很短，下載 PDF、呼叫 OpenAI 的時候，db 不持有交易：
 #   取得租約、讀資料、查重複、報平安：各自是一個短交易，做完馬上 commit
@@ -256,31 +262,26 @@ def expire_overdue_documents(db: Session, document_id: int | None = None, worksp
 #   存結果：chunks 和「完成」在同一個交易裡一起 commit
 # 注意：commit 之後 document 物件的欄位會過期（expire_on_commit），再讀會重新查資料庫、又開一個交易，
 # 所以要用的欄位在第 2 步先讀進一般變數，之後只用這些變數
-def process_document(db: Session, document: Document) -> Document:
+def process_document(db: Session, document: Document) -> Document | None:
     document_id = document.id
     log.bind_document(document_id)
     started = time.perf_counter()
 
-    # 1. 取得租約（commit）：排隊中的文件、或上一個 Lambda 超過 10 分鐘沒報平安（判定它死了）才搶得到
-    #    兩個 Lambda 同時搶，只會有一個成功；搶不到代表別人在處理、或文件已經處理完 / 失敗了（重複的工單）
+    # 1. 取得租約（commit）：只有排隊中的文件搶得到，兩個 Lambda 同時搶只會有一個成功
+    #    搶不到：別人正在處理、文件已經處理完 / 失敗了（重複的工單、Lambda 死掉後 SQS 重送的工單）、或已經被刪掉
     token = uuid4().hex
-    stale_before = datetime.now(timezone.utc) - HEARTBEAT_TIMEOUT
-    if not document_repo.claim(db, document_id, token, stale_before):
-        db.refresh(document)
-        log.event("claim_skipped", status=document.status)
-        return document
+    if not document_repo.claim(db, document_id, token):
+        current = document_repo.get_by_id(db, document_id)  # 被刪掉了就是 None
+        log.event("claim_skipped", status=current.status if current else "deleted")
+        return current
 
     # 2. 把這次要用的資料讀進一般變數，然後結束這個讀取用的交易（沒有要存的東西）
     storage_path = document.storage_path
     workspace_id = document.workspace_id
     owner_id = document.workspace.owner_id  # 用量算在上傳的人（workspace 的主人）身上
-    attempt = document.attempts
+    attempt = document.attempts  # 第幾次處理（使用者按重試會歸零），只用來寫 log
     db.commit()
     log.event("claimed", attempt=attempt)
-
-    # 次數用完就不處理了（連 S3 都不下載）：SQS 重送工單、接手死掉的 Lambda 都會走到這裡，統一在這裡擋
-    if attempt > MAX_ATTEMPTS:
-        return _fail(db, document, token, _GAVE_UP)
 
     try:
         # 3. 從 S3 下載 PDF
@@ -292,20 +293,20 @@ def process_document(db: Session, document: Document) -> Document:
         content_hash = hashlib.sha256(content).hexdigest()
         duplicate = document_repo.find_duplicate(db, workspace_id, content_hash, document_id)
         if duplicate is not None:
-            return _fail(db, document, token, f"跟「{duplicate.filename}」的內容完全相同，不需要重複上傳")
+            return _fail(db, document_id, token, f"跟「{duplicate.filename}」的內容完全相同，不需要重複上傳")
         db.commit()  # 查完了，結束這個讀取用的交易（沒有要存的東西）
 
         # 5. 抽文字、切段（檔案壞掉、超過頁數會丟出錯誤，在下面接）
         #    抓不到任何字（通常是掃描檔）：存 0 段 chunk 然後標「完成」會誤導使用者，所以標失敗
         text = pdf_parser.extract_text(io.BytesIO(content), max_pages=MAX_PAGES)
         if not text:
-            return _fail(db, document, token, "抓不到任何文字，可能是掃描檔（目前不支援）")
+            return _fail(db, document_id, token, "抓不到任何文字，可能是掃描檔（目前不支援）")
         pieces = chunker.chunk_text(text)
         log.event("chunked", chunks=len(pieces))
 
         # 報平安（commit）：下載、解析算一段，第一批轉向量另外算一段，兩段的時間不會加在一起
         if not document_repo.update_heartbeat(db, document_id, token):
-            return _stop_after_losing_claim(db, document, started)
+            return _stop_after_losing_claim(db, document_id, started)
 
         # 6. 轉向量：一次送 100 段，向量先放在記憶體裡，最後才寫進資料庫
         vectors = []
@@ -319,14 +320,14 @@ def process_document(db: Session, document: Document) -> Document:
             with SessionLocal() as usage_db:
                 usage_service.record(usage_db, owner_id, "document", usage, document_id=document_id)
 
-            # 報平安（commit）。租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉、別人接手）就停下來，不再花錢
+            # 報平安（commit）。租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉）就停下來，不再花錢
             if not document_repo.update_heartbeat(db, document_id, token):
-                return _stop_after_losing_claim(db, document, started)
+                return _stop_after_losing_claim(db, document_id, started)
 
         # 7. 存結果：chunks 和「完成」在同一個交易
         #    先有條件地改狀態（不 commit）：租約已經不是自己的就改不到，整批放棄
         if not document_repo.mark_processed(db, document_id, token, content_hash):
-            return _stop_after_losing_claim(db, document, started)
+            return _stop_after_losing_claim(db, document_id, started)
         chunk_repo.delete_for_document(db, document_id)  # 舊的先清掉：同一份文件處理兩次，結果跟處理一次一樣
         for index, piece in enumerate(pieces):
             chunk_repo.create(db, document_id, index, piece, vectors[index])
@@ -335,53 +336,55 @@ def process_document(db: Session, document: Document) -> Document:
     # 8. 錯誤處理：認得出來的錯誤給使用者明確的原因，讓他知道該換檔案還是可以重試；全部用 _fail 收尾
     # OpenAI、S3 的錯誤先在 openai_client、s3_client 裡分好類，這裡決定業務上怎麼處理
     except pdf_parser.UnreadablePdf:
-        return _fail(db, document, token, "PDF 檔案損壞或無法讀取")
+        return _fail(db, document_id, token, "PDF 檔案損壞或無法讀取")
     except pdf_parser.TooManyPages:
-        return _fail(db, document, token, f"超過 {MAX_PAGES} 頁的上限")
+        return _fail(db, document_id, token, f"超過 {MAX_PAGES} 頁的上限")
     # 檔案不見了重試也沒用，訊息要說清楚，不能叫使用者「稍後重試」
     except s3_client.FileMissing:
-        return _fail(db, document, token, "找不到上傳的檔案，請刪除後重新上傳")
+        return _fail(db, document_id, token, "找不到上傳的檔案，請刪除後重新上傳")
     except (openai_client.OpenAIPermanentError, s3_client.StoragePermanentError):
-        return _fail(db, document, token, "系統設定有誤，請聯絡管理員")
+        return _fail(db, document_id, token, "系統設定有誤，請聯絡管理員")
     # 暫時連不上：OpenAI 由 openai_client 自己寫的重試、S3 由 boto3 內建的重試先試過幾次了，走到這裡代表重試也沒用
     # 直接標失敗，讓使用者稍後按重試（docs/decisions/046）。不延後、不叫 SQS 晚點再送
     except openai_client.OpenAITemporaryError:
-        return _fail(db, document, token, "AI 服務暫時無法使用，請稍後按重試")
+        return _fail(db, document_id, token, "AI 服務暫時無法使用，請稍後按重試")
     except s3_client.StorageTemporaryError:
-        return _fail(db, document, token, "儲存服務暫時無法使用，請稍後按重試")
+        return _fail(db, document_id, token, "儲存服務暫時無法使用，請稍後按重試")
     # 其他預料之外的錯誤：只給一般性的訊息，不把內部錯誤細節（可能含系統資訊）直接顯示給使用者
     # 刻意接住所有錯誤（noqa 告訴 ruff 這是故意的）：這裡是最後一道防線，確保不管發生什麼事，文件都不會卡在處理中
     except Exception:  # noqa: BLE001
         # 給使用者的訊息很籠統，所以 log 裡一定要留完整的錯誤堆疊，不然事後完全不知道發生什麼事
         log.event("unexpected_error", logging.ERROR, exc_info=True)
-        return _fail(db, document, token, "處理時發生錯誤，可以稍後重試")
+        return _fail(db, document_id, token, "處理時發生錯誤，可以稍後重試")
 
     log.event("processed", chunks=len(pieces), total_ms=log.elapsed_ms(started))
-    db.refresh(document)
-    return document
+    return document_repo.get_by_id(db, document_id)
 
 
-# 租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉、別人接手）：
+# 租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉）：
 # 停下來，撤回這次還沒 commit 的東西，也不碰文件的狀態（現在是別人的）
-def _stop_after_losing_claim(db: Session, document: Document, started: float) -> Document:
+# 回傳資料庫裡最新的樣子；文件被刪掉了就是 None（不用 db.refresh：讀不到已經刪掉的文件會丟出錯誤）
+def _stop_after_losing_claim(db: Session, document_id: int, started: float) -> Document | None:
     db.rollback()
-    log.event("lease_lost", logging.WARNING, total_ms=log.elapsed_ms(started))
-    db.refresh(document)
-    return document
+    current = document_repo.get_by_id(db, document_id)
+    log.event(
+        "lease_lost", logging.WARNING, status=current.status if current else "deleted", total_ms=log.elapsed_ms(started)
+    )
+    return current
 
 
 # 處理失敗的收尾：先 rollback 撤回這次還沒 commit 的東西，再有條件地把文件標失敗
-# 條件：租約還是自己的才標（claim_token = token），不然會蓋掉接手的 Lambda 的狀態
-# rollback 一定要在讀 document 的任何欄位之前：如果是資料庫出錯走到這裡，session 要先 rollback 才能再用
-def _fail(db: Session, document: Document, token: str, reason: str) -> Document:
+# 條件：租約還是自己的才標（claim_token = token），不然會蓋掉別人的狀態；文件被刪掉了就改不到任何東西
+# 回傳資料庫裡最新的樣子；文件被刪掉了就是 None
+def _fail(db: Session, document_id: int, token: str, reason: str) -> Document | None:
     # sys.exc_info()[1]：目前正在處理的例外（_fail 大多是在 except 裡被呼叫的），記下是哪一種錯誤造成的
     # reason 是給使用者看的中文訊息，error_type 是給自己查的，告警也靠它（例如 OpenAIPermanentError）
     error = sys.exc_info()[1]
     log.event("failed", logging.WARNING, reason=reason, error_type=type(error).__name__ if error else None)
+    # 先 rollback 才能再用 db：如果是資料庫出錯走到這裡，session 要先 rollback
     db.rollback()
-    document_repo.mark_failed_if_claimed(db, document.id, token, reason)         # ← commit
-    db.refresh(document)
-    return document
+    document_repo.mark_failed_if_claimed(db, document_id, token, reason)          # ← commit
+    return document_repo.get_by_id(db, document_id)
 
 
 def get_owned_document(db: Session, document_id: int, owner_id: int) -> Document:

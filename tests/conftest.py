@@ -17,6 +17,7 @@ if os.path.exists(".env.test"):
     os.environ["DATABASE_URL"] = _test_env["DATABASE_URL"]
     os.environ["SECRET_KEY"] = _test_env["SECRET_KEY"]
 
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -26,7 +27,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base, get_db
 from app.main import app
-from tests.helpers import bucket
+from tests.helpers import LogCollector, bucket
 
 engine = create_engine(os.environ["DATABASE_URL"])
 TestSessionLocal = sessionmaker(bind=engine)
@@ -64,6 +65,17 @@ def client(db_session):
     app.dependency_overrides[get_db] = override_get_db  # 前置：app 遇到 get_db 就改用這個 → endpoint 全連測試資料庫
     yield TestClient(app)  # 造一個 TestClient(FastAPI提供的工具 模擬真實HTTP請求)交給測試
     app.dependency_overrides.clear()  # 收尾：移除上面的替換，app 恢復正常
+
+
+# 要檢查 log 的測試，參數寫 logs：測試期間 "app" logger 寫出的每一筆都收進 logs.entries（見 helpers.LogCollector）
+# 為什麼要自己掛：app 的 logger 不往上傳（propagate = False，見 app/core/log.py），pytest 內建的 caplog 收不到
+@pytest.fixture
+def logs():
+    collector = LogCollector()
+    logger = logging.getLogger("app")
+    logger.addHandler(collector)
+    yield collector
+    logger.removeHandler(collector)
 
 
 # 假的 S3：用記憶體裡的 dict（helpers.bucket）取代真的 S3，跟隔離測試資料庫是同一個道理：測試不該碰到正式的 bucket

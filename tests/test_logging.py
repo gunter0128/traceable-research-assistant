@@ -2,7 +2,6 @@
 # 測的是：每一筆都是 JSON、自動帶上請求編號和文件編號、上傳和背景處理串得起來、不記使用者的內容
 
 import json
-import logging
 
 import pytest
 
@@ -17,28 +16,7 @@ from tests.helpers import (
 )
 from tests.pdf_fixtures import valid_pdf_bytes
 
-
-# 把 "app" 這個 logger 寫出的每一筆，用正式的 JSON 格式轉好、收集到一個 list 裡給測試檢查
-class _Collector(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.setFormatter(log.JsonFormatter())
-        self.entries = []
-
-    def emit(self, record):
-        self.entries.append(json.loads(self.format(record)))
-
-    def named(self, event):
-        return [entry for entry in self.entries if entry["event"] == event]
-
-
-@pytest.fixture
-def logs():
-    collector = _Collector()
-    logger = logging.getLogger("app")
-    logger.addHandler(collector)
-    yield collector
-    logger.removeHandler(collector)
+# logs fixture（收集 log 給測試檢查）在 conftest.py
 
 
 @pytest.fixture(autouse=True)

@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.document import Document
@@ -57,17 +57,28 @@ def mark_queued(db: Session, document: Document) -> Document:
     return document
 
 
-# 何時呼叫：使用者手動按重試。使用者明確要求重來，次數歸零，租約、進度清掉
-def reset_for_retry(db: Session, document: Document) -> Document:
-    document.status = "uploaded"
-    document.attempts = 0
-    document.error_message = None
-    document.claim_token = None
-    document.progress_done = None
-    document.progress_total = None
+# 何時呼叫：使用者手動按重試。使用者明確要求重來：回到排隊中，次數歸零，租約、進度、失敗原因清掉
+# 有條件的更新：只有失敗、已取消的文件改得到（跟下面租約的寫法一樣，一句 UPDATE ... WHERE）
+#   兩個重試同時進來（連按兩次），只有一個改得到；第二個不會把已經被 Lambda 拿去處理的文件又改回排隊中
+# 回傳 False 代表這份文件現在不能重試（狀態已經不是失敗、已取消）
+def reset_for_retry(db: Session, document_id: int) -> bool:
+    updated = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.status.in_(("failed", "cancelled")))
+        .update(
+            {
+                Document.status: "uploaded",
+                Document.attempts: 0,
+                Document.error_message: None,
+                Document.claim_token: None,
+                Document.progress_done: None,
+                Document.progress_total: None,
+            },
+            synchronize_session=False,
+        )
+    )
     db.commit()
-    db.refresh(document)
-    return document
+    return updated == 1
 
 
 # ---------- 租約（docs/decisions/008）----------
@@ -77,21 +88,16 @@ def reset_for_retry(db: Session, document: Document) -> Document:
 # synchronize_session=False：直接對資料庫下 UPDATE，不去同步已經載入記憶體的物件（之後要用的話自己 refresh）
 
 
-# 何時呼叫：Lambda 開始處理之前。成功才能處理，失敗代表別人正在處理、或文件已經不需要處理了
-# 條件：排隊中，或處理中但上一個 Lambda 在 stale_before 之後就沒報過平安（判定它死了，可以接手）
-# 取得租約的同時次數 +1、記下開始時間，跟租約在同一句裡，一定一起成功或一起失敗
-def claim(db: Session, document_id: int, token: str, stale_before: datetime) -> bool:
+# 何時呼叫：Lambda 開始處理之前。成功才能處理
+# 條件：只有排隊中（uploaded）的文件搶得到（docs/decisions/046）
+#   處理中的不行，就算上一個 Lambda 已經很久沒報平安也不接手：等 sweeper 或使用者查看時標成失敗，再由使用者按重試
+#   已完成、已失敗、已取消的也不行：重複的工單、文件已經不需要處理了
+# 取得租約的同時次數 +1（只用來寫 log）、記下開始時間（第一次報平安），跟租約在同一句裡，一定一起成功或一起失敗
+def claim(db: Session, document_id: int, token: str) -> bool:
     now = datetime.now(timezone.utc)
     claimed = (
         db.query(Document)
-        .filter(Document.id == document_id)
-        .filter(
-            # or_ / and_：SQL 的 OR / AND，用 Python 的 or / and 會變成 Python 自己判斷，不會變成 SQL
-            or_(
-                Document.status == "uploaded",
-                and_(Document.status == "processing", Document.heartbeat_at < stale_before),
-            )
-        )
+        .filter(Document.id == document_id, Document.status == "uploaded")
         .update(
             {
                 Document.status: "processing",
@@ -110,7 +116,7 @@ def claim(db: Session, document_id: int, token: str, stale_before: datetime) -> 
 
 # 何時呼叫：處理過程中報平安（解析切段完、每轉完一批向量），更新「最後一次有進度的時間」（docs/decisions/046）
 # 一句 UPDATE、馬上 commit：自己一個很短的交易
-# 回傳 False 代表租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉、別人接手），呼叫的人要停下來
+# 回傳 False 代表租約已經不是自己的了（被判定中斷、使用者取消、文件被刪掉），呼叫的人要停下來
 def update_heartbeat(db: Session, document_id: int, token: str) -> bool:
     updated = (
         db.query(Document)
@@ -157,7 +163,7 @@ def mark_processed(db: Session, document_id: int, token: str, content_hash: str)
     return updated == 1
 
 
-# 何時呼叫：處理中出錯要標失敗。一樣要租約還是自己的才標，不然會蓋掉接手的 Lambda 的狀態
+# 何時呼叫：處理中出錯要標失敗。一樣要租約還是自己的才標，不然會蓋掉別人的狀態（例如已經被判定中斷，使用者按了重試，新的 Lambda 正在處理）
 def mark_failed_if_claimed(db: Session, document_id: int, token: str, reason: str) -> bool:
     updated = (
         db.query(Document)

@@ -3,6 +3,7 @@
 #   下載 PDF、呼叫 OpenAI 的時候，主 session 沒有開著的交易
 #   每轉完一批，用量就已經 commit；這時候 chunks 一段都還沒存（用量的 commit 不會把 chunks 帶出去）
 #   後面的批次失敗：已經花掉的用量留著，chunks 一段都不存
+#   記用量失敗：不再轉下一批，留下告警看得到的 ERROR
 #   最後一次報平安之後租約才被收回：存結果那一步擋下來，一段 chunk 都不留
 #   報平安時資料庫出錯：標失敗，不存 chunks
 #   已經處理完的文件：sweeper、使用者查看都不會改到它
@@ -11,6 +12,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from app.core import openai_client, s3_client
 from app.core.db import SessionLocal
@@ -18,8 +20,9 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.models.usage_record import UsageRecord
 from app.repositories import document_repo
-from app.services import document_service
+from app.services import document_service, usage_service
 from tests.helpers import (
+    always_raise,
     bucket,
     create_workspace,
     fake_embed_texts,
@@ -129,6 +132,35 @@ def test_failed_second_batch_keeps_usage_and_saves_no_chunks(client, db_session,
     assert document.status == "failed"
     assert document.error_message == "AI 服務暫時無法使用，請稍後按重試"
     assert _committed_counts(document_id) == (0, 1)  # 0 段 chunk、1 筆用量（第 1 批的）
+
+
+# 測試：第 1 批轉完、記用量的時候資料庫出錯 → 這一批的錢花了但沒記到（每日上限會少算這一批），所以：
+#   不再轉下一批（不再花錢）、文件標失敗、chunks 一段都不存
+#   留下 ERROR 的 log、附上錯誤堆疊：告警看得到，事後查得到是記用量失敗
+def test_usage_record_failure_stops_embedding_and_logs_error(client, db_session, monkeypatch, logs):
+    document = _queued_document(client, db_session, "dora@example.com")
+    document_id = document.id
+    monkeypatch.setattr(document_service, "EMBED_BATCH_SIZE", 1)
+    calls = []
+
+    def record_embed(texts):
+        calls.append(texts)
+        return fake_embed_texts(texts)
+
+    monkeypatch.setattr(openai_client, "embed_texts", record_embed)
+    # OperationalError：SQLAlchemy 在「連線斷了、資料庫沒回應」這類情況丟的錯誤
+    connection_lost = OperationalError("INSERT INTO usage_records ...", {}, Exception("server closed the connection"))
+    monkeypatch.setattr(usage_service, "record", always_raise(connection_lost))
+
+    document_service.process_document(db_session, document)
+
+    assert len(calls) == 1  # 只轉了第 1 批
+    assert document.status == "failed"
+    assert document.error_message == "處理時發生錯誤，可以稍後重試"
+    assert _committed_counts(document_id) == (0, 0)
+    [error] = logs.errors()
+    assert error["event"] == "unexpected_error"
+    assert "OperationalError" in error["traceback"]
 
 
 # 測試：最後一次報平安之後、存結果之前，租約才被收回（例如 sweeper 剛好把它判定中斷）

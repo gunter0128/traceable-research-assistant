@@ -64,6 +64,9 @@ def finish_upload(
         )
     except WORKSPACE_ERRORS as exc:
         workspace_error(exc)
+    # 本機模式上傳完直接處理，處理到一半文件被刪掉了（例如在別的分頁按了刪除）→ 404
+    except DOCUMENT_ERRORS as exc:
+        document_error(exc)
     except document_service.InvalidFileType:
         raise HTTPException(
             status_code=400, detail="only PDF files are allowed"

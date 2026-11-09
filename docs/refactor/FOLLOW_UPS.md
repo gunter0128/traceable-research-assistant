@@ -6,8 +6,8 @@
 
 | 項目 | 為什麼要注意 | 狀態 |
 |---|---|---|
-| 處理到一半文件被刪掉時，`_stop_after_losing_claim()` 的 `db.refresh(document)` 會失敗 | 文件已經不在了，refresh 讀不到會丟出錯誤：worker 被當成當掉（寫 ERROR、工單被 SQS 重送），本機模式上傳的請求回 500 | 待處理（B2-2） |
-| 記用量失敗時，OpenAI 的費用已經花了但沒記到 | 每日上限會少算這一批。要確認：worker 不會繼續轉下一批（不再花錢），而且留下告警看得到的錯誤紀錄 | 待確認（B2-2） |
+| 處理到一半文件被刪掉時，`_stop_after_losing_claim()` 的 `db.refresh(document)` 會失敗 | 文件已經不在了，refresh 讀不到會丟出錯誤：worker 被當成當掉（寫 ERROR、工單被 SQS 重送），本機模式上傳的請求回 500 | 已處理（B2-2）：停下來的地方改成 `document_repo.get_by_id`（被刪掉就是 None），本機模式回 404。測試：`test_worker_stops_quietly_when_document_deleted_while_embedding`、`test_document_deleted_just_before_saving`、`test_document_deleted_then_processing_fails`、`test_inline_upload_returns_404_when_document_deleted_while_processing` |
+| 記用量失敗時，OpenAI 的費用已經花了但沒記到 | 每日上限會少算這一批。要確認：worker 不會繼續轉下一批（不再花錢），而且留下告警看得到的錯誤紀錄 | 已確認（B2-2）：只轉了那一批、文件標失敗、寫一筆 ERROR 的 `unexpected_error`（附錯誤堆疊）。測試：`test_usage_record_failure_stops_embedding_and_logs_error`。少算的那一批沒有補記：要補的話，得在記用量失敗時另外把用量寫進 log，再人工對帳 |
 | 刪除文件剛好碰上 worker 最後 commit 的那一瞬間，可能因為外鍵回 500 | 改之前就有的情況，機率很低；要修的話是 chunks 的外鍵加 `ondelete="CASCADE"`（要 migration） | 待決定 |
 | 前端的進度、取消 | B2-1 之後進度不再更新（畫面只顯示「處理中」）；取消按鈕還在 | B2-3 |
 
