@@ -10,13 +10,12 @@ from app.core import lambda_secrets
 lambda_secrets.load_if_in_lambda()
 
 import logging
-import socket
 import time
 
 from sqlalchemy import text
 
 from app.core import log
-from app.core.db import SessionLocal, engine
+from app.core.db import SessionLocal
 from app.repositories import document_repo
 from app.services import document_service
 
@@ -28,9 +27,9 @@ log.setup()
 # event：Lambda 傳進來的資料，SQS 觸發時長這樣 {"Records": [{"body": "工單內容"}, ...]}
 # context：Lambda 的執行資訊，這裡用它的 aws_request_id（Lambda 給這次執行的編號，對得上 Lambda 自己的 START/END 紀錄）
 def handle_process_message(event, context):
-    # 手動呼叫、傳 {"probe": true}：不處理工單，改成量 Lambda 到資料庫的連線速度（docs/decisions/011）
-    if event.get("probe"):
-        return _probe_database()
+    # 部署後 CI 手動呼叫、傳 {"health_check": true}：不處理工單，只確認連得到資料庫（docs/decisions/046 B4）
+    if event.get("health_check"):
+        return _check_database()
     for record in event["Records"]:
         # json.loads：跟 sqs_client 裡的 json.dumps 相反，把 JSON 字串轉回 dict
         body = json.loads(record["body"])
@@ -65,43 +64,14 @@ def handle_process_message(event, context):
             db.close()
 
 
-# 量 Lambda 到資料庫：網路來回一趟、新開一條連線、已連好的連線上查一次、一個最小的 transaction 各花多久
-# 只讀不寫。每一項量好幾次，第一次通常比較慢（資料庫可能在睡覺、DNS 還沒查過）
-def _probe_database():
-    host = engine.url.host
-
-    # 從 start 到現在幾毫秒（縮短名字，下面用很多次）
-    def ms(start):
-        return log.elapsed_ms(start)
-
-    result = {"tcp_connect_ms": [], "new_connection_ms": [], "select_ms": [], "transaction_ms": []}
-    for _ in range(3):
-        start = time.perf_counter()
-        # socket.create_connection：只建立網路連線（TCP），一趟來回就完成，不登入資料庫
-        socket.create_connection((host, 5432), timeout=10).close()
-        result["tcp_connect_ms"].append(ms(start))
-    for _ in range(3):
-        # dispose：把連線池裡的連線全部關掉，下一次 connect 一定是新開的
-        engine.dispose()
-        start = time.perf_counter()
-        connection = engine.connect()
-        result["new_connection_ms"].append(ms(start))
-        connection.close()
-    with engine.connect() as connection:
-        for _ in range(5):
-            start = time.perf_counter()
-            connection.execute(text("SELECT 1"))
-            result["select_ms"].append(ms(start))
-            connection.rollback()
-    # 跟報平安一樣的流程（從連線池拿連線 → BEGIN → 一個查詢 → COMMIT），只是查詢不寫資料
-    for _ in range(5):
-        start = time.perf_counter()
-        with SessionLocal() as db:
-            db.execute(text("SELECT 1"))
-            db.commit()
-        result["transaction_ms"].append(ms(start))
-    log.event("db_probe", **result)
-    return result
+# 健康檢查：用跟處理工單一樣的方式開 session，真的對資料庫查一次 SELECT 1（只讀不寫）
+# 連不上資料庫就會丟出錯誤，這次呼叫算失敗；CI 看回傳的內容判斷成功還是失敗（.github/workflows/ci-cd.yml）
+# 順便叫醒新部署的 Lambda：新 image 第一次啟動比較慢，CI 先叫醒一次，第一個使用者就不用等
+# 以前這裡是量連線速度的 probe（docs/decisions/011），量完了用不到，B4 拿掉
+def _check_database():
+    with SessionLocal() as db:
+        db.execute(text("SELECT 1"))
+    return {"database": "ok"}
 
 
 # 排程每小時呼叫一次：把超過處理期限的文件標逾時，再對帳清掉 S3 上的孤兒檔案

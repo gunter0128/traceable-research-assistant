@@ -73,7 +73,7 @@ GitHub Actions 可以在那台臨時機器上，跟測試一起開一個資料�
 ### 其他
 
 - **image 用 commit 編號當標籤**（同時也標 `latest`），看標籤就知道雲端跑的是哪一版。要退回上一版：`aws lambda update-function-code` 指回上一個 commit 編號的 image
-- **部署完熱身**：用測量模式叫醒 worker、經過 CloudFront 打一次 API。新 image 第一次啟動要下載，超過 10 秒，熱身之後使用者就不會是第一個。同時當作檢查：API 沒有回 401 就算部署失敗，GitHub 會寄信通知
+- **部署完熱身**：用測量模式叫醒 worker、經過 CloudFront 打一次 API（2026-11-09 更新：測量模式換成健康檢查 `{"health_check": true}`，真的查一次資料庫，CI 檢查回傳的是 `{"database": "ok"}`，見 [046](046-簡化上雲後的可靠性機制.md) B4）。新 image 第一次啟動要下載，超過 10 秒，熱身之後使用者就不會是第一個。同時當作檢查：API 沒有回 401 就算部署失敗，GitHub 會寄信通知
 - **同一時間只跑一個**：連續 push 兩次，第二次會等第一次跑完，不會兩個部署同時改 Lambda
 - 順便修掉 ruff 累積的 5 個問題（之前沒有人在檢查）
 

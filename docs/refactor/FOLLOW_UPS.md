@@ -13,7 +13,8 @@
 | 餘額不足的 429 會被 SDK 重試 | SDK 只看狀態碼，分不出餘額不足和速率限制（B3-1）。多等約 1.5 秒、多送 2 次請求，最後還是歸類成永久性錯誤、告警照樣觸發 | 接受（B3-1）。測試：`test_insufficient_quota_ends_as_permanent_error` |
 | 問答還在用自己寫的重試 | `_with_retries`、`_backoff_seconds`、`_retry_after_seconds`、`give_up_on_long_wait`、`deadline`、問答的 `on_usage` callback 還在 | 已處理：B3-2 問答不重試、用量改成回傳值、預算改由 qa_service 算；B3-3 刪掉 `_with_retries` 和它的 helper、`openai_retry` 的 log、test_openai_errors.py 那段測試 |
 | S3 的永久性錯誤沒有告警 | 改之前就是這樣：S3 沒權限、bucket 設錯（例如 IAM 改壞了）時，處理文件會標「系統設定有誤」、上傳會回 503，但只寫 WARNING／INFO，不會寄信。OpenAI 的永久性錯誤有告警，S3 沒有 | 還沒處理（不在 B3 範圍）。要加的話：worker 的 `failed` 且 `error_type = "StoragePermanentError"` 再一條篩選條件，API 確認上傳時也要先寫 log |
-| 問答時資料庫的查詢沒有等待上限 | 改之前就是這樣：50 秒的預算只管 OpenAI 的兩次呼叫，資料庫很慢時（例如連線卡住）整個請求還是可能超過 CloudFront 的 60 秒。B3-3 跑完整測試時實際遇過一次：遠端測試資料庫的一次搜尋卡了 88 秒，之後預算用完、程式照設計不送生成答案、回 503（測試在等的是生成失敗，所以失敗了；那兩個測試後來把預算放大，不受資料庫速度影響）。另外，資料庫出錯時 `finally` 寫用量也會失敗（session 要先 rollback），那次轉向量的用量會漏記（金額極小） | 還沒處理（不在 B3 範圍）。要處理的話是資料庫連線加 `connect_timeout`、`statement_timeout` |
+| **效能：問答的搜尋曾經卡 88 秒** | B3-3 跑完整測試時，遠端測試資料庫（Neon）的一次向量搜尋（`qa_search`）花了 87,975 毫秒，平常是幾十毫秒。之後預算用完，程式照設計不送生成答案、回 503。**原因還不知道**：可能是 Neon 那邊、網路、或連線本身卡住（同一時段 DNS 正常）。那兩個測試把預算放大，只是讓測試不受資料庫速度影響，**實際的問題沒有解決**。正式環境是否也會發生，要看部署後的 `qa_search` 耗時 | 還沒處理。部署後：用 CloudWatch Logs Insights 看 `qa_search` 的 `duration_ms` 分布（最大值、p99）；要防的話見下一列 |
+| 問答時資料庫的查詢沒有等待上限 | 改之前就是這樣：50 秒的預算只管 OpenAI 的兩次呼叫，資料庫很慢時（例如上面的 88 秒）整個請求還是可能超過 CloudFront 的 60 秒，使用者看到 CloudFront 的錯誤而不是我們的訊息。另外，資料庫出錯時 `finally` 寫用量也會失敗（session 要先 rollback），那次轉向量的用量會漏記（金額極小） | 還沒處理（不在 B 範圍）。要處理的話是資料庫連線加 `connect_timeout`、`statement_timeout` |
 | 請求超時或回應遺失時的費用 | 用量只能從成功收到的回應裡拿到。請求超時、連線在回應前斷掉的話，OpenAI 可能已經處理（也可能收了錢），我們這邊確認不了，也不會記到用量；SDK 重試會再送一次 | 接受（B3-1 修正說明，不另外做計費對帳）。要對帳的話看 OpenAI 後台的用量 |
 | 舊的工單在使用者按重試之後才出現 | 例如上一輪的 worker 當掉，SQS 1 小時後重送；或工單其實送到了、回應遺失。跟重試送出的新工單是同一份文件，先到的搶到租約處理、後到的跳過，不會處理兩次（租約只給排隊中的文件，B2-2）。剩下的限制：可能是舊工單搶先處理，log 裡帶的是舊請求的編號；先到的那次失敗的話，後到的也會跳過，要再按一次重試。不打算加工單版本號 | 接受（B2-3 確認） |
 
@@ -23,7 +24,9 @@
 |---|---|---|
 | 部署時還開著舊畫面的使用者 | 舊的前端還有取消按鈕、會讀進度欄位：按取消會跳出「Not Found」（API 回 404，文件不會被改到）；進度欄位讀不到，只顯示「處理中」。重新整理就是新畫面 | 部署後確認 |
 | 前端的實際操作 | B2-3 只跑了 build 和 lint，沒有實際點擊：上傳、處理中、完成、重試、刪除、舊的已取消文件的顯示都還沒驗證 | 部署後（或有安全的本機環境時）手動驗證 |
-| 告警的篩選條件要跟程式一起更新 | B3-3 把問答失敗 log 的 `error_type` 從 `permanent` 改成 `OpenAIPermanentError`，`deploy/setup_monitoring.py` 的篩選條件也跟著改了，但 AWS 上的還是舊的。部署新程式和重跑 `setup_monitoring.py` 之間的幾分鐘，問答的永久性錯誤對不上（永久性錯誤會一直發生，下一次就對得上，不會漏掉整件事）。本機已經用 tests/test_alarms.py 驗過 log 跟篩選條件對得上；AWS 上的篩選語法還沒驗 | 部署時：重跑 `.venv\Scripts\python deploy/setup_monitoring.py 你的email`。想先驗語法、不改任何設定的話：`aws logs test-metric-filter --filter-pattern '{ $.event = "qa_failed" && $.error_type = "OpenAIPermanentError" }' --log-event-messages '{"event": "qa_failed", "error_type": "OpenAIPermanentError"}'`，回傳裡有一筆符合就對了 |
+| 告警的篩選條件要跟程式一起更新 | B3-3 把問答失敗 log 的 `error_type` 從 `permanent` 改成 `OpenAIPermanentError`。B4 讓問答那條篩選條件暫時兩種都接受，所以**先更新告警、再部署程式**就不會有空窗。本機已經用 tests/test_alarms.py 驗過新舊兩種 log 都對得上；**AWS 是否接受這個寫法（括號加 `\|\|`）還沒驗** | 部署前：1. 先驗語法（不會改任何設定，見下一列）；2. 重跑 `.venv\Scripts\python deploy/setup_monitoring.py 你的email`；3. 再部署程式。新程式穩定之後可以把 `permanent` 拿掉（留著也沒有壞處） |
+| 用 AWS 驗篩選條件的語法 | `aws logs test-metric-filter` 只拿篩選條件去比對你給的幾筆 log，不會建立或修改任何東西 | 部署前在專案資料夾執行：`aws logs test-metric-filter --cli-input-json file://deploy/test-metric-filter-openai-permanent.json --region ap-southeast-1`。篩選條件和 3 筆範例 log 放在檔案裡（PowerShell 直接打 JSON 會把雙引號吃掉）；檔案的篩選條件跟 setup_monitoring.py 一模一樣（tests/test_alarms.py 會擋）。回傳的 `matches` 裡應該只有 `eventNumber` 1、2（新、舊寫法），沒有 3（暫時性錯誤）；語法不接受的話指令會直接報錯 |
+| 部署後的健康檢查 | B4 把 worker 的 probe 換成 `{"health_check": true}`（真的查一次 `SELECT 1`），CI 改成檢查回傳的 `out.json` 是不是 `{"database": "ok"}`。本機測過：連得到回成功、連不上丟錯誤、CI 的判斷條件只認成功的回傳（tests/test_health_check.py）。CI 的這一步還沒在 GitHub Actions 上真的跑過 | 第一次部署時看「熱身 + 確認能用」這一步的輸出 |
 | SDK 重試的 log 有沒有進到 CloudWatch | B3-1 之後轉向量的重試由 SDK 寫 INFO「Retrying request in …」，`log.setup()` 把它接成我們的 JSON。本機和測試確認過，Lambda 上還沒看過 | 部署後確認：worker 的 log 查得到這句、帶 document_id |
 | 心跳的期限 10 分鐘沒有在 AWS 上實測 | 330 秒（B3-1 之後：3 次 × 30 秒 + 2 次等待 × SDK 最多照等的 120 秒）是假設「每次請求在 30 秒內結束」的估算，不是保證。等待上限是 httpx 每一次讀取的上限，不是整個請求的總時間：回應一直很慢地傳，一批還是可能更久。S3 在異常時，boto3 的等待上限加預設的重試，下載也可能更久。被誤判時存結果會被擋下來，資料不會錯，但會白做一次、顯示「處理中斷」 | 部署後量：一份大文件從取得租約到每次報平安的間隔（log 的 claimed、chunked、openai_usage 的時間差） |
 | worker 的 `sqs:ChangeMessageVisibility` 權限 | B1 之後用不到了。要先部署新程式、確認沒問題，再收回權限 | 部署後 |
@@ -34,4 +37,4 @@
 | 項目 | 狀態 |
 |---|---|
 | A2～A6 的可讀性整理（問答服務、前端、eval、train、零碎） | B 做完之後 |
-| pytest 跑一次約 20 分鐘（每個測試都在遠端的 Neon 建表、刪表） | 可以改成跟 CI 一樣用本機 Docker 的 PostgreSQL，但 conftest 要先加「用環境變數指定測試資料庫」的開關 |
+| pytest 跑一次約 25～33 分鐘（每個測試都在遠端的 Neon 建表、刪表；DNS 偶爾變慢、一次搜尋卡過 88 秒，都會讓整輪測試失敗或中斷） | 可以改成跟 CI 一樣用本機 Docker 的 PostgreSQL，但 conftest 要先加「用環境變數指定測試資料庫」的開關 |

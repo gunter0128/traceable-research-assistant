@@ -38,8 +38,12 @@ METRIC_FILTERS = [
     (WORKER, "timeouts", '"Task timed out"', "Errors", "1"),
     # OpenAI 永久性錯誤（key 失效、餘額用完）：問答失敗（qa_failed）、處理文件失敗（failed）的 log 都寫 error_type = 錯誤的類別名稱
     # 類別名稱來自 app/core/openai_client.py；改名字或改 log 的寫法時，tests/test_alarms.py 會擋下來
-    # （2026-11 B3-3 之前，問答這邊寫的是 "permanent"）
-    (API, "openai-permanent", '{ $.event = "qa_failed" && $.error_type = "OpenAIPermanentError" }', "OpenAIPermanentErrors", "1"),
+    # 問答這條暫時兩種值都接受（docs/decisions/046 B4）：B3-3 之前的程式寫 "permanent"，之後寫 "OpenAIPermanentError"
+    #   先跑這個腳本更新告警、再部署新程式，新舊程式寫的 log 都對得上，中間沒有空窗
+    #   新程式部署穩定之後，"permanent" 可以拿掉（留著也沒有壞處），見 docs/refactor/FOLLOW_UPS.md
+    (API, "openai-permanent",
+     '{ $.event = "qa_failed" && ($.error_type = "OpenAIPermanentError" || $.error_type = "permanent") }',
+     "OpenAIPermanentErrors", "1"),
     (WORKER, "openai-permanent", '{ $.event = "failed" && $.error_type = "OpenAIPermanentError" }', "OpenAIPermanentErrors", "1"),
     # 全系統的每日用量到上限
     (API, "system-quota", '{ $.event = "quota_exceeded" && $.scope = "system" }', "SystemQuotaExceeded", "1"),
