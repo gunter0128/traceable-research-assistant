@@ -22,7 +22,8 @@ from app.models.document import Document
 from app.repositories import chunk_repo, document_repo
 from app.services import usage_service, workspace_service
 
-# 一份文件最多被處理幾次，超過就直接標成失敗，不再重試
+# 一份文件最多被處理幾次，超過就直接標成失敗，不再處理（防止一份會讓程式當掉的文件被一直重做、一直花錢）
+# 次數在取得租約時 +1；會讓它增加的是 SQS 重送工單、接手處理到一半死掉的 Lambda。使用者按重試會歸零
 MAX_ATTEMPTS = 3
 _GAVE_UP = f"處理了 {MAX_ATTEMPTS} 次都沒有成功，已停止自動重試"
 # 處理中超過這麼久沒報平安，就判定程式死了（docs/decisions/008）
@@ -30,7 +31,7 @@ _GAVE_UP = f"處理了 {MAX_ATTEMPTS} 次都沒有成功，已停止自動重試
 HEARTBEAT_TIMEOUT = timedelta(minutes=5)
 _INTERRUPTED = "處理中斷，請按重試"
 # 排隊中超過這麼久還沒人開始處理，就判定出事了（docs/decisions/007）
-# 排隊本來就可能很久：同時最多 2 個 Lambda，一次上傳很多份時後面的要等；等下一回合重試也在排隊中
+# 排隊本來就可能很久：同時最多 2 個 Lambda，一次上傳很多份時後面的要等
 QUEUE_TIMEOUT = timedelta(minutes=15)
 _TIMED_OUT = "處理逾時，請按重試"
 # 上傳檔案大小上限：一般論文 1~5 MB、圖多的報告 10~20 MB
@@ -92,12 +93,6 @@ class DuplicateDocument(Exception):
     def __init__(self, filename: str):
         super().__init__(filename)
         self.filename = filename
-
-
-# OpenAI 暫時連不上、而且還有剩餘次數：這次先不處理，文件回到「排隊中」
-# 丟給呼叫的人（worker）決定怎麼延後，worker 會叫 SQS 2 分鐘後再把工單送回來
-class RetryLater(Exception):
-    pass
 
 
 # 只有失敗、或使用者自己取消的文件可以手動重試（排隊中、處理中、已完成的不行）
@@ -311,7 +306,7 @@ def process_document(db: Session, document: Document) -> Document:
 
     log.event("claimed", attempt=document.attempts)
 
-    # 次數用完就不處理了。工單可能從好幾個地方來（SQS 自動重送、使用者重試），統一在這裡擋
+    # 次數用完就不處理了（連 S3 都不下載）：SQS 重送工單、接手死掉的 Lambda 都會走到這裡，統一在這裡擋
     if document.attempts > MAX_ATTEMPTS:
         return _fail(db, document, lease, _GAVE_UP)
 
@@ -377,10 +372,12 @@ def process_document(db: Session, document: Document) -> Document:
         return _fail(db, document, lease, "找不到上傳的檔案，請刪除後重新上傳")
     except (openai_client.OpenAIPermanentError, s3_client.StoragePermanentError):
         return _fail(db, document, lease, "系統設定有誤，請聯絡管理員")
+    # 暫時連不上：OpenAI 由 openai_client 自己寫的重試、S3 由 boto3 內建的重試先試過幾次了，走到這裡代表重試也沒用
+    # 直接標失敗，讓使用者稍後按重試（docs/decisions/046）。不延後、不叫 SQS 晚點再送
     except openai_client.OpenAITemporaryError:
-        return _defer_or_fail(db, document, lease, "AI 服務")
+        return _fail(db, document, lease, "AI 服務暫時無法使用，請稍後按重試")
     except s3_client.StorageTemporaryError:
-        return _defer_or_fail(db, document, lease, "儲存服務")
+        return _fail(db, document, lease, "儲存服務暫時無法使用，請稍後按重試")
     # 其他預料之外的錯誤：只給一般性的訊息，不把內部錯誤細節（可能含系統資訊）直接顯示給使用者
     # 刻意接住所有錯誤（noqa 告訴 ruff 這是故意的）：上面認得的錯誤都分類處理過了，
     # 這裡是最後一道防線，確保不管發生什麼事，文件都會被標成失敗，不會卡在處理中
@@ -394,27 +391,6 @@ def process_document(db: Session, document: Document) -> Document:
         log.event("processed", chunks=len(pieces), total_ms=log.elapsed_ms(started))
     else:
         log.event("lease_lost", logging.WARNING, total_ms=log.elapsed_ms(started))
-    db.refresh(document)
-    return document
-
-
-# 外部服務（OpenAI、S3）暫時連不上時：雲端而且還有剩餘次數 → 回到排隊中等下一回合；否則標失敗
-# service：哪個服務出問題，放進給使用者看的訊息裡（「AI 服務」/「儲存服務」）
-def _defer_or_fail(db: Session, document: Document, lease: _Lease, service: str) -> Document:
-    # 本機沒有 SQS，沒辦法延後，只能直接標失敗讓使用者自己重試
-    if settings.sqs_queue_url is None:
-        return _fail(db, document, lease, f"{service}暫時無法使用，請稍後按重試")
-    if document.attempts >= MAX_ATTEMPTS:
-        return _fail(
-            db, document, lease, f"{service}暫時無法使用，已自動重試 {MAX_ATTEMPTS} 次，請稍後按重試"
-        )
-    db.rollback()
-    # 放掉租約、回到排隊中，留一個提示給使用者。租約已經不是自己的了就不延後（別人在處理了）
-    if document_repo.defer_with_lease(
-        db, document.id, lease.token, f"{service}暫時無法使用，稍後會自動重試"
-    ):
-        log.event("deferred", logging.WARNING, service=service, attempt=document.attempts)
-        raise RetryLater
     db.refresh(document)
     return document
 

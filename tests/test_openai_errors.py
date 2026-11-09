@@ -1,4 +1,4 @@
-# 呼叫 OpenAI 出錯時的處理（docs/decisions/005）：錯誤分類、文件處理延後重試、問答回 503、批次送
+# 呼叫 OpenAI 出錯時的處理（docs/decisions/005、046）：錯誤分類、文件處理標失敗後手動重試、問答回 503、批次送
 # 真的 OpenAI 都換成假的函式，用丟出不同錯誤來模擬各種狀況
 
 import json
@@ -97,31 +97,53 @@ def _pending_document(db_session, document_id, attempts):
     return document
 
 
-# 測試：雲端、OpenAI 暫時連不上、還有剩餘次數 → 不標失敗，留在處理中並提示，交給 worker 延後
-def test_temporary_error_defers_in_cloud(client, db_session, monkeypatch, cloud):
-    _, _, document_id = _upload(client, "alice@example.com")
-    document = _pending_document(db_session, document_id, attempts=0)
-    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
+# 夠長的文字，切下去會變成好幾段：才測得出「轉向量轉到一半出錯，前面寫的 chunk 要撤回」
+LONG_TEXT = "retrieval " * 2000
 
-    with pytest.raises(document_service.RetryLater):
-        document_service.process_document(db_session, document)
+
+# 測試：雲端、轉向量轉到第 2 批時 OpenAI 暫時連不上 → 直接標失敗（不延後、不再送工單），
+# 第 1 批已經寫進 session 的 chunk 全部撤回（docs/decisions/046）
+def test_temporary_error_fails_in_cloud_and_rolls_back_chunks(client, db_session, monkeypatch, cloud):
+    headers = login_headers(client, "alice@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = upload_pdf(client, headers, ws_id, valid_pdf_bytes(LONG_TEXT)).json()["id"]
+    document = _pending_document(db_session, document_id, attempts=0)
+    # 一次只送一段去轉向量，才會有「第 2 批」
+    monkeypatch.setattr(document_service, "EMBED_BATCH_SIZE", 1)
+    calls = []
+
+    def fail_on_second_batch(texts, **kwargs):
+        calls.append(texts)
+        if len(calls) == 2:
+            raise openai_client.OpenAITemporaryError()
+        return fake_embed_texts(texts)
+
+    monkeypatch.setattr(openai_client, "embed_texts", fail_on_second_batch)
+
+    document_service.process_document(db_session, document)
 
     db_session.refresh(document)
-    assert document.status == "uploaded"
-    assert document.error_message == "AI 服務暫時無法使用，稍後會自動重試"
+    assert len(calls) == 2  # 第 1 批成功、第 2 批失敗：確認真的是「轉到一半」才出錯
+    assert document.status == "failed"
+    assert document.error_message == "AI 服務暫時無法使用，請稍後按重試"
+    assert document.claim_token is None  # 租約收回了，之後按重試才搶得到
     assert db_session.query(Chunk).filter(Chunk.document_id == document_id).count() == 0
+    assert cloud == [document_id]  # 只有上傳時送的那一張工單，沒有再送
 
 
-# 測試：第 3 回合還是暫時連不上 → 標失敗，請使用者稍後重試
-def test_temporary_error_fails_on_last_attempt(client, db_session, monkeypatch, cloud):
+# 測試：第 3 次處理（次數還沒超過上限）遇到暫時性錯誤 → 跟一般的暫時性錯誤一樣標失敗
+# 確認兩件事：次數上限只擋「超過」上限的，第 3 次會真的去處理；暫時性錯誤不管第幾次都一樣，不會延後
+def test_temporary_error_on_last_allowed_attempt_fails_normally(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "bob@example.com")
     document = _pending_document(db_session, document_id, attempts=document_service.MAX_ATTEMPTS - 1)
     monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
 
     document_service.process_document(db_session, document)
 
+    assert document.attempts == document_service.MAX_ATTEMPTS
     assert document.status == "failed"
-    assert document.error_message == "AI 服務暫時無法使用，已自動重試 3 次，請稍後按重試"
+    # 不是次數上限的「處理了 3 次都沒有成功」：第 3 次有真的去處理，是 OpenAI 的錯誤讓它失敗
+    assert document.error_message == "AI 服務暫時無法使用，請稍後按重試"
 
 
 # 測試：本機沒有 SQS 沒辦法延後 → 直接標失敗
@@ -147,19 +169,53 @@ def test_permanent_error_fails_immediately(client, db_session, monkeypatch, clou
     assert document.error_message == "系統設定有誤，請聯絡管理員"
 
 
-# 測試：worker 收到 RetryLater → 叫 SQS 2 分鐘後再送這張工單，並讓這次執行失敗（工單才不會被刪）
-def test_worker_delays_message_on_retry_later(client, db_session, monkeypatch, cloud):
+# 測試：worker 處理時 OpenAI 暫時連不上 → 這次執行正常結束（不丟例外），也不去改工單的可見時間
+# 正常結束 = SQS 會把工單刪掉、不會再送；文件標失敗，要再處理由使用者按重試
+def test_worker_finishes_normally_on_temporary_error(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "erin@example.com")
     monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
     monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
-    delayed = []
-    monkeypatch.setattr(sqs_client, "delay_message", lambda receipt, seconds: delayed.append((receipt, seconds)))
+    # 換掉 SQS client 的「改工單可見時間」（以前延後重試用的就是它）：有人呼叫的話記下來
+    visibility_changes = []
+
+    def record_visibility_change(**kwargs):
+        visibility_changes.append(kwargs)
+
+    monkeypatch.setattr(sqs_client.client, "change_message_visibility", record_visibility_change)
     event = {"Records": [{"body": json.dumps({"document_id": document_id}), "receiptHandle": "receipt-1"}]}
 
-    with pytest.raises(document_service.RetryLater):
-        worker.handle_process_message(event, None)
+    worker.handle_process_message(event, None)  # 不丟例外就代表這次執行成功
 
-    assert delayed == [("receipt-1", 120)]
+    assert visibility_changes == []
+    assert cloud == [document_id]  # 只有上傳時送的那一張工單，沒有再送
+    assert db_session.get(Document, document_id).status == "failed"
+
+
+# 測試：暫時性錯誤標失敗之後，使用者按重試 → 次數歸零、重新送一張工單；這次 OpenAI 正常，worker 處理完成
+def test_temporary_failure_can_be_retried(client, db_session, monkeypatch, cloud):
+    headers, _, document_id = _upload(client, "frank@example.com")
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
+    event = {"Records": [{"body": json.dumps({"document_id": document_id})}]}
+    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
+    worker.handle_process_message(event, None)
+    assert db_session.get(Document, document_id).status == "failed"
+
+    # OpenAI 恢復了，使用者按重試
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
+    response = client.post(f"/documents/{document_id}/retry", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "uploaded"
+    assert response.json()["error_message"] is None
+    assert db_session.get(Document, document_id).attempts == 0
+    assert cloud == [document_id, document_id]  # 上傳一次、重試一次，各送一張工單
+
+    worker.handle_process_message(event, None)
+
+    document = db_session.get(Document, document_id)
+    db_session.refresh(document)
+    assert document.status == "processed"
+    assert db_session.query(Chunk).filter(Chunk.document_id == document_id).count() > 0
 
 
 # 測試：批次送 → 250 段、每批 100 段，只呼叫 3 次，chunk 的順序編號照原本的順序 0~249

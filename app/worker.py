@@ -15,16 +15,13 @@ import time
 
 from sqlalchemy import text
 
-from app.core import log, sqs_client
+from app.core import log
 from app.core.db import SessionLocal, engine
 from app.repositories import document_repo
 from app.services import document_service
 
 # 寫 log 的設定（docs/decisions/010），跟 API 用同一套
 log.setup()
-
-# OpenAI 暫時連不上時，工單延後多久（秒）再處理（見 docs/decisions/005）
-RETRY_DELAY_SECONDS = 120
 
 
 # SQS 有新工單時，Lambda 會呼叫這個函式
@@ -56,14 +53,11 @@ def handle_process_message(event, context):
             if document is None:
                 log.event("message_skipped", reason="document_deleted")
                 continue
+            # 處理中的錯誤（包括 OpenAI、S3 暫時連不上）process_document 都會自己接住、把文件標失敗、正常回來
+            # 正常回來 = 這次執行成功 → SQS 把工單刪掉，不會重送；要再處理由使用者按重試（docs/decisions/046）
             document_service.process_document(db, document)
-        except document_service.RetryLater:
-            # 叫 SQS 2 分鐘後再把這張工單送回來，然後把錯誤往外丟，讓這次執行算失敗
-            # Lambda 執行失敗時不會刪掉工單，工單才會在 2 分鐘後重新出現
-            sqs_client.delay_message(record["receiptHandle"], RETRY_DELAY_SECONDS)
-            raise
-        # 其他沒接住的錯誤（process_document 自己會接住處理中的錯誤，會走到這裡的通常是一開始就連不上資料庫）
-        # 記下錯誤堆疊再往外丟：工單會被 SQS 重送，3 次都這樣就進 DLQ
+        # 沒接住的錯誤：會走到這裡的通常是一開始就連不上資料庫，文件還沒被標成任何狀態
+        # 記下錯誤堆疊再往外丟，讓這次執行算失敗：工單約 1 小時後被 SQS 重送，3 次都這樣就進 DLQ（有告警）
         except Exception:
             log.event("message_crashed", logging.ERROR, exc_info=True)
             raise

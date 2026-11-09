@@ -29,12 +29,12 @@
 | 拿工單 | 重複的工單（文件已處理完） | 跳過，不會重複呼叫 OpenAI | 測試（test_worker_skips_duplicate_message） |
 | 拿工單 | 資料庫連不上 | 連租約都拿不到，文件還在排隊中；15 分鐘後標「處理逾時，請按重試」 | 測試（test_listing_expires_overdue_document） |
 | 拿工單 | 兩個 Lambda 同時拿到同一份文件的工單 | 只有一個搶得到租約，另一個直接跳過 | 測試（test_claim_is_exclusive） |
-| 開始 | 已經處理 3 次 | 不處理，直接標失敗 | 測試（test_process_stops_after_max_attempts） |
-| 下載 PDF | S3 暫時連不上 | 跟 OpenAI 一樣：2 分鐘後再一回合，最多 3 回合 | 測試（test_storage_temporary_error_defers_in_cloud、test_s3_errors_are_classified） |
+| 開始 | 已經處理 3 次（SQS 重送工單、接手死掉的 Lambda 才會增加；按重試會歸零） | 不處理，直接標失敗 | 測試（test_process_stops_after_max_attempts；第 3 次照常處理：test_temporary_error_on_last_allowed_attempt_fails_normally） |
+| 下載 PDF | S3 暫時連不上 | 跟 OpenAI 一樣：標失敗「儲存服務暫時無法使用，請稍後按重試」，使用者按重試（decisions/046） | 測試（test_storage_temporary_error_fails_in_cloud、test_s3_errors_are_classified） |
 | 下載 PDF | 檔案不見了 | 標失敗「找不到上傳的檔案，請刪除後重新上傳」，不重試 | 測試（test_missing_file_fails_with_clear_reason）；真的 S3 回的錯誤也確認會被分類成「檔案不存在」 |
 | 下載 PDF | 沒權限讀檔案 | 標失敗「系統設定有誤」，不重試 | 測試（test_s3_errors_are_classified） |
 | 解析 | PDF 壞掉 / 超過 300 頁 / 抓不到字 | 標失敗並寫明原因，不重試 | 測試（test_corrupt_pdf_has_reason 等三個） |
-| 轉向量 | OpenAI 暫時連不上 | 自己寫的重試：每次嘗試前報平安，最多 5 次；不行就 2 分鐘後再一回合，最多 3 回合 | 測試（test_temporary_error_*、test_retries_with_growing_backoff）、雲端（演練 1：8.6 分鐘後標失敗，間隔都剛好 2 分鐘） |
+| 轉向量 | OpenAI 暫時連不上 | 自己寫的重試：每次嘗試前報平安，最多 5 次；還是不行就標失敗「AI 服務暫時無法使用，請稍後按重試」，已經寫的 chunk 全部撤回，工單不延後（decisions/046；以前是 2 分鐘後再一回合，最多 3 回合） | 測試（test_temporary_error_*、test_worker_finishes_normally_on_temporary_error、test_temporary_failure_can_be_retried、test_retries_with_growing_backoff）；雲端的演練 1 是改之前的做法 |
 | 轉向量 | OpenAI 說「請等 N 秒」 | 照做，但最多等 60 秒（以前套件會照做最多 120 秒，而且中間沒辦法報平安） | 測試（test_processing_caps_long_retry_after） |
 | 轉向量 | OpenAI 永久性錯誤（key 無效、餘額不足） | 立刻標失敗「系統設定有誤」 | 測試（test_permanent_error_fails_immediately）、本機真的 OpenAI（演練 2） |
 | 存 chunk | 中途任何錯誤 | rollback，一段都不留 | 測試（test_failed_processing_leaves_no_chunks） |
@@ -42,7 +42,6 @@
 | 整個執行 | 在取得租約之前就被中斷 | 文件還在排隊中，15 分鐘後標「處理逾時」 | 雲端（演練 3 發現的，decisions/007），測試（test_listing_expires_overdue_document） |
 | 整個執行 | 使用者按「取消處理」 | 狀態改成已取消、收回租約；正在處理的 Lambda 下次報平安時發現代碼對不上，自己停下來，寫到一半的全部丟掉（decisions/009） | 測試（test_cancel_stops_running_worker、test_cancelled_document_is_skipped_by_worker） |
 | 整個執行 | 其實沒死只是很慢，被判定中斷後使用者按了重試 | 舊的 Lambda 報平安或存結果時發現租約不是自己的，放棄這次處理，不會存出兩份 | 測試（test_worker_gives_up_when_lease_is_taken、test_heartbeat_rejected_after_interrupted） |
-| 延後工單 | 沒有「延後」的權限 | 這次執行失敗，工單照預設 60 分鐘後重送（變慢，但不會遺失） | 雲端（演練 1 證明權限有效） |
 
 ## 3. 每小時掃描（Lambda sweeper）
 

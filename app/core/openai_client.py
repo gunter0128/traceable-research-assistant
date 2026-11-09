@@ -3,7 +3,7 @@
 #   1. 把 OpenAI 的各種錯誤分成「暫時性」和「永久性」兩類（見 docs/decisions/005）
 #   2. 自己做重試（見 docs/decisions/008）：SDK 內建的重試會照 OpenAI 的「請等 N 秒」最多等 120 秒，
 #      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法在重試之間報平安、也沒辦法控制總時間
-# 分類完怎麼處理（延後、標失敗、回 503）由呼叫的 service 決定，這裡不管
+# 分類完怎麼處理（標失敗、回 503）由呼叫的 service 決定，這裡不管
 
 import logging
 import random

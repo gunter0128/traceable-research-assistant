@@ -110,6 +110,9 @@ def test_worker_skips_deleted_document(client, sent, worker_db):
 
 
 # 測試：次數用完的文件，就算又收到工單，也不會再處理，直接標失敗
+# 自動延後重試拿掉之後（docs/decisions/046），次數只會因為 SQS 重送工單、接手死掉的 Lambda 而增加；
+# 這個上限是「一份會讓程式當掉的文件不會被一直重做」的保險。邊界（第 3 次照常處理）見
+# test_openai_errors.py 的 test_temporary_error_on_last_allowed_attempt_fails_normally
 def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
     headers = login_headers(client, "erin@example.com")
     ws_id = create_workspace(client, headers)
@@ -130,7 +133,9 @@ def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
     monkeypatch.setattr(openai_client, "embed_texts", record_embed)
     document_service.process_document(db_session, document)
 
+    assert document.attempts == document_service.MAX_ATTEMPTS + 1
     assert document.status == "failed"
+    assert document.error_message == "處理了 3 次都沒有成功，已停止自動重試"  # 是次數上限擋下來的，不是別的錯誤
     assert calls == []  # 完全沒有呼叫 OpenAI
 
 

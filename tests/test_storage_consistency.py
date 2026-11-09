@@ -165,8 +165,8 @@ def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch):
     assert body["error_message"] == "找不到上傳的檔案，請刪除後重新上傳"
 
 
-# 測試：雲端、處理時 S3 暫時連不上 → 跟 OpenAI 一樣，留在處理中等下一回合
-def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch):
+# 測試：雲端、處理時 S3 暫時連不上 → 跟 OpenAI 一樣直接標失敗，請使用者稍後按重試（不延後，docs/decisions/046）
+def test_storage_temporary_error_fails_in_cloud(client, db_session, monkeypatch):
     monkeypatch.setattr(settings, "sqs_queue_url", "https://fake-queue")
     monkeypatch.setattr(document_service.sqs_client, "send_process_message", lambda document_id: None)
     headers = login_headers(client, "frank@example.com")
@@ -175,12 +175,11 @@ def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch
     document = db_session.get(Document, document_id)
     monkeypatch.setattr(s3_client, "download_file", always_raise(s3_client.StorageTemporaryError("模擬")))
 
-    with pytest.raises(document_service.RetryLater):
-        document_service.process_document(db_session, document)
+    document_service.process_document(db_session, document)
 
     db_session.refresh(document)
-    assert document.status == "uploaded"
-    assert document.error_message == "儲存服務暫時無法使用，稍後會自動重試"
+    assert document.status == "failed"
+    assert document.error_message == "儲存服務暫時無法使用，請稍後按重試"
 
 
 # 測試：上傳完成、API 去 S3 確認檔案時 S3 暫時連不上 → 回 503 和看得懂的訊息（不是 500），不建紀錄

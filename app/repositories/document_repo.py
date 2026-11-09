@@ -181,27 +181,6 @@ def fail_with_lease(db: Session, document_id: int, token: str, reason: str) -> b
     return updated == 1
 
 
-# 何時呼叫：OpenAI / S3 暫時連不上、等下一回合。放掉租約、回到排隊中，重新計算排隊時間，
-# 留一個提示給使用者看（「…稍後會自動重試」）
-def defer_with_lease(db: Session, document_id: int, token: str, message: str) -> bool:
-    updated = (
-        db.query(Document)
-        .filter(Document.id == document_id, Document.claim_token == token)
-        .filter(Document.status == "processing")
-        .update(
-            {
-                Document.status: "uploaded",
-                Document.claim_token: None,
-                Document.error_message: message,
-                Document.queued_at: datetime.now(timezone.utc),
-            },
-            synchronize_session=False,
-        )
-    )
-    db.commit()
-    return updated == 1
-
-
 # 何時呼叫：使用者按「取消處理」（docs/decisions/009）
 # 條件不用對代碼：使用者手上沒有代碼，只要文件還在排隊中或處理中就可以取消
 # 收回租約（清掉代碼）就夠了，不用另外通知正在處理的 Lambda：
