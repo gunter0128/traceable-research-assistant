@@ -74,14 +74,17 @@ def setup_knowledge_base(corpus: str):
 
 # 建表、把 PDF 一份一份走系統正常的處理流程放進知識庫；訓練資料也用這個（train/make_answers.py）
 def build_knowledge_base(pdfs: dict[str, bytes], workspace_name: str):
-    # 本機模式：沒有 SQS，上傳後直接在同一個流程裡處理（docs/decisions/003）
+    # 跟線上不一樣的兩件事（直接改 app 模組裡的值，之後整個程式執行期間都有效）：
+    #   本機模式：沒有 SQS，上傳後直接在同一個流程裡處理（docs/decisions/003）
+    #   檔案不放 S3：處理時「從 S3 下載」改成直接讀本機的 PDF（key 就是檔名，下面建紀錄時存的位置填檔名）
+    # 其他步驟（解析、切段、轉向量、存資料庫）都跟線上一樣
     settings.sqs_queue_url = None
+    s3_client.download_file = lambda key: pdfs[key]
+
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
-    # 檔案不放 S3：處理時「從 S3 下載」改成直接讀本機的 PDF，其他步驟（解析、切段、轉向量、存資料庫）都跟線上一樣
-    s3_client.download_file = lambda key: pdfs[key]
 
     db = SessionLocal()
     user = auth_service.register_user(db, "eval@example.com", "eval-password")
@@ -258,9 +261,9 @@ def run_once(db, user, workspace, questions, client, domain, today, evidence=Non
 def score(client, domain, q, answer, retrieved, cited, seconds, evidence=None) -> dict:
     required = sorted({doc_code(s) for s in q["sources"]})
     verdict = judge(client, domain, q, answer, cited)
-    included = _align(q["must_include"], verdict.get("must_include", []))
-    bonus = _align(q.get("nice_to_have", []), verdict.get("nice_to_have", []))
-    violated = _align(q["must_not"], verdict.get("must_not", []))
+    included = align_verdict(q["must_include"], verdict.get("must_include", []))
+    bonus = align_verdict(q.get("nice_to_have", []), verdict.get("nice_to_have", []))
+    violated = align_verdict(q["must_not"], verdict.get("must_not", []))
     refused = bool(verdict["refused"])
     row = {
         "id": q["id"], "type": q["type"], "question": q["question"], "response": answer,
@@ -283,14 +286,21 @@ def score(client, domain, q, answer, retrieved, cited, seconds, evidence=None) -
     # 全對：重點全提到、沒有錯誤說法、拒答正確
     row["correct"] = row["refusal_ok"] and not row["misuse"] and (row["include_rate"] in (None, 1.0))
     mark = "✓" if row["correct"] else "✗"
-    print(f"  {mark} {q['id']} {q['question'][:30]:32} 檢索 {'完整' if row['full_hit'] else ('—' if row['full_hit'] is None else '缺')}"
+    print(f"  {mark} {q['id']} {q['question'][:30]:32} 檢索 {_hit_label(row['full_hit'])}"
           f"{'  誤用' if row['misuse'] else ''}{'  拒答' if refused else ''}")
     return row
 
 
+# 印在畫面上的檢索結果：完整 / 缺 / —（沒有答案的題目不算檢索）
+def _hit_label(full_hit: bool | None) -> str:
+    if full_hit is None:
+        return "—"
+    return "完整" if full_hit else "缺"
+
+
 # 評審偶爾會自己多寫一項、漏寫一項或改寫項目的文字（954 次裡有 15 次，docs/decisions/030）
 # 只採用題目裡有的項目：先照原文對回去，對不到、但數量一樣的話照順序對；都對不到就當作 false
-def _align(expected: list[str], judged: list[dict]) -> list[bool]:
+def align_verdict(expected: list[str], judged: list[dict]) -> list[bool]:
     by_text = {v.get("item"): v for v in judged}
     aligned = []
     for i, item in enumerate(expected):
@@ -299,35 +309,44 @@ def _align(expected: list[str], judged: list[dict]) -> list[bool]:
     return aligned
 
 
+# 一輪的摘要：全部題目一組，再每種題型各一組，例如 {"all": {...}, "persona": {...}}
 def summarize(rows: list[dict]) -> dict:
-    def rate(values):
-        values = [v for v in values if v is not None]
-        return round(sum(values) / len(values), 3) if values else None
-
-    def stats(group):
-        answerable = [r for r in group if r["full_hit"] is not None]
-        wrong = [r for r in answerable if not r["correct"]]
-        return {
-            "n": len(group),
-            "correct": rate([r["correct"] for r in group]),
-            "full_hit": rate([r["full_hit"] for r in group]),
-            "evidence_full": rate([r.get("evidence_full") for r in group]),
-            "cite_full": rate([r.get("cite_full") for r in group]),
-            "misuse": rate([r["misuse"] for r in group]),
-            "include": rate([r["include_rate"] for r in group]),
-            # 可信、可追蹤（docs/decisions/038）：之前的結果沒有這兩項，是 None
-            "citation_ok": rate([r.get("citation_ok") for r in group]),
-            "consistent": rate([None if "contradiction" not in r else not r["contradiction"] for r in group]),
-            "refusal_ok": rate([r["refusal_ok"] for r in group]),
-            # 雙層分析（取自我的論文）：答錯的題目，是文件沒搜到（取得層），還是搜到了還答錯（使用層）
-            "fail_acquisition": sum(1 for r in wrong if not r["full_hit"]),
-            "fail_usage": sum(1 for r in wrong if r["full_hit"]),
-        }
-
     by_type = defaultdict(list)
     for r in rows:
         by_type[r["type"]].append(r)
-    return {"all": stats(rows), **{t: stats(by_type[t]) for t in TYPE_NAMES if t in by_type}}
+    summary = {"all": _stats(rows)}
+    for qtype in TYPE_NAMES:
+        if qtype in by_type:
+            summary[qtype] = _stats(by_type[qtype])
+    return summary
+
+
+# 一組題目的各項比率
+def _stats(group: list[dict]) -> dict:
+    answerable = [r for r in group if r["full_hit"] is not None]
+    wrong = [r for r in answerable if not r["correct"]]
+    return {
+        "n": len(group),
+        "correct": _rate([r["correct"] for r in group]),
+        "full_hit": _rate([r["full_hit"] for r in group]),
+        "evidence_full": _rate([r.get("evidence_full") for r in group]),
+        "cite_full": _rate([r.get("cite_full") for r in group]),
+        "misuse": _rate([r["misuse"] for r in group]),
+        "include": _rate([r["include_rate"] for r in group]),
+        # 可信、可追蹤（docs/decisions/038）：之前的結果沒有這兩項，是 None
+        "citation_ok": _rate([r.get("citation_ok") for r in group]),
+        "consistent": _rate([None if "contradiction" not in r else not r["contradiction"] for r in group]),
+        "refusal_ok": _rate([r["refusal_ok"] for r in group]),
+        # 雙層分析（取自我的論文）：答錯的題目，是文件沒搜到（取得層），還是搜到了還答錯（使用層）
+        "fail_acquisition": sum(1 for r in wrong if not r["full_hit"]),
+        "fail_usage": sum(1 for r in wrong if r["full_hit"]),
+    }
+
+
+# 比率：True 算 1、False 算 0，None（這題不適用）不算；全部都是 None 就回傳 None
+def _rate(values: list) -> float | None:
+    values = [v for v in values if v is not None]
+    return round(sum(values) / len(values), 3) if values else None
 
 
 def pct(v):
@@ -378,20 +397,7 @@ def main():
                         help="另外請評審判斷每個回答前後有沒有矛盾（docs/decisions/038），每 70 題約多 0.15 美元")
     args = parser.parse_args()
     corpus = CORPORA[args.corpus]
-    if args.model:
-        openai_client.GENERATION_MODEL = args.model
-    if args.answer_base_url:
-        # 自己架的模型不用付 API 的錢（GPU 的成本另外算），價目表記 0
-        openai_client.PRICES_PER_MILLION.setdefault(openai_client.GENERATION_MODEL, (Decimal(0), Decimal(0)))
-        # 跟上線一樣：不思考、temperature 0（docs/decisions/036、042）
-        extra = {**QWEN_SAMPLING["no_think"], "chat_template_kwargs": {"enable_thinking": False}}
-        openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
-    if args.answer_timeout:
-        openai_client.ANSWER_TIMEOUT = args.answer_timeout
-        # 整個問答的時間預算也跟著放寬，生成答案才等得到完整的 answer_timeout（轉向量、搜尋另外要時間，這裡算得比較寬）
-        qa_service.ANSWER_BUDGET_SECONDS = max(qa_service.ANSWER_BUDGET_SECONDS, args.answer_timeout * 2 + 20)
-    # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
-    usage_service.ensure_within_quota = lambda db, owner_id: None
+    override_app_settings(args)
 
     questions = load_questions(args.corpus, args.split)
     client = OpenAI(api_key=settings.openai_api_key)
@@ -415,6 +421,28 @@ def main():
             "answer_sampling": openai_client.answer_extra_body}
     save_results(meta, summaries, all_rows, tag=meta["commit"])
     db.close()
+
+
+# 評估跟線上不一樣的設定，全部集中在這裡（直接改 app 模組裡的值，整個評估執行期間都有效）：
+#   --model、--answer-base-url、--answer-timeout：換回答的模型或服務、等待上限，用來比較
+#   每日用量上限：評估不受限制
+# 處理文件時的兩個不同（不放 SQS、PDF 從本機讀）在 build_knowledge_base，訓練資料也會用到
+def override_app_settings(args) -> None:
+    if args.model:
+        openai_client.GENERATION_MODEL = args.model
+    if args.answer_base_url:
+        # 自己架的模型不用付 API 的錢（GPU 的成本另外算），價目表記 0
+        openai_client.PRICES_PER_MILLION.setdefault(openai_client.GENERATION_MODEL, (Decimal(0), Decimal(0)))
+        # 跟上線一樣：不思考、temperature 0（docs/decisions/036、042）
+        extra = {**QWEN_SAMPLING["no_think"], "chat_template_kwargs": {"enable_thinking": False}}
+        openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
+    if args.answer_timeout:
+        openai_client.ANSWER_TIMEOUT = args.answer_timeout
+        # 整個問答的時間預算也跟著放寬，生成答案才等得到完整的 answer_timeout（轉向量、搜尋另外要時間，這裡算得比較寬）
+        qa_service.ANSWER_BUDGET_SECONDS = max(qa_service.ANSWER_BUDGET_SECONDS, args.answer_timeout * 2 + 20)
+    # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
+    # 把「檢查上限」換成什麼都不做的函式
+    usage_service.ensure_within_quota = lambda db, owner_id: None
 
 
 # 讀題目：split 是 dev（練習題）、test（考試題）或 all（全部）

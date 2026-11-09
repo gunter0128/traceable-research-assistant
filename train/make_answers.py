@@ -27,7 +27,7 @@ import os
 os.environ["EVAL_DATABASE_URL"] = os.environ.get("TRAIN_DATABASE_URL", "postgresql+psycopg://postgres:test@localhost:55433/train")
 
 # isort: off
-from eval.run import CONSISTENCY_PROMPT, JUDGE_PROMPT, QWEN_SAMPLING, _align, build_knowledge_base, seen_passage
+from eval.run import CONSISTENCY_PROMPT, JUDGE_PROMPT, QWEN_SAMPLING, align_verdict, build_knowledge_base, seen_passage
 # isort: on
 
 import argparse
@@ -163,8 +163,8 @@ NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0
 
 # 照評分程式的算法，從評審的判斷算出「全對」（跟 eval/run.py 的 score 一樣）
 def correct_from(verdict: dict, q: dict) -> bool:
-    included = _align(q["must_include"], verdict.get("must_include", []))
-    violated = _align(q["must_not"], verdict.get("must_not", []))
+    included = align_verdict(q["must_include"], verdict.get("must_include", []))
+    violated = align_verdict(q["must_not"], verdict.get("must_not", []))
     refusal_ok = bool(verdict.get("refused")) == q["should_refuse"]
     return refusal_ok and not any(violated) and (not included or all(included))
 
