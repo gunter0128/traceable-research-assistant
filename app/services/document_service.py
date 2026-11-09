@@ -25,9 +25,10 @@ from app.services import usage_service, workspace_service
 # 處理中超過這麼久沒報平安，就判定處理的程式已經不在了（docs/decisions/008、046）
 # 報平安的時間點：取得租約時、解析切段完、每轉完一批向量。兩次之間最長的正常空檔：
 #   下載 + 解析 + 切段：300 頁塞滿文字的 PDF 在筆電上量過約 3 秒（Lambda 比較慢，也在 1 分鐘以內）
-#   一批轉向量加上它所有的重試：openai_client 的設定，5 次 × 30 秒 + 4 次等待 × 最多 60 秒 = 390 秒（6.5 分鐘）
-# 10 分鐘比最長的一段多 3.5 分鐘。改 openai_client 的重試設定時要一起檢查（有測試擋）
-# 不是絕對保證：例如單次請求的資料一直慢慢傳、每次都剛好不到 30 秒的等待上限，一批還是可能更久
+#   一批轉向量加上 SDK 所有的重試：用 openai_client 的設定估算，3 次 × 30 秒 + 2 次等待 × 最多 120 秒 = 330 秒（5.5 分鐘）
+# 10 分鐘比估算的多 4.5 分鐘。改 openai_client 的重試設定時要一起檢查（有測試擋）
+# 330 秒不是保證：它假設每次請求在 30 秒內結束，但 30 秒只限制連線和每一次讀取，不限制整個請求；
+# 單次請求的資料一直慢慢傳、每一段都不到 30 秒的話，一批還是可能更久。部署後要在 AWS 上量（docs/refactor/FOLLOW_UPS.md）
 HEARTBEAT_TIMEOUT = timedelta(minutes=10)
 _INTERRUPTED = "處理中斷，請按重試"
 # 排隊中超過這麼久還沒人開始處理，就判定出事了（docs/decisions/007）
@@ -325,7 +326,7 @@ def process_document(db: Session, document: Document) -> Document | None:
         return _fail(db, document_id, token, "找不到上傳的檔案，請刪除後重新上傳")
     except (openai_client.OpenAIPermanentError, s3_client.StoragePermanentError):
         return _fail(db, document_id, token, "系統設定有誤，請聯絡管理員")
-    # 暫時連不上：OpenAI 由 openai_client 自己寫的重試、S3 由 boto3 內建的重試先試過幾次了，走到這裡代表重試也沒用
+    # 暫時連不上：OpenAI 由 SDK 內建的重試、S3 由 boto3 內建的重試先試過幾次了，走到這裡代表重試也沒用
     # 直接標失敗，讓使用者稍後按重試（docs/decisions/046）。不延後、不叫 SQS 晚點再送
     except openai_client.OpenAITemporaryError:
         return _fail(db, document_id, token, "AI 服務暫時無法使用，請稍後按重試")

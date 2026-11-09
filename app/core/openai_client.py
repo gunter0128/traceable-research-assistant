@@ -1,8 +1,10 @@
 # 包 OpenAI SDK 的呼叫（轉向量、生成答案），不碰資料庫，跟 s3_client.py 同一種角色
 # 送什麼內容（回答原則、資料、問題）由呼叫的 service 決定，這裡只負責送出去，另外負責兩件事：
 #   1. 把 OpenAI 的各種錯誤分成「暫時性」和「永久性」兩類（見 docs/decisions/005）
-#   2. 自己做重試（見 docs/decisions/008）：SDK 內建的重試會照 OpenAI 的「請等 N 秒」最多等 120 秒，
-#      而且在 embeddings.create() 裡面自己做，我們插不上手，沒辦法限制等多久、也沒辦法控制問答的總時間（B3 再改成 SDK 內建的）
+#   2. 重試：
+#      文件處理的轉向量（embed_texts）用 SDK 內建的重試（docs/decisions/046 B3-1）
+#      問答（embed_query、generate_answer）還是用下面自己寫的 _with_retries（docs/decisions/008），
+#      因為要控制整個問答的總時間；B3-2 再改
 # 分類完怎麼處理（標失敗、回 503）由呼叫的 service 決定，這裡不管
 
 import logging
@@ -52,7 +54,7 @@ class Usage:
         input_price, output_price = PRICES_PER_MILLION[self.model]
         return (self.input_tokens * input_price + self.output_tokens * output_price) / 1_000_000
 
-# max_retries=0：關掉 SDK 內建的重試，全部由下面的 _with_retries 處理
+# max_retries=0：預設關掉 SDK 內建的重試。文件處理的轉向量呼叫時用 with_options 打開；問答由下面的 _with_retries 處理
 # 每次嘗試最多等多久，呼叫時才用 with_options(timeout=...) 指定（文件處理跟問答不一樣）
 # 企業內部版沒有 OpenAI 的金鑰：SDK 沒給金鑰會直接報錯，先給一個假的，真的去呼叫 OpenAI 時才會失敗（金鑰錯誤，歸類成永久性錯誤）
 client = OpenAI(api_key=settings.openai_api_key or "not-set", max_retries=0)
@@ -66,12 +68,17 @@ def _client_for(base_url: str | None) -> OpenAI:
 # 轉向量用的服務：沒設定就是 OpenAI
 embedding_client = _client_for(settings.embedding_base_url)
 
-# 文件處理（背景執行，沒人在等）：每次最多等 30 秒、最多試 5 次；OpenAI 叫我們等，最多等 60 秒
-# 一批最久 = 5 × 30 + 4 × 60 = 390 秒。document_service.HEARTBEAT_TIMEOUT 要比它長，改這三個數字時要一起檢查
-# （test_processing_transactions.py 的 test_heartbeat_timeout_covers_one_batch_with_all_retries 會擋）
+# 文件處理（背景執行，沒人在等）的轉向量，用 SDK 內建的重試：
+#   每次請求最多等 30 秒（連線、每一次讀取各自的上限，不是整個請求的總時間），失敗了最多再試 2 次，一共 3 次
+#   SDK 重試前等多久：OpenAI 有說「請等 N 秒」就照做，最多 120 秒（SDK 寫死的，超過就不重試、直接丟錯誤）；
+#   沒說就是 0.5、1 秒
+#   估算一批要多久：3 次 × 30 秒 + 2 次等待 × 120 秒 = 330 秒（5.5 分鐘）
+#   這是估算不是保證：假設每次請求在 30 秒內結束，但 30 秒只限制「連線、每一次讀取」，
+#   回應的資料一直慢慢傳（每一段都不到 30 秒）的話，一次請求就可能超過 30 秒，整批超過 330 秒
+#   document_service.HEARTBEAT_TIMEOUT 要比估算的長，改這兩個數字時要一起檢查
+#   （test_processing_transactions.py 的 test_heartbeat_timeout_covers_one_batch_with_all_retries 會擋）
 PROCESSING_TIMEOUT = 30
-PROCESSING_ATTEMPTS = 5
-PROCESSING_MAX_WAIT = 60
+PROCESSING_RETRIES = 2
 # 問答（使用者在等）：每次最多等 15 秒、最多試 2 次；OpenAI 叫我們等超過 5 秒就直接放棄
 # 總時間由 qa_service 給的 deadline 控制（整個問答共用 50 秒）
 QA_TIMEOUT = 15
@@ -80,7 +87,7 @@ ANSWER_TIMEOUT = settings.answer_timeout
 QA_ATTEMPTS = 2
 QA_MAX_WAIT = 5
 
-# 重試間隔：0.5、1、2、4 秒每次加倍，最多 8 秒（跟 SDK 原本的規則一樣）
+# 問答自己寫的重試用的間隔：0.5、1、2、4 秒每次加倍，最多 8 秒（跟 SDK 內建的規則一樣）
 _INITIAL_DELAY = 0.5
 _MAX_DELAY = 8.0
 
@@ -95,7 +102,8 @@ class OpenAIPermanentError(Exception):
     pass
 
 
-# 把 OpenAI SDK 丟出來的錯誤，翻譯成上面兩種之一
+# 把 OpenAI SDK 丟出來的錯誤，翻譯成上面兩種之一（文件處理、問答都用）
+# 告警也靠這個分類：文件處理失敗的 log 寫 error_type = "OpenAIPermanentError"（deploy/setup_monitoring.py）
 def _classify(exc: openai.OpenAIError) -> Exception:
     # 連不上、超時（APITimeoutError 是 APIConnectionError 的子類別，一起接）
     if isinstance(exc, openai.APIConnectionError):
@@ -138,7 +146,8 @@ def _backoff_seconds(retry_number: int) -> float:
 T = TypeVar("T")
 
 
-# 重試的迴圈。call(timeout) 是真正去呼叫 OpenAI 的函式，傳入這次最多等幾秒
+# 問答自己寫的重試迴圈（embed_query、generate_answer 用；文件處理在 B3-1 改用 SDK 內建的，B3-2 再改問答）
+# call(timeout) 是真正去呼叫 OpenAI 的函式，傳入這次最多等幾秒
 # attempts：最多試幾次；timeout：每次最多等幾秒；max_wait：OpenAI 叫我們等的上限
 # give_up_on_long_wait：OpenAI 叫我們等超過上限時，True = 直接放棄（問答），False = 等上限那麼久就好（文件處理）
 # deadline：time.monotonic() 的截止時間，超過就放棄（問答用來控制總時間）；None = 不限
@@ -189,22 +198,20 @@ def _with_retries(
 
 # 何時呼叫：document_service 處理文件時，一次把一批 chunk 送去轉向量
 # 一次送很多段，比一段一段送少很多次來回（300 頁約 330 段，每批 100 段只要呼叫 4 次）
-# 回傳 (每一段的向量, 這次用了多少)。用量交給呼叫的人記錄（docs/decisions/012）：只有成功才有，失敗的請求 OpenAI 不收錢
+# 回傳 (每一段的向量, 這次用了多少)。用量交給呼叫的人記錄（docs/decisions/012）
+# 成功收到 API 的回應時才拿得到用量、才記得到；請求超時或回應遺失的話，OpenAI 實際有沒有收錢，從我們這邊確認不了
+# 重試交給 SDK：暫時性的錯誤（連不上、超時、429、5xx）SDK 會自己再試，試完還是失敗才丟出來
 def embed_texts(texts: list[str]) -> tuple[list[list[float]], Usage]:
-    # call(timeout)：_with_retries 每次嘗試時呼叫它，傳入這次最多等幾秒（B3 改用 SDK 內建的重試時拿掉）
-    def call(timeout: float):
-        # with_options(timeout=...)：只有這一次呼叫用這個等待上限，不影響其他地方
-        return embedding_client.with_options(timeout=timeout).embeddings.create(
-            model=EMBEDDING_MODEL, input=texts
-        )
-
-    response = _with_retries(                                                   # ← 呼叫 OpenAI
-        call,
-        attempts=PROCESSING_ATTEMPTS,
-        timeout=PROCESSING_TIMEOUT,
-        max_wait=PROCESSING_MAX_WAIT,
-        give_up_on_long_wait=False,
-    )
+    try:
+        # with_options(...)：只有這一次呼叫用這些設定，不影響問答
+        response = embedding_client.with_options(
+            timeout=PROCESSING_TIMEOUT, max_retries=PROCESSING_RETRIES
+        ).embeddings.create(model=EMBEDDING_MODEL, input=texts)              # ← 呼叫 OpenAI（含 SDK 的重試）
+    except openai.OpenAIError as exc:
+        # SDK 的重試也用完了，或是重試也沒用的錯誤（例如金鑰無效）：翻譯成暫時性／永久性，
+        # document_service 再決定給使用者看什麼訊息
+        # from exc：把 SDK 原本的錯誤接在後面，log 的錯誤堆疊裡看得到真正的原因
+        raise _classify(exc) from exc
     # response.data 是「每一段各自的結果」，每筆帶一個 index（它是第幾段輸入）
     # 照 index 放回原本的位置，保證第 i 個向量一定對應第 i 段文字
     vectors = [None] * len(texts)

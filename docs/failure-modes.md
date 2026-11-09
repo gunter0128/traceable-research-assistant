@@ -34,11 +34,11 @@
 | 下載 PDF | 檔案不見了 | 標失敗「找不到上傳的檔案，請刪除後重新上傳」，不重試 | 測試（test_missing_file_fails_with_clear_reason）；真的 S3 回的錯誤也確認會被分類成「檔案不存在」 |
 | 下載 PDF | 沒權限讀檔案 | 標失敗「系統設定有誤」，不重試 | 測試（test_s3_errors_are_classified） |
 | 解析 | PDF 壞掉 / 超過 300 頁 / 抓不到字 | 標失敗並寫明原因，不重試 | 測試（test_corrupt_pdf_has_reason 等三個） |
-| 轉向量 | OpenAI 暫時連不上 | 自己寫的重試，最多 5 次；還是不行就標失敗「AI 服務暫時無法使用，請稍後按重試」，工單不延後（decisions/046；以前是 2 分鐘後再一回合，最多 3 回合）。chunks 最後才寫，所以一段都不會留；前面幾批已經花掉的用量照樣有紀錄 | 測試（test_temporary_error_*、test_worker_finishes_normally_on_temporary_error、test_temporary_failure_can_be_retried、test_failed_second_batch_keeps_usage_and_saves_no_chunks、test_retries_with_growing_backoff）；雲端的演練 1 是改之前的做法 |
-| 轉向量 | OpenAI 說「請等 N 秒」 | 照做，但最多等 60 秒（以前套件會照做最多 120 秒） | 測試（test_processing_caps_long_retry_after） |
-| 轉向量 | OpenAI 永久性錯誤（key 無效、餘額不足） | 立刻標失敗「系統設定有誤」 | 測試（test_permanent_error_fails_immediately）、本機真的 OpenAI（演練 2） |
+| 轉向量 | OpenAI 暫時連不上 | OpenAI SDK 內建的重試，一共試 3 次（間隔 0.5、1 秒）；還是不行就標失敗「AI 服務暫時無法使用，請稍後按重試」，工單不延後（decisions/046；B3-1 之前是自己寫的重試、最多 5 次；更早是 2 分鐘後再一回合，最多 3 回合）。chunks 最後才寫，所以一段都不會留；前面幾批已經花掉的用量照樣有紀錄。每次重試 SDK 會寫一筆 INFO「Retrying request in …」 | 測試（test_temporary_error_*、test_worker_finishes_normally_on_temporary_error、test_temporary_failure_can_be_retried、test_failed_second_batch_keeps_usage_and_saves_no_chunks；用真的 SDK 測：test_temporary_errors_are_retried、test_gives_up_after_retries_as_temporary_error、test_sdk_retry_is_logged_as_json）；雲端的演練 1 是改之前的做法 |
+| 轉向量 | OpenAI 說「請等 N 秒」 | 120 秒以內 SDK 照做；超過 120 秒 SDK 不重試，直接標失敗「AI 服務暫時無法使用」（B3-1 之前自己寫的重試最多等 60 秒） | 測試（test_follows_retry_after、test_does_not_wait_longer_than_sdk_limit） |
+| 轉向量 | OpenAI 永久性錯誤（key 無效、餘額不足） | 標失敗「系統設定有誤」，觸發告警。key 無效、格式錯誤不重試；餘額不足跟速率限制都是 429，SDK 分不出來，會先重試 2 次（多等約 1.5 秒）才標失敗 | 測試（test_permanent_error_fails_immediately；用真的 SDK 測：test_permanent_error_is_not_retried、test_insufficient_quota_ends_as_permanent_error）、本機真的 OpenAI（演練 2，B3-1 之前的做法） |
 | 轉向量 | 記用量時資料庫出錯 | 這一批的錢花了但沒記到（每日上限會少算這一批）；不再轉下一批（不再花錢），標失敗「處理時發生錯誤」，寫 ERROR 和錯誤堆疊（觸發告警） | 測試（test_usage_record_failure_stops_embedding_and_logs_error） |
-| 轉向量 | 轉得很慢 | 每轉完一批報一次平安；一批加上所有重試最多 6.5 分鐘，比 10 分鐘的期限短，不會被誤判（decisions/046） | 測試（test_heartbeat_timeout_covers_one_batch_with_all_retries） |
+| 轉向量 | 轉得很慢 | 每轉完一批報一次平安；一批加上 SDK 所有的重試估算約 5.5 分鐘（3 次 × 30 秒 + 2 次等待 × 120 秒），比 10 分鐘的期限短（decisions/046）。這是估算不是保證：30 秒是連線和每一次讀取的上限，不是整個請求的總時間，回應一直慢慢傳的話一批還是可能更久、被誤判成中斷（存結果會被擋下來，資料不會錯）。部署後在 AWS 上量 | 測試（test_heartbeat_timeout_covers_one_batch_with_all_retries） |
 | 存 chunk | 中途任何錯誤 | rollback，一段都不留 | 測試（test_failed_processing_leaves_no_chunks） |
 | 存 chunk | 最後一次報平安之後才被判定中斷 | 存結果時有條件的 UPDATE 改不到，整批放棄，一段都不留 | 測試（test_lease_lost_after_last_heartbeat_saves_no_chunks） |
 | 報平安 | 資料庫出錯 | 標失敗，不存 chunks | 測試（test_heartbeat_error_fails_document_without_saving_chunks） |

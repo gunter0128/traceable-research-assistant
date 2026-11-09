@@ -1,5 +1,6 @@
 # 呼叫 OpenAI 出錯時的處理（docs/decisions/005、046）：錯誤分類、文件處理標失敗後手動重試、問答回 503、批次送
 # 真的 OpenAI 都換成假的函式，用丟出不同錯誤來模擬各種狀況
+# embed_texts 本身（SDK 內建的重試、等待上限）用真的 SDK 測，見 test_embed_texts.py
 
 import json
 import time
@@ -264,6 +265,8 @@ def test_ask_returns_503_when_misconfigured(client, monkeypatch):
 
 
 # ---------- 自己寫的重試迴圈（docs/decisions/008）----------
+# 現在只剩問答在用（embed_query、generate_answer）；文件處理的轉向量改用 SDK 內建的重試，見 test_embed_texts.py
+# B3-2 改問答的時候，_with_retries 和這一段測試一起拿掉
 # 真的等待（time.sleep）換成只記錄「要等幾秒」，測試才不用真的等
 
 
@@ -342,7 +345,8 @@ def test_follows_retry_after(sleeps):
     assert sleeps == [20.0]
 
 
-# 測試：文件處理，OpenAI 說「請等 100 秒」→ 超過上限，只等 60 秒就重試
+# 測試：OpenAI 說「請等 100 秒」→ 超過上限，只等 60 秒就重試
+# 以前文件處理用這個（give_up_on_long_wait=False）；B3-1 文件處理改用 SDK 之後，只剩這個測試在用這個寫法
 def test_processing_caps_long_retry_after(sleeps):
     call, _ = _calls(_status_error(openai.RateLimitError, 429, headers={"retry-after": "100"}), "ok")
 

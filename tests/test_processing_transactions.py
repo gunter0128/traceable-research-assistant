@@ -7,11 +7,14 @@
 #   最後一次報平安之後租約才被收回：存結果那一步擋下來，一段 chunk 都不留
 #   報平安時資料庫出錯：標失敗，不存 chunks
 #   已經處理完的文件：sweeper、使用者查看都不會改到它
-#   心跳的期限比「一批轉向量加上它所有的重試」最久要花的時間還長
+#   心跳的期限比「一批轉向量加上 SDK 所有的重試」最久要花的時間還長
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+# SDK 內部的常數：OpenAI 叫我們等的時候，SDK 最多照等幾秒（120）
+from openai._constants import MAX_RETRY_AFTER_DELAY
 from sqlalchemy.exc import OperationalError
 
 from app.core import openai_client, s3_client
@@ -232,14 +235,17 @@ def test_sweeper_and_listing_do_not_touch_processed_documents(client, db_session
     assert _committed_counts(document_id)[0] == chunks_before
 
 
-# 測試：心跳的期限，比「一批轉向量加上它所有的重試」最久要花的時間還長（docs/decisions/046）
-# 改了 openai_client 的重試設定（次數、每次等多久、OpenAI 叫我們等的上限）卻忘了調 HEARTBEAT_TIMEOUT，這裡會擋下來
-# 重試之間不是照 OpenAI 說的等（最多 PROCESSING_MAX_WAIT），就是自己算的間隔（最多 8 秒），所以用 PROCESSING_MAX_WAIT 算最壞情況
+# 測試：心跳的期限，比「一批轉向量加上 SDK 所有的重試」最久要花的時間還長（docs/decisions/046）
+# 改了 openai_client 的重試設定（次數、每次等多久）卻忘了調 HEARTBEAT_TIMEOUT，這裡會擋下來
+# 重試之間不是照 OpenAI 說的等（最多 MAX_RETRY_AFTER_DELAY = 120 秒，SDK 寫死的），就是 SDK 自己算的間隔（最多 8 秒），
+# 所以用 MAX_RETRY_AFTER_DELAY 估算。直接讀 SDK 的常數：SDK 升級改了這個上限，這裡會跟著算
+# 這只擋「設定改了、期限忘了調」：它假設每次請求在 30 秒內結束，回應一直慢慢傳的情況擋不到（要在 AWS 上量）
 def test_heartbeat_timeout_covers_one_batch_with_all_retries():
-    attempts = openai_client.PROCESSING_ATTEMPTS
+    retries = openai_client.PROCESSING_RETRIES
     longest_batch_seconds = (
-        attempts * openai_client.PROCESSING_TIMEOUT  # 每次嘗試最多等這麼久
-        + (attempts - 1) * openai_client.PROCESSING_MAX_WAIT  # 兩次嘗試之間最多等這麼久
+        (retries + 1) * openai_client.PROCESSING_TIMEOUT  # 假設每次請求在這麼久之內結束（第一次 + 重試）
+        + retries * MAX_RETRY_AFTER_DELAY  # 兩次請求之間最多等這麼久
     )
 
+    assert longest_batch_seconds == 330  # 3 × 30 + 2 × 120，跟 openai_client、document_service 的說明一致
     assert document_service.HEARTBEAT_TIMEOUT.total_seconds() > longest_batch_seconds

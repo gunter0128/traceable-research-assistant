@@ -19,7 +19,8 @@ class FakeService:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat))
         self.timeouts = []
 
-    def with_options(self, timeout):
+    # 轉文件段落時還會帶 max_retries（SDK 內建的重試），這裡不檢查；重試的行為在 test_embed_texts.py 用真的 SDK 測
+    def with_options(self, timeout, max_retries=None):
         self.timeouts.append(timeout)
         return self
 
