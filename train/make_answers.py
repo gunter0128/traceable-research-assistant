@@ -231,7 +231,7 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
             reasons.append("沒有答案的題目卻標了出處")
     elif not set(item["cited"]) & set(q["sources"]):
         reasons.append("沒有標到出題時設定的文件")
-    checks = citation_checks(answer, item["seen"], f"{q['question']}\n今天日期：{qa_service._date_text(TODAY)}")
+    checks = citation_checks(answer, item["seen"], f"{q['question']}\n今天日期：{qa_service.date_text(TODAY)}")
     detail["citation_checks"] = checks
     if any(c["missing"] for c in checks):
         reasons.append("引用對不上")
@@ -273,7 +273,7 @@ def run_attempt(client: OpenAI, todo: list[dict], attempt: int) -> None:
         answers = list(pool.map(lambda item: teach(client, item, attempt), todo))
     for item, answer in zip(todo, answers, strict=True):
         answer = answer and answer.translate(STRAY_SIMPLIFIED)
-        _, marked = qa_service._extract_citations(answer, len(item["seen"]))
+        _, marked = qa_service.extract_citations(answer, len(item["seen"]))
         item.update(answer=answer, cited=sorted({item["codes"][n - 1] for n in marked}), attempts=attempt + 1)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda item: check(client, item), todo))

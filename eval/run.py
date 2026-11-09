@@ -192,7 +192,7 @@ def seen_passage(filename: str, header: str, content: str) -> str:
 
 # 引用對得上（eval/common.py 的 citation_checks）：有可以檢查的句子，而且每一句的數字都在標的原文裡；沒有可以檢查的句子是 None
 def trust_fields(answer: str, passages: list[str], question: str, today) -> dict:
-    checks = citation_checks(answer, passages, f"{question}\n今天日期：{qa_service._date_text(today)}")
+    checks = citation_checks(answer, passages, f"{question}\n今天日期：{qa_service.date_text(today)}")
     return {"citation_checks": checks, "citation_ok": all(not c["missing"] for c in checks) if checks else None}
 
 
@@ -238,7 +238,7 @@ def run_once(db, user, workspace, questions, client, domain, today, evidence=Non
         response, passages, seconds = _ask(db, workspace, user, q["question"], today)
         retrieved = sorted({doc_code(p.filename) for p in passages})
         # 引用：自己從答案裡數 [n]，不看 response.citations（模型忘了標時，系統會退回列出全部搜到的段落，會灌水）
-        _, marked = qa_service._extract_citations(response.answer, len(passages))
+        _, marked = qa_service.extract_citations(response.answer, len(passages))
         cited = sorted({doc_code(p.filename) for p in passages if p.number in marked})
         quotes = (evidence or {}).get(q["id"], [])
         texts = [p.content for p in passages]

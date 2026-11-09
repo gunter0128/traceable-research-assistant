@@ -141,12 +141,13 @@ def test_answer_without_markers_falls_back_to_retrieved_passages(client, monkeyp
         ("可以[1][3]，也可以［2］", "可以[1][3]，也可以[2]", {1, 2, 3}),
         ("見[1, 2]、[2，3]", "見[1][2]、[2][3]", {1, 2, 3}),
         ("見[1, 9]", "見[1]", {1}),
+        ("見[2, 1, 2]。", "見[2][1]。", {1, 2}),
         ("民國[2025]年", "民國[2025]年", set()),
         ("文件中找不到相關資訊", "文件中找不到相關資訊", set()),
     ],
 )
 def test_extract_citations(answer, expected_answer, expected_cited):
-    assert qa_service._extract_citations(answer, 3) == (expected_answer, expected_cited)
+    assert qa_service.extract_citations(answer, 3) == (expected_answer, expected_cited)
 
 
 # 測試：給模型的資料（docs/decisions/018）
@@ -174,6 +175,24 @@ def test_context_groups_chunks_by_document_with_header_and_date():
         "【文件】手冊_2025.pdf\n文件開頭：員工手冊（2025 年版）\n\n"
         "[3] 舊版第 1 段"
     )
+
+
+# 測試：回傳給前端的段落，編號跟給模型看的一樣：跨文件連續編 1、2、3，順序跟 build_context 一樣
+def test_numbered_passages_follow_context_order():
+    new = SimpleNamespace(id=1, filename="手冊_2026.pdf")
+    old = SimpleNamespace(id=2, filename="手冊_2025.pdf")
+    groups = [
+        (new, [SimpleNamespace(document_id=1, content="新版第 1 段"), SimpleNamespace(document_id=1, content="新版第 3 段")]),
+        (old, [SimpleNamespace(document_id=2, content="舊版第 1 段")]),
+    ]
+
+    passages = qa_service.numbered_passages(groups)
+
+    assert [(p.number, p.filename, p.content) for p in passages] == [
+        (1, "手冊_2026.pdf", "新版第 1 段"),
+        (2, "手冊_2026.pdf", "新版第 3 段"),
+        (3, "手冊_2025.pdf", "舊版第 1 段"),
+    ]
 
 
 # 測試：文件開頭只取前 200 個字，很長的第一段不會整段塞進去

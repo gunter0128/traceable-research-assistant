@@ -103,12 +103,7 @@ def ask_with_passages(
             fields["answer_chars"] = len(answer)
         # 給模型看的全部段落，number 就是給模型看的編號 [1] [2]…（順序跟 build_context 一樣）
         # 放在 try 裡面：要在下面 finally 寫入用量（commit）之前讀完段落的內容
-        passages = [
-            CitationOut(number=number, document_id=chunk.document_id, filename=document.filename, content=chunk.content)
-            for number, (document, chunk) in enumerate(
-                ((document, chunk) for document, group in groups for chunk in group), start=1
-            )
-        ]
+        passages = numbered_passages(groups)
     # 問答不重試（使用者在等，docs/decisions/046）：OpenAI 出問題就記一筆 log，錯誤原樣往外丟，
     # API 層（app/api/qa.py）把它翻成 503 和給使用者看的訊息（暫時性、永久性的訊息不同）
     # error_type 跟文件處理的 failed 一樣寫類別名稱；OpenAIPermanentError 會觸發告警（deploy/setup_monitoring.py）
@@ -125,7 +120,7 @@ def ask_with_passages(
             usage_service.record(db, owner_id, "qa", usage)
 
     # 逐句引用（docs/decisions/021）：只回傳答案裡真的標到的段落
-    answer, cited = _extract_citations(answer, len(passages))
+    answer, cited = extract_citations(answer, len(passages))
     if cited:
         citations = [passage for passage in passages if passage.number in cited]
     elif NOT_FOUND in answer:
@@ -164,7 +159,25 @@ def user_message(context: str, question: str) -> str:
     return f"資料：\n{context}\n\n問題：{question}\n\n{CITATION_REMINDER}"
 
 
-def _date_text(day: date) -> str:
+# 給模型看的全部段落，依序編號 1、2、3……，跨文件連續編（順序跟 build_context 一樣，模型看到的 [n] 就是這裡的 number）
+# groups：[(文件, [這份文件的段落, ...]), ...]，search_passages 回傳的那個
+def numbered_passages(groups) -> list[CitationOut]:
+    passages = []
+    for document, group in groups:
+        for passage in group:
+            passages.append(
+                CitationOut(
+                    number=len(passages) + 1,
+                    document_id=passage.document_id,
+                    filename=document.filename,
+                    content=passage.content,
+                )
+            )
+    return passages
+
+
+# 「2026 年 10 月 20 日」：給模型看的今天日期（build_context）；評估、訓練檢查答案時也用同一種寫法
+def date_text(day: date) -> str:
     return f"{day.year} 年 {day.month} 月 {day.day} 日"
 
 
@@ -176,18 +189,25 @@ _MARKER = re.compile(r"[\[［]\s*(\d+(?:\s*[,，、]\s*\d+)*)\s*[\]］]")
 # 同一個標記裡有幾個編號超出範圍的（例如只給 5 段，卻寫 [1, 9]），只留範圍內的 [1]
 # 整個標記都不在範圍內的，原文不動：那可能根本不是引用（例如「[2025]」）。
 #   也可能是模型編出來的編號，但這很少見，寧可留著，也不要誤刪原文
-def _extract_citations(answer: str, count: int) -> tuple[str, set[int]]:
+# 回傳 (統一寫法之後的答案, 引用到的編號)。count：給模型看了幾段
+# 做法：一個一個標記看過去，標記之間的文字照抄，標記本身換成統一的寫法，最後接起來
+def extract_citations(answer: str, count: int) -> tuple[str, set[int]]:
     cited = set()
-
-    def normalize(match: re.Match) -> str:
-        numbers = [int(n) for n in re.findall(r"\d+", match.group(1))]
+    pieces = []
+    copied_up_to = 0  # 原文抄到第幾個字了
+    for marker in _MARKER.finditer(answer):
+        pieces.append(answer[copied_up_to : marker.start()])  # 上一個標記到這個標記之間的文字
+        numbers = [int(n) for n in re.findall(r"\d+", marker.group(1))]
+        # dict.fromkeys：去掉重複的編號、保留原本的順序（[2, 1, 2] → [2, 1]）
         valid = [n for n in dict.fromkeys(numbers) if 1 <= n <= count]
-        if not valid:
-            return match.group()
-        cited.update(valid)
-        return "".join(f"[{n}]" for n in valid)
-
-    return _MARKER.sub(normalize, answer), cited
+        if valid:
+            cited.update(valid)
+            pieces.append("".join(f"[{n}]" for n in valid))
+        else:
+            pieces.append(marker.group())  # 整個都不在範圍內：原文不動
+        copied_up_to = marker.end()
+    pieces.append(answer[copied_up_to:])  # 最後一個標記之後的文字
+    return "".join(pieces), cited
 
 
 # 同一份文件的段落放在一起（docs/decisions/018）
@@ -244,7 +264,7 @@ def _join_overlap(first: str, second: str) -> str:
 #   文件不編號、只標檔名：編了號，模型會寫「依據：文件 1」，使用者看不到文件 1 是哪一份
 #   段落編號 [1] [2]… 跨文件連續編，跟 citations 的順序一樣
 def build_context(groups, headers: dict[int, str], today: date) -> str:
-    blocks = [f"今天日期：{_date_text(today)}"]
+    blocks = [f"今天日期：{date_text(today)}"]
     number = 0
     for document, group in groups:
         # 把換行和連續空白壓成一個空格，開頭才不會佔太多行
