@@ -17,6 +17,22 @@
 
 ---
 
+## 2026-11-10：Cloud Core（B1～B4）和可讀性整理（A2～A6）手動部署
+
+- 怎麼發現的：不是故障，是計畫內的部署。程式在 `refactor/cloud-core` 分支，沒有 push 到 main，所以用「手動部署」的流程（docs/deployment-commands.md），不經過 GitHub Actions
+- 影響：三個 Lambda 換成 commit `0911026` 的 image（digest `sha256:b352ceb4…`），前端換成新的 build。沒有 migration、沒有改 SQS、DLQ、EventBridge、IAM、Secrets
+- 原因：—
+- 處理（順序）：
+  1. `aws logs test-metric-filter` 驗問答那條篩選條件（新舊兩種 `error_type` 都接受）的語法：AWS 接受，第 1、2 筆符合、第 3 筆不符合
+  2. 只更新 API 的 `trace-app-openai-permanent` 篩選條件（其他篩選條件、告警、SNS、帳單上限都沒動）
+  3. 從乾淨的 checkout build image（不含本機不進 git 的檔案）、推到 ECR、更新三個 Lambda
+  4. worker 健康檢查 `{"health_check": true}` 回 `{"database": "ok"}`；經過 CloudFront 打 `/auth/me` 回 401；部署後沒有任何 ERROR 的 log
+  5. 前端：先備份 bucket，再 `s3 sync --delete`、清 CloudFront 快取，網站拿到的是新的 JS
+  6. 比對部署前後：SQS 觸發、EventBridge 排程、Lambda 的 timeout 和記憶體都沒變；DLQ 0 張；告警都是 OK
+- 途中遇到的：這台電腦的網路斷斷續續（DNS 每二十多分鐘斷幾分鐘），在遠端 Neon 上跑的完整 pytest 兩次被打斷，改用本機 Docker 的 PostgreSQL（跟 CI 一樣）跑完 227 個；Docker build 下載套件逾時一次、推 image 時一層逾時一次，重試後成功
+- 回退：三個 Lambda 指回上一版 `49b6272c07dd7c7a131eae52feea4a0d30427ff6`（見 deployment-commands.md 的「退回上一版」）；前端的舊版備份在部署時的本機暫存資料夾
+- 之後要注意：**正式環境現在跑的程式不在 main 上**。push 到 main 之前要先把 `refactor/cloud-core` 合併進去，不然 CI 會把舊版部署回來。前端還沒有人實際點擊驗證
+
 ## 2026-10-19：CI/CD 第一次部署被 AWS 拒絕
 
 - 怎麼發現的：GitHub Actions 的部署步驟失敗，錯誤是 `Not authorized to perform sts:AssumeRoleWithWebIdentity`
