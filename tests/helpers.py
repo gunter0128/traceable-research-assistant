@@ -5,7 +5,10 @@
 import json
 import logging
 
-from app.core import log
+import httpx2
+import openai
+
+from app.core import log, openai_client
 from app.core.openai_client import EMBEDDING_MODEL, Usage
 
 # 測試帳號共用的密碼
@@ -60,10 +63,15 @@ def fake_embed_texts(texts):
     return [[0.1] * 1536 for _ in texts], Usage(EMBEDDING_MODEL, 0)
 
 
-# 問題轉成同一個 1536 維的向量
-# **kwargs：真的 embed_query 還有其他參數（deadline、on_usage），假的用不到，收下來不理它
-def fake_embed_query(text, **kwargs):
-    return [0.1] * 1536
+# 跟真的 embed_query 一樣回傳 (向量, 用量)：問題轉成同一個 1536 維的向量，用量記 0 個 token
+def fake_embed_query(text):
+    return [0.1] * 1536, Usage(EMBEDDING_MODEL, 0)
+
+
+# 跟真的 generate_answer 一樣回傳 (答案, 用量)：用量記 0 個 token
+# 用法：monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, timeout: fake_answer("答案[1]"))
+def fake_answer(text):
+    return text, Usage(openai_client.GENERATION_MODEL, 0, 0)
 
 
 # 回傳一個「不管怎麼呼叫都丟出 error」的假函式，用來模擬外部服務出錯
@@ -73,6 +81,50 @@ def always_raise(error: Exception):
         raise error
 
     return fake
+
+
+# ---------- 假的 OpenAI 伺服器 ----------
+# 用真的 OpenAI SDK，只把網路換成假的（httpx2.MockTransport）：SDK 的重試、等待上限、錯誤都是真的在跑，
+# 但請求不會送到 OpenAI、不花錢。用在 test_embed_texts.py、test_qa_openai_calls.py
+
+
+# 照順序回應清單裡的東西，清單用完了就一直回最後一個（例如「一直 503」）
+# 清單裡放例外的話就丟出來，模擬連不上、超時
+class FakeOpenAIServer:
+    def __init__(self, responses):
+        self.responses = responses
+        self.requests = []
+
+    # MockTransport 每收到一個請求就呼叫這裡
+    def handle(self, request):
+        self.requests.append(request)
+        result = self.responses[min(len(self.requests), len(self.responses)) - 1]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    # 第 i 個請求送出去的內容（JSON 轉回 dict）
+    def sent(self, i=0):
+        return json.loads(self.requests[i].content)
+
+
+# 把 openai_client 的某個 client（"embedding_client" 或 "answer_client"）換成連到假伺服器的真 SDK client
+# 網址、max_retries=0 跟正式的 client 一樣（_client_for），只有網路是假的
+def use_fake_openai(monkeypatch, client_name, *responses, base_url="https://api.openai.com/v1"):
+    server = FakeOpenAIServer(list(responses))
+    client = openai.OpenAI(
+        api_key="test-key",
+        base_url=base_url,
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(server.handle)),
+    )
+    monkeypatch.setattr(openai_client, client_name, client)
+    return server
+
+
+# OpenAI 錯誤的回應：狀態碼 + 錯誤代碼（例如 insufficient_quota）+ header（例如 retry-after）
+def openai_error(status, code=None, headers=None):
+    return httpx2.Response(status, headers=headers, json={"error": {"message": "模擬錯誤", "code": code}})
 
 
 # ---------- 收集 log ----------

@@ -9,6 +9,7 @@ from app.core import log, openai_client, sqs_client
 from app.core.config import settings
 from tests.helpers import (
     create_workspace,
+    fake_answer,
     fake_embed_query,
     fake_embed_texts,
     login_headers,
@@ -106,7 +107,7 @@ def test_queue_message_carries_request_id(client, logs, monkeypatch):
 # 測試：log 裡沒有使用者的檔名和問題內容
 def test_no_user_content_in_logs(client, logs, monkeypatch):
     monkeypatch.setattr(openai_client, "embed_query", fake_embed_query)
-    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, **kwargs: "答案")
+    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, timeout: fake_answer("答案"))
     headers = login_headers(client, "alice@example.com")
     ws_id = _upload(client, headers).json()["workspace_id"]
 

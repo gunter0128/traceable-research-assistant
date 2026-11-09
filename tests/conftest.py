@@ -78,6 +78,21 @@ def logs():
     logger.removeHandler(collector)
 
 
+# 用真的 OpenAI SDK 測的時候（helpers.use_fake_openai），參數寫 sdk_sleeps：SDK 重試前的 time.sleep 換成只記錄要等幾秒
+# 測試才不用真的等；問答的測試用它確認「完全沒有等、沒有重試」
+# time 是共用的模組，所以這段測試期間所有的 time.sleep 都被換掉，monkeypatch 會在測試結束時換回來
+# jitter 的隨機數固定成 0，SDK 自己算的間隔就剛好是 0.5、1 秒
+@pytest.fixture
+def sdk_sleeps(monkeypatch):
+    # SDK 內部的模組：重試前的 time.sleep、jitter 用的 random 都在這裡
+    from openai import _base_client as sdk
+
+    waited = []
+    monkeypatch.setattr(sdk.time, "sleep", waited.append)
+    monkeypatch.setattr(sdk, "random", lambda: 0)
+    return waited
+
+
 # 假的 S3：用記憶體裡的 dict（helpers.bucket）取代真的 S3，跟隔離測試資料庫是同一個道理：測試不該碰到正式的 bucket
 # autouse=True：不用在參數列表裡點名，每一個測試開始前都自動先跑這個；要直接看 bucket 的測試，參數寫 fake_s3 拿到它
 #   上傳是瀏覽器直接傳到 S3（docs/decisions/013）：測試裡「傳上去」就是放進 dict，見 helpers.upload_pdf

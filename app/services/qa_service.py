@@ -18,6 +18,10 @@ from app.services import usage_service, workspace_service
 # 使用者最多等多久就要看到答案或錯誤訊息
 # 原本 60 秒，改成 50 秒（docs/decisions/013）：CloudFront 等後端回應最多 60 秒，超過就直接回錯誤給使用者，
 # 而 Lambda 冷啟動還要再加幾秒，留 10 秒的餘裕
+# 怎麼用（docs/decisions/046 B3-2）：從轉向量開始算，生成答案最多等「ANSWER_TIMEOUT 和剩下的時間，取小的」
+#   雲端：轉向量 15 秒 + 生成 15 秒，資料庫正常時用不到這個上限
+#   地端：生成最多等 45 秒（本機的模型比較慢），加上轉向量會超過 50 秒，靠這個上限擋住
+# 評估時會跟著 --answer-timeout 放寬（eval/run.py）
 ANSWER_BUDGET_SECONDS = 50
 
 # 每份文件附上開頭的幾個字，讓模型知道段落出自哪份文件、哪個版本（docs/decisions/018）
@@ -75,21 +79,37 @@ def ask_with_passages(
     # 今天的用量到上限了就不回答（docs/decisions/012）。還沒到的話，這次會完整回答完，就算答完之後超過了也一樣
     usage_service.ensure_within_quota(db, owner_id)
 
-    # 每次呼叫 OpenAI 成功，先把用量收集起來，最後再一起寫進資料庫（見下面的 finally）
+    # 每次呼叫 OpenAI 成功，馬上把回傳的用量放進這個 list，最後在 finally 一起寫進資料庫
+    # 成功收到回應，這次的錢就花掉了：後面的步驟失敗（搜尋出錯、生成答案失敗），finally 照樣會把已經拿到的用量寫進去
+    # （請求超時、回應遺失的話拿不到用量，OpenAI 實際有沒有收錢從這邊確認不了，見 docs/refactor/FOLLOW_UPS.md）
     # 不在中途寫：寫入要 commit，commit 會讓已經查出來的段落資料失效，後面組引用時又要重查一次
     usages = []
-    record_usage = usages.append
 
-    # 整個問答共用 50 秒的時間預算（docs/decisions/008）：轉向量跟生成答案各自的重試加起來，也不會超過
-    deadline = time.monotonic() + ANSWER_BUDGET_SECONDS
+    # 整個問答的時間預算（ANSWER_BUDGET_SECONDS）從這裡開始算
+    # time.monotonic()：只會往前走的時鐘，適合算「過了多久」（不受電腦改時間影響）
+    started = time.monotonic()
     try:
-        groups, headers = retrieve(db, workspace_id, question, deadline=deadline, on_usage=record_usage)
+        # 1. 問題轉向量。每一步各記花多久（qa_embed、qa_search、qa_generate），回答「問答慢在哪」（docs/decisions/010）
+        #    問題只記字數、不記內容：使用者的問題可能是未發表的研究
+        with log.timed("qa_embed", question_chars=len(question)):
+            embedding, usage = openai_client.embed_query(question)              # ← 呼叫 OpenAI（最多等 QA_TIMEOUT 秒）
+            usages.append(usage)
+
+        # 2. 搜段落、組成給模型看的資料
+        groups, headers = search_passages(db, workspace_id, embedding)
         today = today or datetime.now(usage_service.TAIWAN).date()
         context = build_context(groups, headers, today)
+
+        # 3. 生成答案：最多等 ANSWER_TIMEOUT 秒，但不超過整個問答剩下的時間
+        remaining = ANSWER_BUDGET_SECONDS - (time.monotonic() - started)
+        if remaining < 1:
+            # 前面花太久（例如資料庫很慢），已經來不及生成答案：不送出去，當成 AI 服務暫時無法使用（下面的 except 接）
+            raise openai_client.OpenAITemporaryError("時間預算用完了")
         with log.timed("qa_generate") as fields:
-            answer = openai_client.generate_answer(
-                ANSWER_RULES, user_message(context, question), deadline=deadline, on_usage=record_usage
-            )
+            answer, usage = openai_client.generate_answer(
+                ANSWER_RULES, user_message(context, question), timeout=min(openai_client.ANSWER_TIMEOUT, remaining)
+            )                                                                    # ← 呼叫 OpenAI
+            usages.append(usage)
             fields["answer_chars"] = len(answer)
         # 給模型看的全部段落，number 就是給模型看的編號 [1] [2]…（順序跟 build_context 一樣）
         # 放在 try 裡面：要在下面 finally 寫入用量（commit）之前讀完段落的內容
@@ -99,7 +119,8 @@ def ask_with_passages(
                 ((document, chunk) for document, group in groups for chunk in group), start=1
             )
         ]
-    # openai_client 已經做完秒級重試了，走到這裡代表重試也沒用
+    # 問答不重試（使用者在等，docs/decisions/046）：OpenAI 出問題就直接回 503，讓使用者知道、再問一次
+    # error_type 是告警看的（deploy/setup_monitoring.py：qa_failed 且 permanent 才告警）
     # from None：不把 OpenAI 原本的錯誤接在後面，API 層只需要知道是哪一種
     except openai_client.OpenAITemporaryError:
         log.event("qa_failed", logging.WARNING, error_type="temporary")
@@ -126,14 +147,18 @@ def ask_with_passages(
     return AskResponse(answer=answer, citations=citations), passages
 
 
-# 搜段落：問題轉向量 → 搜最像的幾段 → 照文件分組、相連的合併 → 查每份文件的開頭
-# 回傳 (分好組的段落, {document_id: 文件開頭})。訓練資料也用這個（train/make_answers.py），給模型看的資料跟線上一樣
-# 每一段各記花多久，回答「問答慢在哪」（docs/decisions/010）；問題只記字數、不記內容：使用者的問題可能是未發表的研究
-def retrieve(
-    db: Session, workspace_id: int, question: str, deadline: float | None = None, on_usage=None
-) -> tuple[list[tuple], dict[int, str]]:
-    with log.timed("qa_embed", question_chars=len(question)):
-        embedding = openai_client.embed_query(question, deadline=deadline, on_usage=on_usage)
+# 問題轉向量 + 搜段落。訓練資料用這個（train/make_answers.py），給模型看的資料跟線上一樣
+# 線上問答（ask_with_passages）不用這個，自己分兩步呼叫：用量改成回傳值之後，要在轉向量一成功就拿到用量，
+# 才能維持原本 callback 時的行為（後面搜尋出錯，轉向量的用量照樣記）
+# 訓練接的是自己架的模型、不花錢，用量不記
+def retrieve(db: Session, workspace_id: int, question: str) -> tuple[list[tuple], dict[int, str]]:
+    embedding, _ = openai_client.embed_query(question)
+    return search_passages(db, workspace_id, embedding)
+
+
+# 搜段落：搜最像的幾段 → 照文件分組、相連的合併 → 查每份文件的開頭
+# 回傳 (分好組的段落, {document_id: 文件開頭})。搜尋花多久記在 qa_search
+def search_passages(db: Session, workspace_id: int, embedding: list[float]) -> tuple[list[tuple], dict[int, str]]:
     with log.timed("qa_search") as fields:
         chunks = chunk_repo.search_similar(db, workspace_id, embedding, limit=SEARCH_LIMIT)
         groups = _merge_adjacent(_group_by_document(chunks))

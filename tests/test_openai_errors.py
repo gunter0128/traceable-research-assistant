@@ -265,8 +265,8 @@ def test_ask_returns_503_when_misconfigured(client, monkeypatch):
 
 
 # ---------- 自己寫的重試迴圈（docs/decisions/008）----------
-# 現在只剩問答在用（embed_query、generate_answer）；文件處理的轉向量改用 SDK 內建的重試，見 test_embed_texts.py
-# B3-2 改問答的時候，_with_retries 和這一段測試一起拿掉
+# B3-2 之後已經沒有程式在用：文件處理的轉向量改用 SDK 內建的重試（test_embed_texts.py），問答不重試（test_qa_openai_calls.py）
+# 照 046 的分階段，B3-3 把 _with_retries 和這一段測試一起拿掉
 # 真的等待（time.sleep）換成只記錄「要等幾秒」，測試才不用真的等
 
 

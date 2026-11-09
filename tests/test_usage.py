@@ -12,8 +12,9 @@ from app.core.openai_client import Usage
 from app.models.document import Document
 from app.models.usage_record import UsageRecord
 from app.models.user import User
-from app.services import usage_service
+from app.services import qa_service, usage_service
 from tests.helpers import (
+    always_raise,
     create_workspace,
     fake_embed_query,
     fake_embed_texts,
@@ -25,21 +26,17 @@ from tests.pdf_fixtures import valid_pdf_bytes
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    # 假的 OpenAI，跟真的一樣回報用了多少：
-    #   文件處理（embed_texts）直接回傳 (向量, 用量)；問答（embed_query、generate_answer）成功之後交給 on_usage
+    # 假的 OpenAI，跟真的一樣直接回傳 (結果, 這次用了多少)
     def embed_texts(texts):
         vectors, _ = fake_embed_texts(texts)
         return vectors, Usage(openai_client.EMBEDDING_MODEL, 1000 * len(texts))
 
-    def embed_query(text, deadline=None, on_usage=None):
-        if on_usage:
-            on_usage(Usage(openai_client.EMBEDDING_MODEL, 20))
-        return fake_embed_query(text)
+    def embed_query(text):
+        vector, _ = fake_embed_query(text)
+        return vector, Usage(openai_client.EMBEDDING_MODEL, 20)
 
-    def generate_answer(system, user, deadline=None, on_usage=None):
-        if on_usage:
-            on_usage(Usage(openai_client.GENERATION_MODEL, 2500, 300))
-        return "答案"
+    def generate_answer(system, user, timeout):
+        return "答案", Usage(openai_client.GENERATION_MODEL, 2500, 300)
 
     monkeypatch.setattr(openai_client, "embed_texts", embed_texts)
     monkeypatch.setattr(openai_client, "embed_query", embed_query)
@@ -101,7 +98,7 @@ def test_processing_records_usage_for_owner(client, db_session):
 
 # 測試：生成答案失敗，問題轉向量已經花掉的錢還是要記
 def test_failed_ask_still_records_spent_usage(client, db_session, monkeypatch):
-    def broken(system, user, deadline=None, on_usage=None):
+    def broken(system, user, timeout):
         raise openai_client.OpenAITemporaryError("down")
 
     monkeypatch.setattr(openai_client, "generate_answer", broken)
@@ -112,6 +109,22 @@ def test_failed_ask_still_records_spent_usage(client, db_session, monkeypatch):
 
     records = db_session.query(UsageRecord).all()
     assert [r.model for r in records] == [openai_client.EMBEDDING_MODEL]
+
+
+# 測試：問題轉向量成功之後，搜段落出了預料之外的錯誤 → 轉向量的錢照樣記（docs/decisions/046 B3-2）
+# 改之前靠 on_usage callback 就是這樣；這個測試確認改成回傳值之後行為不變：
+# 轉向量一成功就把用量放進清單，最後在 finally 寫進資料庫
+def test_search_failure_after_embedding_still_records_usage(client, db_session, monkeypatch):
+    monkeypatch.setattr(qa_service, "search_passages", always_raise(RuntimeError("search broke")))
+    headers = login_headers(client, "carol2@example.com")
+    ws_id = create_workspace(client, headers)
+
+    # 預料之外的錯誤：API 會回 500；測試用的 client 會把錯誤直接丟出來
+    with pytest.raises(RuntimeError):
+        _ask(client, headers, ws_id)
+
+    records = db_session.query(UsageRecord).all()
+    assert [(r.model, r.input_tokens) for r in records] == [(openai_client.EMBEDDING_MODEL, 20)]
 
 
 # 測試：開始之前還沒到上限 → 放行、完整回答；回答完已經超過 → 馬上查得到；下一次才擋

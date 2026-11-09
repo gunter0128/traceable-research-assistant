@@ -19,7 +19,7 @@ class FakeService:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat))
         self.timeouts = []
 
-    # 轉文件段落時還會帶 max_retries（SDK 內建的重試），這裡不檢查；重試的行為在 test_embed_texts.py 用真的 SDK 測
+    # 還會帶 max_retries（轉文件段落 2、問答 0），這裡不檢查；重試的行為在 test_embed_texts.py、test_qa_openai_calls.py 用真的 SDK 測
     def with_options(self, timeout, max_retries=None):
         self.timeouts.append(timeout)
         return self
@@ -60,16 +60,16 @@ def test_no_prefix_by_default(monkeypatch):
     assert service.calls[0]["input"] == ["特休幾天？"]
 
 
-# 測試：回答送到設定的服務，帶上額外參數（例如關掉思考模式），等待上限用回答專用的
+# 測試：回答送到設定的服務，帶上額外參數（例如關掉思考模式），等待上限用呼叫的人給的（qa_service 算好傳進來）
 def test_answer_uses_configured_service(monkeypatch):
     service = FakeService()
     monkeypatch.setattr(openai_client, "answer_client", service)
     monkeypatch.setattr(openai_client, "answer_extra_body", {"chat_template_kwargs": {"enable_thinking": False}})
-    monkeypatch.setattr(openai_client, "ANSWER_TIMEOUT", 45)
 
-    answer = openai_client.generate_answer("回答原則", "資料和問題")
+    answer, usage = openai_client.generate_answer("回答原則", "資料和問題", timeout=45)
 
     assert answer == "答案 [1]。"
+    assert usage == openai_client.Usage(openai_client.GENERATION_MODEL, 100, 20)
     assert service.calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
     assert service.timeouts == [45]
 

@@ -1,11 +1,11 @@
 # 包 OpenAI SDK 的呼叫（轉向量、生成答案），不碰資料庫，跟 s3_client.py 同一種角色
 # 送什麼內容（回答原則、資料、問題）由呼叫的 service 決定，這裡只負責送出去，另外負責兩件事：
 #   1. 把 OpenAI 的各種錯誤分成「暫時性」和「永久性」兩類（見 docs/decisions/005）
-#   2. 重試：
-#      文件處理的轉向量（embed_texts）用 SDK 內建的重試（docs/decisions/046 B3-1）
-#      問答（embed_query、generate_answer）還是用下面自己寫的 _with_retries（docs/decisions/008），
-#      因為要控制整個問答的總時間；B3-2 再改
+#   2. 重試（docs/decisions/046）：
+#      文件處理的轉向量（embed_texts）用 SDK 內建的重試（B3-1）
+#      問答（embed_query、generate_answer）不重試（B3-2）：使用者在等，失敗了直接讓他知道、再問一次
 # 分類完怎麼處理（標失敗、回 503）由呼叫的 service 決定，這裡不管
+# 每個函式都直接回傳結果和這次的用量（Usage），由呼叫的 service 記錄
 
 import logging
 import random
@@ -54,8 +54,8 @@ class Usage:
         input_price, output_price = PRICES_PER_MILLION[self.model]
         return (self.input_tokens * input_price + self.output_tokens * output_price) / 1_000_000
 
-# max_retries=0：預設關掉 SDK 內建的重試。文件處理的轉向量呼叫時用 with_options 打開；問答由下面的 _with_retries 處理
-# 每次嘗試最多等多久，呼叫時才用 with_options(timeout=...) 指定（文件處理跟問答不一樣）
+# max_retries=0：預設關掉 SDK 內建的重試。文件處理的轉向量呼叫時用 with_options 打開；問答呼叫時也再寫一次 0，看得出不重試
+# 每次請求最多等多久，呼叫時才用 with_options(timeout=...) 指定（文件處理跟問答不一樣）
 # 企業內部版沒有 OpenAI 的金鑰：SDK 沒給金鑰會直接報錯，先給一個假的，真的去呼叫 OpenAI 時才會失敗（金鑰錯誤，歸類成永久性錯誤）
 client = OpenAI(api_key=settings.openai_api_key or "not-set", max_retries=0)
 
@@ -79,15 +79,15 @@ embedding_client = _client_for(settings.embedding_base_url)
 #   （test_processing_transactions.py 的 test_heartbeat_timeout_covers_one_batch_with_all_retries 會擋）
 PROCESSING_TIMEOUT = 30
 PROCESSING_RETRIES = 2
-# 問答（使用者在等）：每次最多等 15 秒、最多試 2 次；OpenAI 叫我們等超過 5 秒就直接放棄
-# 總時間由 qa_service 給的 deadline 控制（整個問答共用 50 秒）
+# 問答（使用者在等）：只送一次、不重試
+#   問題轉向量最多等 QA_TIMEOUT 秒
+#   生成答案最多等 ANSWER_TIMEOUT 秒，但不超過整個問答剩下的時間（qa_service 算好傳進來，見 qa_service.ANSWER_BUDGET_SECONDS）
+#   跟文件處理一樣，這兩個數字是連線、每一次讀取的上限，不是整個請求的總時間
 QA_TIMEOUT = 15
-# 生成答案每次最多等幾秒：OpenAI 用 15 秒；本機的模型比較慢，看設定（docs/decisions/037）
+# OpenAI 用 15 秒；本機的模型比較慢，看設定（docs/decisions/037）。評估時可以改（eval/run.py --answer-timeout）
 ANSWER_TIMEOUT = settings.answer_timeout
-QA_ATTEMPTS = 2
-QA_MAX_WAIT = 5
 
-# 問答自己寫的重試用的間隔：0.5、1、2、4 秒每次加倍，最多 8 秒（跟 SDK 內建的規則一樣）
+# 自己寫的重試用的間隔：0.5、1、2、4 秒每次加倍，最多 8 秒（跟 SDK 內建的規則一樣）
 _INITIAL_DELAY = 0.5
 _MAX_DELAY = 8.0
 
@@ -146,7 +146,8 @@ def _backoff_seconds(retry_number: int) -> float:
 T = TypeVar("T")
 
 
-# 問答自己寫的重試迴圈（embed_query、generate_answer 用；文件處理在 B3-1 改用 SDK 內建的，B3-2 再改問答）
+# 自己寫的重試迴圈（docs/decisions/008）。B3-2 之後已經沒有人呼叫：文件處理改用 SDK 內建的重試、問答不重試
+# 照 046 的分階段，B3-3 跟 _retry_after_seconds、_backoff_seconds、openai_retry 這筆 log 一起拿掉
 # call(timeout) 是真正去呼叫 OpenAI 的函式，傳入這次最多等幾秒
 # attempts：最多試幾次；timeout：每次最多等幾秒；max_wait：OpenAI 叫我們等的上限
 # give_up_on_long_wait：OpenAI 叫我們等超過上限時，True = 直接放棄（問答），False = 等上限那麼久就好（文件處理）
@@ -222,28 +223,19 @@ def embed_texts(texts: list[str]) -> tuple[list[list[float]], Usage]:
 
 
 # 何時呼叫：qa_service 把使用者的問題轉成向量，拿去跟 chunk 比相似度
-# deadline：整個問答共用的截止時間（qa_service 算好傳進來）
 # 問題前面加上模型要求的說明（設定的 embedding_query_prefix，OpenAI 不用加）；文件段落不加，見 embed_texts
-def embed_query(
-    text: str,
-    deadline: float | None = None,
-    on_usage: Callable[[Usage], None] | None = None,
-) -> list[float]:
-    def call(timeout: float):
-        return embedding_client.with_options(timeout=timeout).embeddings.create(
+# 回傳 (向量, 這次用了多少)。只送一次（max_retries=0）：使用者在等，失敗了直接讓他知道
+def embed_query(text: str) -> tuple[list[float], Usage]:
+    try:
+        response = embedding_client.with_options(timeout=QA_TIMEOUT, max_retries=0).embeddings.create(
             model=EMBEDDING_MODEL, input=[settings.embedding_query_prefix + text]
-        )
-
-    response = _with_retries(
-        call,
-        attempts=QA_ATTEMPTS,
-        timeout=QA_TIMEOUT,
-        max_wait=QA_MAX_WAIT,
-        give_up_on_long_wait=True,
-        deadline=deadline,
-    )
-    _report_embedding_usage(response, on_usage)
-    return response.data[0].embedding
+        )                                                                         # ← 呼叫 OpenAI
+    except openai.OpenAIError as exc:
+        # 翻譯成暫時性／永久性，qa_service 決定回使用者什麼訊息；from exc 把 SDK 原本的錯誤接在後面
+        raise _classify(exc) from exc
+    # embedding 的回應只有輸入的 token 數（沒有生成任何文字）
+    usage = Usage(EMBEDDING_MODEL, response.usage.prompt_tokens)
+    return response.data[0].embedding, usage
 
 
 # 回答用的模型服務（docs/decisions/034、037）：看設定，沒設定就是 OpenAI
@@ -262,36 +254,19 @@ def use_answer_endpoint(base_url: str, extra_body: dict | None = None) -> None:
 
 # 何時呼叫：qa_service 組好要給模型看的內容之後，丟給 LLM 生成答案
 # system：回答原則（開發者給模型的規則）；user：資料 + 問題。兩段的內容都由 qa_service 決定，這裡只負責送出去
-def generate_answer(
-    system: str,
-    user: str,
-    deadline: float | None = None,
-    on_usage: Callable[[Usage], None] | None = None,
-) -> str:
-    def call(timeout: float):
-        return answer_client.with_options(timeout=timeout).chat.completions.create( # 對話生成的功能
+# timeout：這次最多等幾秒，qa_service 算好傳進來（ANSWER_TIMEOUT 和整個問答剩下的時間，取小的）
+# 回傳 (答案, 這次用了多少)。只送一次（max_retries=0），理由跟 embed_query 一樣
+def generate_answer(system: str, user: str, timeout: float) -> tuple[str, Usage]:
+    try:
+        response = answer_client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
             model=GENERATION_MODEL,
             extra_body=answer_extra_body,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
-
-    response = _with_retries(
-        call,
-        attempts=QA_ATTEMPTS,
-        timeout=ANSWER_TIMEOUT,
-        max_wait=QA_MAX_WAIT,
-        give_up_on_long_wait=True,
-        deadline=deadline,
-    )
-    if on_usage is not None:
-        # prompt_tokens：送進去的（問題 + 資料 + 規則）；completion_tokens：生成出來的答案
-        on_usage(Usage(GENERATION_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens))
+        )                                                                         # ← 呼叫 OpenAI（對話生成）
+    except openai.OpenAIError as exc:
+        raise _classify(exc) from exc
+    # prompt_tokens：送進去的（問題 + 資料 + 規則）；completion_tokens：生成出來的答案
+    usage = Usage(GENERATION_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens)
     # 選擇第一個候選回應(一個問題可能有好幾種回應)
     # 開源模型開思考模式時，想到長度上限還沒想完，就沒有答案（content 是 None），當成空的回答
-    return response.choices[0].message.content or ""
-
-
-# embedding 的回應只有輸入的 token 數（沒有生成任何文字）
-def _report_embedding_usage(response, on_usage: Callable[[Usage], None] | None) -> None:
-    if on_usage is not None:
-        on_usage(Usage(EMBEDDING_MODEL, response.usage.prompt_tokens))
+    return response.choices[0].message.content or "", usage

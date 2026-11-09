@@ -388,7 +388,7 @@ def main():
         openai_client.use_answer_endpoint(args.answer_base_url, extra_body=extra)
     if args.answer_timeout:
         openai_client.ANSWER_TIMEOUT = args.answer_timeout
-        # 整個問答的時間預算也跟著放寬：重試兩次加上轉向量、搜尋
+        # 整個問答的時間預算也跟著放寬，生成答案才等得到完整的 answer_timeout（轉向量、搜尋另外要時間，這裡算得比較寬）
         qa_service.ANSWER_BUDGET_SECONDS = max(qa_service.ANSWER_BUDGET_SECONDS, args.answer_timeout * 2 + 20)
     # 評估不受每日用量上限限制：用的是臨時資料庫，而且用貴的模型跑一輪就會超過每人每天 0.5 美元
     usage_service.ensure_within_quota = lambda db, owner_id: None

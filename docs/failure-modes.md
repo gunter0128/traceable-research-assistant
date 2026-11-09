@@ -63,10 +63,12 @@
 | 哪一步 | 故障 | 系統的反應 | 證據 |
 |---|---|---|---|
 | 搜尋 | 只有失敗或處理中的文件 | 搜不到，回「文件中找不到相關資訊」 | 測試（test_search_similar_skips_unprocessed_documents） |
-| 轉向量 / 生成 | OpenAI 暫時連不上 | 每次最多等 15 秒、重試 1 次，整個問答共用 50 秒的預算，回 503 | 測試（test_ask_returns_503_when_ai_unavailable、test_stops_when_deadline_passed）、本機演練（32 秒回 503） |
-| 轉向量 / 生成 | OpenAI 說「請等 N 秒」 | 5 秒以內照做，超過就直接回 503，不讓使用者乾等（以前套件會照做最多 120 秒） | 測試（test_qa_gives_up_on_long_retry_after） |
+| 轉向量 / 生成 | OpenAI 暫時連不上、超時 | 只送一次、不重試（使用者在等，decisions/046 B3-2），回 503「AI 服務暫時無法使用」。轉向量最多等 15 秒；生成最多等 15 秒（地端 45 秒），而且不超過整個問答剩下的時間（50 秒的預算）。轉向量成功、生成失敗的話，轉向量的用量照樣記（B3-2 之前每次重試 1 次） | 測試（test_ask_returns_503_when_ai_unavailable；用真的 SDK 測：test_qa_calls_are_not_retried、test_ask_answer_failure_returns_503_and_keeps_embedding_usage）、本機演練（32 秒回 503，B3-2 之前的做法） |
+| 轉向量 / 生成 | OpenAI 說「請等 N 秒」 | 不等、不重試，直接回 503（B3-2 之前是 5 秒以內照做；更早套件會照做最多 120 秒） | 測試（test_qa_calls_are_not_retried 的 429-retry-after） |
+| 生成 | 前面花太久（例如資料庫很慢），整個問答的預算剩不到 1 秒 | 不送生成答案的請求，回 503；轉向量的用量照樣記 | 測試（test_budget_used_up_skips_answer、test_answer_timeout_is_capped_by_remaining_budget） |
+| 搜尋 | 轉向量成功之後，搜尋出了預料之外的錯誤 | 回 500；轉向量的用量照樣記（拿到用量就先放進清單，最後在 finally 寫入。改之前靠 on_usage callback 也是這樣，B3-2 改成回傳值後行為不變） | 測試（test_search_failure_after_embedding_still_records_usage） |
 | 任何 API | 資料庫連不上 | 回 503「服務暫時無法使用，請稍後再試」（以前是 500） | — |
-| 轉向量 / 生成 | OpenAI 永久性錯誤 | 回 503「系統設定有誤」 | 測試（test_ask_returns_503_when_misconfigured）、本機真的 OpenAI（演練 2：0.8 秒回 503，沒有白白重試） |
+| 轉向量 / 生成 | OpenAI 永久性錯誤 | 回 503「系統設定有誤」，觸發告警（qa_failed、permanent）；只送一次，餘額不足也不會先白試 | 測試（test_ask_returns_503_when_misconfigured、test_qa_permanent_errors）、本機真的 OpenAI（演練 2：0.8 秒回 503，沒有白白重試） |
 
 ## 5. 需要人處理時，怎麼知道
 

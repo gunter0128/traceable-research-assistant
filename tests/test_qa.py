@@ -10,6 +10,7 @@ from app.core import openai_client
 from app.services import qa_service
 from tests.helpers import (
     create_workspace,
+    fake_answer,
     fake_embed_query,
     fake_embed_texts,
     login_headers,
@@ -66,9 +67,9 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
     # 把丟給模型的資料記下來，最後檢查裡面有檔名和今天日期
     sent = {}
 
-    def fake_generate(system, user, **kwargs):
+    def fake_generate(system, user, timeout):
         sent["user"] = user
-        return "這是生成的答案[1]"
+        return fake_answer("這是生成的答案[1]")
 
     monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
 
@@ -99,7 +100,7 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
 # 以前會把搜到的段落全部當引用，變成「答案說找不到，下面卻附了一份文件」
 def test_answer_without_markers_has_no_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda system, user, **kwargs: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda system, user, timeout: fake_answer("文件中找不到相關資訊")
     )
     headers = login_headers(client, "erin@example.com")
     ws_id = create_workspace(client, headers)
@@ -117,7 +118,7 @@ def test_answer_without_markers_has_no_citations(client, monkeypatch):
 
 # 測試：模型有回答、卻忘了標編號時，退回列出搜到的段落（安全網，docs/decisions/021）
 def test_answer_without_markers_falls_back_to_retrieved_passages(client, monkeypatch):
-    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, **kwargs: "核心方法是多跳檢索")
+    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, timeout: fake_answer("核心方法是多跳檢索"))
     headers = login_headers(client, "frank@example.com")
     ws_id = create_workspace(client, headers)
     _upload_pdf(client, headers, ws_id, text="Multi-hop retrieval is the core method")
@@ -219,7 +220,7 @@ def test_join_overlap_without_overlap():
 # 測試：workspace 裡還沒有任何文件時問問題，不會噴錯，只是 citations 是空的
 def test_ask_with_no_documents_returns_empty_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda system, user, **kwargs: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda system, user, timeout: fake_answer("文件中找不到相關資訊")
     )
 
     headers = login_headers(client, "dave@example.com")
