@@ -170,7 +170,7 @@ npm run dev                       # http://localhost:5173, proxies API calls to 
 pytest
 ```
 
-215 tests cover ownership checks across users, the processing pipeline, retries, leases, concurrent workers, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
+218 tests cover ownership checks across users, the processing pipeline, retries, leases, concurrent workers, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
 
 ## API
 

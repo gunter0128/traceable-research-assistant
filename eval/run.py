@@ -224,7 +224,7 @@ def _ask(db, workspace, user, question, today):
         try:
             response, passages = qa_service.ask_with_passages(db, workspace.id, user.id, question, today=today)
             return response, passages, time.perf_counter() - started
-        except qa_service.AIServiceUnavailable:
+        except openai_client.OpenAITemporaryError:
             if attempt == ASK_RETRIES - 1:
                 raise
             print(f"  （回答的服務連不上，{ASK_RETRY_WAIT} 秒後重試，第 {attempt + 1} 次）")

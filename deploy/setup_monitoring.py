@@ -36,8 +36,10 @@ METRIC_FILTERS = [
     # 超過時間上限被 Lambda 強制停掉：程式沒機會寫 log，只有 Lambda 自己印的這行純文字
     (API, "timeouts", '"Task timed out"', "Errors", "1"),
     (WORKER, "timeouts", '"Task timed out"', "Errors", "1"),
-    # OpenAI 永久性錯誤（key 失效、餘額用完）：問答和處理文件兩邊各自的寫法
-    (API, "openai-permanent", '{ $.event = "qa_failed" && $.error_type = "permanent" }', "OpenAIPermanentErrors", "1"),
+    # OpenAI 永久性錯誤（key 失效、餘額用完）：問答失敗（qa_failed）、處理文件失敗（failed）的 log 都寫 error_type = 錯誤的類別名稱
+    # 類別名稱來自 app/core/openai_client.py；改名字或改 log 的寫法時，tests/test_alarms.py 會擋下來
+    # （2026-11 B3-3 之前，問答這邊寫的是 "permanent"）
+    (API, "openai-permanent", '{ $.event = "qa_failed" && $.error_type = "OpenAIPermanentError" }', "OpenAIPermanentErrors", "1"),
     (WORKER, "openai-permanent", '{ $.event = "failed" && $.error_type = "OpenAIPermanentError" }', "OpenAIPermanentErrors", "1"),
     # 全系統的每日用量到上限
     (API, "system-quota", '{ $.event = "quota_exceeded" && $.scope = "system" }', "SystemQuotaExceeded", "1"),

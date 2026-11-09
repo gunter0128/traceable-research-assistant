@@ -195,6 +195,9 @@ def _qa_usage(db_session):
 #   答案和引用照舊；兩次呼叫各送一次；用量照回應記下兩筆（轉向量 5 個 token、生成 100 + 20 個）
 #   等待上限：轉向量 QA_TIMEOUT、生成 ANSWER_TIMEOUT（預算還很多，用不到「剩下的時間」）
 def test_ask_end_to_end(client, db_session, monkeypatch, sdk_sleeps):
+    # 這裡不測時間預算（下面另外用假的時鐘測）：預算放大，遠端的測試資料庫偶爾很慢時，結果才不會跟著變
+    # （B3-3 實際遇過：搜尋卡了 88 秒，預算用完，生成答案沒送出去）
+    monkeypatch.setattr(qa_service, "ANSWER_BUDGET_SECONDS", 10_000)
     headers, ws_id = _workspace_with_document(client, monkeypatch, "alice@example.com")
     embedding_server = use_fake_openai(monkeypatch, "embedding_client", _embedding_ok())
     answer_server = use_fake_openai(monkeypatch, "answer_client", _answer_ok())
@@ -231,6 +234,7 @@ def test_ask_end_to_end(client, db_session, monkeypatch, sdk_sleeps):
 # 測試：生成答案時 OpenAI 暫時出問題（503、超時）→ 回 503、只送一次；轉向量已經花掉的錢照樣記
 @pytest.mark.parametrize("failure", [openai_error(503), _read_timeout()], ids=["503", "timeout"])
 def test_ask_answer_failure_returns_503_and_keeps_embedding_usage(client, db_session, monkeypatch, sdk_sleeps, failure):
+    monkeypatch.setattr(qa_service, "ANSWER_BUDGET_SECONDS", 10_000)  # 理由同 test_ask_end_to_end
     headers, ws_id = _workspace_with_document(client, monkeypatch, "bob@example.com")
     use_fake_openai(monkeypatch, "embedding_client", _embedding_ok())
     answer_server = use_fake_openai(monkeypatch, "answer_client", failure)

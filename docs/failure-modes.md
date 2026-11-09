@@ -75,7 +75,8 @@
 系統自己處理不了的，寄告警 email（decisions/015，`deploy/setup_monitoring.py`）：
 
 - dead-letter queue 裡出現工單（代表有東西壞到自己處理不了）
-- OpenAI 永久性錯誤（key 失效、沒錢了，所有新文件都會失敗）
+- OpenAI 永久性錯誤（key 失效、沒錢了，所有新文件都會失敗）：處理文件、問答兩邊的 log 都比對 `error_type = "OpenAIPermanentError"`；tests/test_alarms.py 確認金鑰失效、餘額不足會符合、暫時性的錯誤不會
+- （還沒有）S3 的永久性錯誤（沒權限、bucket 設錯）：見 [refactor/FOLLOW_UPS.md](refactor/FOLLOW_UPS.md)
 - 程式錯誤的 log（預料之外的錯誤）
 - 全系統當天的用量到上限
 - 每小時的 sweeper 沒有跑

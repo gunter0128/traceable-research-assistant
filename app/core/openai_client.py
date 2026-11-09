@@ -1,24 +1,19 @@
 # 包 OpenAI SDK 的呼叫（轉向量、生成答案），不碰資料庫，跟 s3_client.py 同一種角色
 # 送什麼內容（回答原則、資料、問題）由呼叫的 service 決定，這裡只負責送出去，另外負責兩件事：
 #   1. 把 OpenAI 的各種錯誤分成「暫時性」和「永久性」兩類（見 docs/decisions/005）
-#   2. 重試（docs/decisions/046）：
-#      文件處理的轉向量（embed_texts）用 SDK 內建的重試（B3-1）
-#      問答（embed_query、generate_answer）不重試（B3-2）：使用者在等，失敗了直接讓他知道、再問一次
+#   2. 每次請求最多等多久、要不要重試（docs/decisions/046）：都交給 SDK，用 with_options 設定
+#      文件處理的轉向量（embed_texts）：SDK 內建的重試
+#      問答（embed_query、generate_answer）：不重試，使用者在等，失敗了直接讓他知道、再問一次
 # 分類完怎麼處理（標失敗、回 503）由呼叫的 service 決定，這裡不管
 # 每個函式都直接回傳結果和這次的用量（Usage），由呼叫的 service 記錄
+# 每個函式的寫法都一樣：try 呼叫 SDK → except 把 SDK 的錯誤翻譯成我們的兩類 → 整理回傳值
 
-import logging
-import random
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TypeVar
 
 import openai
 from openai import OpenAI
 
-from app.core import log
 from app.core.config import settings
 
 # 用哪個模型轉向量、回答，看設定（docs/decisions/037）：公開展示版用 OpenAI，企業內部版用本機的模型
@@ -87,11 +82,6 @@ QA_TIMEOUT = 15
 # OpenAI 用 15 秒；本機的模型比較慢，看設定（docs/decisions/037）。評估時可以改（eval/run.py --answer-timeout）
 ANSWER_TIMEOUT = settings.answer_timeout
 
-# 自己寫的重試用的間隔：0.5、1、2、4 秒每次加倍，最多 8 秒（跟 SDK 內建的規則一樣）
-_INITIAL_DELAY = 0.5
-_MAX_DELAY = 8.0
-
-
 # 等一下再試通常會好的錯誤：網路斷線、超時、速率限制、OpenAI 伺服器錯誤
 class OpenAITemporaryError(Exception):
     pass
@@ -103,7 +93,8 @@ class OpenAIPermanentError(Exception):
 
 
 # 把 OpenAI SDK 丟出來的錯誤，翻譯成上面兩種之一（文件處理、問答都用）
-# 告警也靠這個分類：文件處理失敗的 log 寫 error_type = "OpenAIPermanentError"（deploy/setup_monitoring.py）
+# 告警也靠這個分類：文件處理失敗（failed）、問答失敗（qa_failed）的 log 都寫 error_type = 類別名稱，
+# 告警看 error_type = "OpenAIPermanentError"（deploy/setup_monitoring.py）。改類別名稱時，tests/test_alarms.py 會擋
 def _classify(exc: openai.OpenAIError) -> Exception:
     # 連不上、超時（APITimeoutError 是 APIConnectionError 的子類別，一起接）
     if isinstance(exc, openai.APIConnectionError):
@@ -118,83 +109,6 @@ def _classify(exc: openai.OpenAIError) -> Exception:
             return OpenAITemporaryError(str(exc))
     # 其他（400 格式錯、401 key 無效、403 沒權限、404 模型不存在……）
     return OpenAIPermanentError(str(exc))
-
-
-# OpenAI 有沒有在回應裡說「請等 N 秒」？有的話回傳秒數，沒有回傳 None
-# retry-after-ms 是毫秒、retry-after 是秒；retry-after 也可能是日期格式，那種就不理它
-def _retry_after_seconds(exc: openai.OpenAIError) -> float | None:
-    if not isinstance(exc, openai.APIStatusError):
-        return None
-    headers = exc.response.headers
-    for name, unit in (("retry-after-ms", 1000), ("retry-after", 1)):
-        value = headers.get(name)
-        if value is not None:
-            try:
-                return float(value) / unit
-            except ValueError:
-                pass
-    return None
-
-
-# 沒有「請等 N 秒」時用的間隔：0.5 × 2^(第幾次重試)，最多 8 秒
-# 再乘上 0.75～1 之間的隨機數（jitter）：很多程式同時失敗時，不會同一瞬間一起重試，把 OpenAI 又打爆一次
-def _backoff_seconds(retry_number: int) -> float:
-    delay = min(_INITIAL_DELAY * 2**retry_number, _MAX_DELAY)
-    return delay * (1 - 0.25 * random.random())
-
-
-T = TypeVar("T")
-
-
-# 自己寫的重試迴圈（docs/decisions/008）。B3-2 之後已經沒有人呼叫：文件處理改用 SDK 內建的重試、問答不重試
-# 照 046 的分階段，B3-3 跟 _retry_after_seconds、_backoff_seconds、openai_retry 這筆 log 一起拿掉
-# call(timeout) 是真正去呼叫 OpenAI 的函式，傳入這次最多等幾秒
-# attempts：最多試幾次；timeout：每次最多等幾秒；max_wait：OpenAI 叫我們等的上限
-# give_up_on_long_wait：OpenAI 叫我們等超過上限時，True = 直接放棄（問答），False = 等上限那麼久就好（文件處理）
-# deadline：time.monotonic() 的截止時間，超過就放棄（問答用來控制總時間）；None = 不限
-def _with_retries(
-    call: Callable[[float], T],
-    *,
-    attempts: int,
-    timeout: float,
-    max_wait: float,
-    give_up_on_long_wait: bool,
-    deadline: float | None = None,
-) -> T:
-    for attempt in range(attempts):
-        this_timeout = timeout
-        if deadline is not None:
-            # time.monotonic()：只會往前走的時鐘，適合算「過了多久」（不受電腦改時間影響）
-            remaining = deadline - time.monotonic()
-            if remaining < 1:
-                raise OpenAITemporaryError("時間預算用完了")
-            this_timeout = min(timeout, remaining)
-        try:
-            return call(this_timeout)
-        except openai.OpenAIError as exc:
-            error = _classify(exc)
-            # 永久性錯誤：試幾次都一樣，直接丟出去
-            if isinstance(error, OpenAIPermanentError) or attempt == attempts - 1:
-                raise error from exc
-            retry_after = wait = _retry_after_seconds(exc)
-            if wait is None:
-                wait = _backoff_seconds(attempt)
-            elif wait > max_wait:
-                if give_up_on_long_wait:
-                    raise error from exc
-                wait = max_wait
-            if deadline is not None and time.monotonic() + wait >= deadline:
-                raise error from exc
-            # 每次重試記一筆：事後才看得出 OpenAI 多常出問題、出的是哪種問題、OpenAI 有沒有叫我們等
-            log.event(
-                "openai_retry", logging.WARNING,
-                attempt=attempt + 1, error=type(exc).__name__,
-                status_code=getattr(exc, "status_code", None),
-                retry_after=retry_after, wait_seconds=round(wait, 2),
-            )
-            time.sleep(wait)
-    # 迴圈一定會在裡面 return 或 raise，走不到這裡；寫出來讓型別檢查知道
-    raise OpenAITemporaryError("重試次數用完了")
 
 
 # 何時呼叫：document_service 處理文件時，一次把一批 chunk 送去轉向量

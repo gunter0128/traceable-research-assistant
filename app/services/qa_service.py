@@ -53,16 +53,6 @@ NOT_FOUND = "文件中找不到相關資訊"
 CITATION_REMINDER = "（回答時，用到資料的句子，句尾要標上依據的段落編號，例如 [1]。）"
 
 
-# 問答時 OpenAI 出問題：使用者正在等，不能延後，直接讓 API 回錯誤訊息
-# 暫時性的（重試過還是不行）跟永久性的（設定有誤）分開，給使用者的訊息不同
-class AIServiceUnavailable(Exception):
-    pass
-
-
-class AIServiceMisconfigured(Exception):
-    pass
-
-
 # today：給模型看的「今天日期」。線上不用給（用台灣當天）；評估時固定一個日期，分數才不會因為哪天跑而變
 def ask(db: Session, workspace_id: int, owner_id: int, question: str, today: date | None = None) -> AskResponse:
     response, _ = ask_with_passages(db, workspace_id, owner_id, question, today)
@@ -119,15 +109,16 @@ def ask_with_passages(
                 ((document, chunk) for document, group in groups for chunk in group), start=1
             )
         ]
-    # 問答不重試（使用者在等，docs/decisions/046）：OpenAI 出問題就直接回 503，讓使用者知道、再問一次
-    # error_type 是告警看的（deploy/setup_monitoring.py：qa_failed 且 permanent 才告警）
-    # from None：不把 OpenAI 原本的錯誤接在後面，API 層只需要知道是哪一種
+    # 問答不重試（使用者在等，docs/decisions/046）：OpenAI 出問題就記一筆 log，錯誤原樣往外丟，
+    # API 層（app/api/qa.py）把它翻成 503 和給使用者看的訊息（暫時性、永久性的訊息不同）
+    # error_type 跟文件處理的 failed 一樣寫類別名稱；OpenAIPermanentError 會觸發告警（deploy/setup_monitoring.py）
+    # raise（後面不接東西）：把正在處理的這個錯誤原樣再丟出去
     except openai_client.OpenAITemporaryError:
-        log.event("qa_failed", logging.WARNING, error_type="temporary")
-        raise AIServiceUnavailable from None
+        log.event("qa_failed", logging.WARNING, error_type="OpenAITemporaryError")
+        raise
     except openai_client.OpenAIPermanentError:
-        log.event("qa_failed", logging.ERROR, error_type="permanent")
-        raise AIServiceMisconfigured from None
+        log.event("qa_failed", logging.ERROR, error_type="OpenAIPermanentError")
+        raise
     # finally：不管成功或失敗都會執行。轉向量成功、生成答案失敗的話，轉向量的錢還是花掉了，要記
     finally:
         for usage in usages:

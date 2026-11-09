@@ -151,6 +151,34 @@ def test_s3_errors_are_classified(monkeypatch, exc, expected):
         REAL_DOWNLOAD_FILE("documents/x.pdf")
 
 
+REAL_FILE_SIZE = s3_client.file_size
+REAL_DELETE_FILE = s3_client.delete_file
+
+
+# 測試：確認上傳的檔案時（head_object），檔案不存在的錯誤代碼只有 "404"（沒有回應內容）→ 一樣認成檔案不存在
+# 沒權限還是永久性錯誤（docs/decisions/046 B3-3：這個例外以前寫在 file_size 裡，現在跟其他錯誤一起在 _classify 判斷）
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (_client_error("404", 404), s3_client.FileMissing),
+        (_client_error("403", 403), s3_client.StoragePermanentError),
+    ],
+)
+def test_file_size_errors_are_classified(monkeypatch, exc, expected):
+    monkeypatch.setattr(s3_client.client, "head_object", always_raise(exc))
+
+    with pytest.raises(expected):
+        REAL_FILE_SIZE("documents/x.pdf")
+
+
+# 測試：刪檔案時連不上 S3 → 暫時性錯誤（每個 S3 函式都用同一個 _classify）
+def test_delete_errors_are_classified(monkeypatch):
+    monkeypatch.setattr(s3_client.client, "delete_object", always_raise(EndpointConnectionError(endpoint_url="https://s3")))
+
+    with pytest.raises(s3_client.StorageTemporaryError):
+        REAL_DELETE_FILE("documents/x.pdf")
+
+
 # 測試：處理時檔案不見了 → 標失敗，訊息叫使用者重新上傳（不能叫他「稍後重試」，重試永遠不會成功）
 def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch):
     headers = login_headers(client, "erin@example.com")
