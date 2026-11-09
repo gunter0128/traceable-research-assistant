@@ -21,14 +21,18 @@ _SUPPLEMENT = {
 }
 
 
+# 把文字裡的部首字元換回一般漢字
+# 只換這兩個區段的字，不對整段文字做 NFKC：整段做會連全形標點（，：）都換成半形，改變原文的樣子
+# re.sub 的第二個參數給函式：每找到一個部首字元就呼叫一次 _radical_to_char，回傳要換成的字
 def _fix_radicals(text: str) -> str:
-    # NFKC 正規化：Unicode 定義好的「相容字元 → 標準字元」對應，把部首字元換回一般漢字
-    # 只對這兩個區段做，不對整段文字做：整段做 NFKC 會連全形標點（，：）都換成半形，改變原文的樣子
-    def fix(match: re.Match) -> str:
-        ch = match.group()
-        return _SUPPLEMENT.get(ch) or unicodedata.normalize("NFKC", ch)
+    return _RADICALS.sub(_radical_to_char, text)
 
-    return _RADICALS.sub(fix, text)
+
+# 一個部首字元 → 一般漢字：補充區段查上面的表；康熙部首用 NFKC 正規化
+# （NFKC：Unicode 定義好的「相容字元 → 標準字元」對應）
+def _radical_to_char(match: re.Match) -> str:
+    ch = match.group()
+    return _SUPPLEMENT.get(ch) or unicodedata.normalize("NFKC", ch)
 
 
 class UnreadablePdf(Exception):

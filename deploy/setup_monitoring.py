@@ -22,7 +22,10 @@ DASHBOARD_NAME = "trace-app"
 BUDGET_NAME = "trace-app-monthly"
 BUDGET_USD = "5"
 
-API, WORKER, SWEEPER = (f"/aws/lambda/trace-app-{name}" for name in ("api", "worker", "sweeper"))
+# 三個 Lambda 各自的 log group（Lambda 的 log 自動放在 /aws/lambda/函式名稱）
+API = "/aws/lambda/trace-app-api"
+WORKER = "/aws/lambda/trace-app-worker"
+SWEEPER = "/aws/lambda/trace-app-sweeper"
 
 # ---------- 1. 把 log 變成數字的規則 ----------
 # (log group, 規則名稱, 篩選條件, 數字名稱, 每符合一筆加多少)
