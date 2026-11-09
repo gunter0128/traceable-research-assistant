@@ -13,8 +13,14 @@ from app.models.document import Document
 from app.models.usage_record import UsageRecord
 from app.models.user import User
 from app.services import usage_service
+from tests.helpers import (
+    create_workspace,
+    fake_embed_query,
+    fake_embed_texts,
+    login_headers,
+    upload_pdf,
+)
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
@@ -23,12 +29,12 @@ def _fakes(monkeypatch):
     def embed_texts(texts, on_attempt=None, on_usage=None):
         if on_usage:
             on_usage(Usage(openai_client.EMBEDDING_MODEL, 1000 * len(texts)))
-        return [[0.1] * 1536 for _ in texts]
+        return fake_embed_texts(texts)
 
     def embed_query(text, deadline=None, on_usage=None):
         if on_usage:
             on_usage(Usage(openai_client.EMBEDDING_MODEL, 20))
-        return [0.1] * 1536
+        return fake_embed_query(text)
 
     def generate_answer(system, user, deadline=None, on_usage=None):
         if on_usage:
@@ -38,16 +44,6 @@ def _fakes(monkeypatch):
     monkeypatch.setattr(openai_client, "embed_texts", embed_texts)
     monkeypatch.setattr(openai_client, "embed_query", embed_query)
     monkeypatch.setattr(openai_client, "generate_answer", generate_answer)
-
-
-def _login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    token = client.post("/auth/login", json={"email": email, "password": "pw123456"}).json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _workspace(client, headers):
-    return client.post("/workspaces", json={"name": "研究"}, headers=headers).json()["id"]
 
 
 def _upload(client, headers, ws_id):
@@ -79,8 +75,8 @@ def test_cost_calculation():
 
 # 測試：問一次問題，記下兩筆（問題轉向量、生成答案），金額正確
 def test_ask_records_usage(client, db_session):
-    headers = _login(client, "alice@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "alice@example.com")
+    ws_id = create_workspace(client, headers)
 
     assert _ask(client, headers, ws_id).status_code == 200
 
@@ -93,8 +89,8 @@ def test_ask_records_usage(client, db_session):
 
 # 測試：處理文件的用量算在上傳的人身上，記下是哪份文件
 def test_processing_records_usage_for_owner(client, db_session):
-    headers = _login(client, "bob@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "bob@example.com")
+    ws_id = create_workspace(client, headers)
 
     document_id = _upload(client, headers, ws_id).json()["id"]
 
@@ -109,8 +105,8 @@ def test_failed_ask_still_records_spent_usage(client, db_session, monkeypatch):
         raise openai_client.OpenAITemporaryError("down")
 
     monkeypatch.setattr(openai_client, "generate_answer", broken)
-    headers = _login(client, "carol@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "carol@example.com")
+    ws_id = create_workspace(client, headers)
 
     assert _ask(client, headers, ws_id).status_code == 503
 
@@ -120,8 +116,8 @@ def test_failed_ask_still_records_spent_usage(client, db_session, monkeypatch):
 
 # 測試：開始之前還沒到上限 → 放行、完整回答；回答完已經超過 → 馬上查得到；下一次才擋
 def test_crossing_the_limit_finishes_then_blocks(client, db_session):
-    headers = _login(client, "dave@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "dave@example.com")
+    ws_id = create_workspace(client, headers)
     _spend(db_session, _user_id(db_session, "dave@example.com"), "0.4999")
 
     first = _ask(client, headers, ws_id)
@@ -137,8 +133,8 @@ def test_crossing_the_limit_finishes_then_blocks(client, db_session):
 
 # 測試：到上限之後，上傳和重試也擋
 def test_limit_blocks_upload_and_retry(client, db_session):
-    headers = _login(client, "erin@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "erin@example.com")
+    ws_id = create_workspace(client, headers)
     document_id = _upload(client, headers, ws_id).json()["id"]
     db_session.get(Document, document_id).status = "failed"  # 做一份可以重試的文件
     db_session.commit()
@@ -150,10 +146,10 @@ def test_limit_blocks_upload_and_retry(client, db_session):
 
 # 測試：全系統的上限：別人（或很多帳號）把今天的額度用完了，其他人也不能用，訊息不一樣
 def test_system_limit_blocks_everyone(client, db_session):
-    _login(client, "spammer@example.com")
+    login_headers(client, "spammer@example.com")  # 只是要建出這個帳號，回傳的 headers 用不到
     _spend(db_session, _user_id(db_session, "spammer@example.com"), "5")
-    headers = _login(client, "frank@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "frank@example.com")
+    ws_id = create_workspace(client, headers)
 
     response = _ask(client, headers, ws_id)
 
@@ -164,8 +160,8 @@ def test_system_limit_blocks_everyone(client, db_session):
 
 # 測試：「今天」用台灣時間算，昨天（台灣時間）用的不算
 def test_yesterday_does_not_count(client, db_session):
-    headers = _login(client, "grace@example.com")
-    ws_id = _workspace(client, headers)
+    headers = login_headers(client, "grace@example.com")
+    ws_id = create_workspace(client, headers)
     yesterday = datetime.now(usage_service.TAIWAN) - timedelta(days=1)
     _spend(db_session, _user_id(db_session, "grace@example.com"), "10", created_at=yesterday)
 

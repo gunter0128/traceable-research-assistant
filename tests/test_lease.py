@@ -13,8 +13,8 @@ from app.models.chunk import Chunk
 from app.models.document import Document
 from app.repositories import document_repo
 from app.services import document_service
+from tests.helpers import create_workspace, fake_embed_texts, login_headers, upload_pdf
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
 # 夠長的文字，切下去會變成好幾段，進度才看得出來
 LONG_TEXT = "retrieval " * 2000
@@ -22,25 +22,15 @@ LONG_TEXT = "retrieval " * 2000
 
 @pytest.fixture(autouse=True)
 def _fake_embeddings(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
 
 
-def _register_and_login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    response = client.post("/auth/login", json={"email": email, "password": "pw123456"})
-    return response.json()["access_token"]
-
-
-def _auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-
-# 上傳一份（本機模式，會直接處理完），回傳 token、workspace、文件編號
+# 登入 + 建 workspace + 上傳一份（本機模式，會直接處理完），回傳 headers、workspace、文件編號
 def _upload(client, email, text=LONG_TEXT):
-    token = _register_and_login(client, email)
-    ws_id = client.post("/workspaces", json={"name": "研究"}, headers=_auth_headers(token)).json()["id"]
-    response = upload_pdf(client, _auth_headers(token), ws_id, valid_pdf_bytes(text))
-    return token, ws_id, response.json()["id"]
+    headers = login_headers(client, email)
+    ws_id = create_workspace(client, headers)
+    response = upload_pdf(client, headers, ws_id, valid_pdf_bytes(text))
+    return headers, ws_id, response.json()["id"]
 
 
 def _set(db_session, document_id, **fields):
@@ -97,10 +87,10 @@ def test_fresh_lease_cannot_be_taken_over(client, db_session):
 
 # 測試：使用者查看時，處理中超過 5 分鐘沒報平安 → 「處理中斷，請按重試」
 def test_listing_marks_silent_document_interrupted(client, db_session):
-    token, ws_id, document_id = _upload(client, "erin@example.com")
+    headers, ws_id, document_id = _upload(client, "erin@example.com")
     _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(6))
 
-    documents = client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json()
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
     assert documents[0]["status"] == "failed"
     assert documents[0]["error_message"] == "處理中斷，請按重試"
@@ -108,10 +98,10 @@ def test_listing_marks_silent_document_interrupted(client, db_session):
 
 # 測試：處理中、4 分鐘前才報過平安 → 不動（不能把還活著的誤判成中斷）
 def test_listing_keeps_document_with_recent_heartbeat(client, db_session):
-    token, ws_id, document_id = _upload(client, "frank@example.com")
+    headers, ws_id, document_id = _upload(client, "frank@example.com")
     _set(db_session, document_id, status="processing", claim_token="x", heartbeat_at=_minutes_ago(4))
 
-    documents = client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json()
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
     assert documents[0]["status"] == "processing"
 
@@ -141,7 +131,7 @@ def test_worker_gives_up_when_lease_is_taken(client, db_session, monkeypatch):
                 {Document.claim_token: "someone-else", Document.heartbeat_at: datetime.now(timezone.utc)}
             )
             other.commit()
-        return [[0.1] * 1536 for _ in texts]
+        return fake_embed_texts(texts)
 
     monkeypatch.setattr(openai_client, "embed_texts", steal_lease_then_embed)
 
@@ -164,9 +154,9 @@ def test_finish_rejected_with_wrong_token(client, db_session):
 
 # 測試：被判定中斷之後，那個其實只是很慢的 Lambda 再來報平安 → 失敗（租約已經收回），不會把文件「救活」
 def test_heartbeat_rejected_after_interrupted(client, db_session):
-    token, ws_id, document_id = _upload(client, "jack@example.com")
+    headers, ws_id, document_id = _upload(client, "jack@example.com")
     _set(db_session, document_id, status="processing", claim_token="slow", heartbeat_at=_minutes_ago(6))
-    client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token))  # 觸發判定中斷
+    client.get(f"/workspaces/{ws_id}/documents", headers=headers)  # 觸發判定中斷
 
     assert document_repo.heartbeat(db_session, document_id, "slow") is False
     db_session.refresh(db_session.get(Document, document_id))
@@ -179,16 +169,16 @@ def test_heartbeat_rejected_after_interrupted(client, db_session):
 # 測試：Lambda 正在處理時，使用者按了取消 → Lambda 下次報平安時發現代碼對不上，自己停下來，
 # 寫到一半的 chunk 一段都不留，文件狀態是「已取消」
 def test_cancel_stops_running_worker(client, db_session, monkeypatch):
-    token, _, document_id = _upload(client, "kate@example.com")
+    headers, _, document_id = _upload(client, "kate@example.com")
     document = _set(db_session, document_id, status="uploaded")
     db_session.query(Chunk).filter(Chunk.document_id == document_id).delete()
     db_session.commit()
 
     # 假的 OpenAI：被呼叫時，模擬「使用者在這時候按了取消」（走真的 API，跟使用者做的事一樣）
     def cancel_then_embed(texts, **kwargs):
-        response = client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+        response = client.post(f"/documents/{document_id}/cancel", headers=headers)
         assert response.status_code == 200
-        return [[0.1] * 1536 for _ in texts]
+        return fake_embed_texts(texts)
 
     monkeypatch.setattr(openai_client, "embed_texts", cancel_then_embed)
 
@@ -201,11 +191,19 @@ def test_cancel_stops_running_worker(client, db_session, monkeypatch):
 
 # 測試：還在排隊時取消 → 之後 Lambda 拿到工單，搶不到租約，完全不處理
 def test_cancelled_document_is_skipped_by_worker(client, db_session, monkeypatch):
-    token, _, document_id = _upload(client, "leo@example.com")
+    headers, _, document_id = _upload(client, "leo@example.com")
     document = _set(db_session, document_id, status="uploaded")
-    client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+    client.post(f"/documents/{document_id}/cancel", headers=headers)
+
+    # 從這裡開始記錄有沒有呼叫 OpenAI。不在假函式裡直接 raise：
+    # process_document 會接住所有錯誤，測試反而看不出「其實呼叫了」
     calls = []
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: calls.append(texts))
+
+    def record_embed(texts, **kwargs):
+        calls.append(texts)
+        return fake_embed_texts(texts)
+
+    monkeypatch.setattr(openai_client, "embed_texts", record_embed)
 
     document_service.process_document(db_session, document)
 
@@ -216,9 +214,9 @@ def test_cancelled_document_is_skipped_by_worker(client, db_session, monkeypatch
 
 # 測試：已經處理完的文件不能取消（409），沒有東西可以停
 def test_cannot_cancel_processed_document(client):
-    token, _, document_id = _upload(client, "mia@example.com")  # 本機模式，上傳完就處理好了
+    headers, _, document_id = _upload(client, "mia@example.com")  # 本機模式，上傳完就處理好了
 
-    response = client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+    response = client.post(f"/documents/{document_id}/cancel", headers=headers)
 
     assert response.status_code == 409
 
@@ -227,20 +225,20 @@ def test_cannot_cancel_processed_document(client):
 def test_cannot_cancel_others_document(client, db_session):
     _, _, document_id = _upload(client, "nina@example.com")
     _set(db_session, document_id, status="uploaded")
-    other = _register_and_login(client, "owen@example.com")
+    other_headers = login_headers(client, "owen@example.com")
 
-    response = client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(other))
+    response = client.post(f"/documents/{document_id}/cancel", headers=other_headers)
 
     assert response.status_code == 403
 
 
 # 測試：取消之後可以按重試，重新處理完成
 def test_cancelled_document_can_be_retried(client, db_session):
-    token, _, document_id = _upload(client, "paul@example.com")
+    headers, _, document_id = _upload(client, "paul@example.com")
     _set(db_session, document_id, status="uploaded")
-    client.post(f"/documents/{document_id}/cancel", headers=_auth_headers(token))
+    client.post(f"/documents/{document_id}/cancel", headers=headers)
 
-    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(token))
+    response = client.post(f"/documents/{document_id}/retry", headers=headers)
 
     assert response.status_code == 200
     assert response.json()["status"] == "processed"

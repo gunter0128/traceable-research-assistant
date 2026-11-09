@@ -14,14 +14,21 @@ from app.core.config import settings
 from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
+from tests.helpers import (
+    always_raise,
+    create_workspace,
+    fake_embed_query,
+    fake_embed_texts,
+    login_headers,
+    upload_pdf,
+)
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
 def _fake_embeddings(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
-    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(openai_client, "embed_query", fake_embed_query)
 
 
 # 切換成雲端模式（有 SQS），送出去的工單記在 list 裡
@@ -33,28 +40,12 @@ def cloud(monkeypatch):
     return messages
 
 
-def _register_and_login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    response = client.post("/auth/login", json={"email": email, "password": "pw123456"})
-    return response.json()["access_token"]
-
-
-def _auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-
+# 登入 + 建 workspace + 上傳一份，回傳 headers、workspace、文件編號
 def _upload(client, email):
-    token = _register_and_login(client, email)
-    ws_id = client.post("/workspaces", json={"name": "研究"}, headers=_auth_headers(token)).json()["id"]
-    response = upload_pdf(client, _auth_headers(token), ws_id, valid_pdf_bytes())
-    return token, ws_id, response.json()["id"]
-
-
-def _raise(exc):
-    def fake(*args, **kwargs):
-        raise exc
-
-    return fake
+    headers = login_headers(client, email)
+    ws_id = create_workspace(client, headers)
+    response = upload_pdf(client, headers, ws_id, valid_pdf_bytes())
+    return headers, ws_id, response.json()["id"]
 
 
 # 造出 OpenAI SDK 真的會丟的錯誤物件（它們需要一個假的 HTTP 回應才建得起來）
@@ -110,7 +101,7 @@ def _pending_document(db_session, document_id, attempts):
 def test_temporary_error_defers_in_cloud(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "alice@example.com")
     document = _pending_document(db_session, document_id, attempts=0)
-    monkeypatch.setattr(openai_client, "embed_texts", _raise(openai_client.OpenAITemporaryError()))
+    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
 
     with pytest.raises(document_service.RetryLater):
         document_service.process_document(db_session, document)
@@ -125,7 +116,7 @@ def test_temporary_error_defers_in_cloud(client, db_session, monkeypatch, cloud)
 def test_temporary_error_fails_on_last_attempt(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "bob@example.com")
     document = _pending_document(db_session, document_id, attempts=document_service.MAX_ATTEMPTS - 1)
-    monkeypatch.setattr(openai_client, "embed_texts", _raise(openai_client.OpenAITemporaryError()))
+    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
 
     document_service.process_document(db_session, document)
 
@@ -135,11 +126,11 @@ def test_temporary_error_fails_on_last_attempt(client, db_session, monkeypatch, 
 
 # 測試：本機沒有 SQS 沒辦法延後 → 直接標失敗
 def test_temporary_error_fails_locally(client, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", _raise(openai_client.OpenAITemporaryError()))
+    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
 
-    token, _, document_id = _upload(client, "carol@example.com")
+    headers, _, document_id = _upload(client, "carol@example.com")
 
-    body = client.get(f"/documents/{document_id}", headers=_auth_headers(token)).json()
+    body = client.get(f"/documents/{document_id}", headers=headers).json()
     assert body["status"] == "failed"
     assert body["error_message"] == "AI 服務暫時無法使用，請稍後按重試"
 
@@ -148,7 +139,7 @@ def test_temporary_error_fails_locally(client, monkeypatch):
 def test_permanent_error_fails_immediately(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "dave@example.com")
     document = _pending_document(db_session, document_id, attempts=0)
-    monkeypatch.setattr(openai_client, "embed_texts", _raise(openai_client.OpenAIPermanentError()))
+    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAIPermanentError()))
 
     document_service.process_document(db_session, document)
 
@@ -160,7 +151,7 @@ def test_permanent_error_fails_immediately(client, db_session, monkeypatch, clou
 def test_worker_delays_message_on_retry_later(client, db_session, monkeypatch, cloud):
     _, _, document_id = _upload(client, "erin@example.com")
     monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
-    monkeypatch.setattr(openai_client, "embed_texts", _raise(openai_client.OpenAITemporaryError()))
+    monkeypatch.setattr(openai_client, "embed_texts", always_raise(openai_client.OpenAITemporaryError()))
     delayed = []
     monkeypatch.setattr(sqs_client, "delay_message", lambda receipt, seconds: delayed.append((receipt, seconds)))
     event = {"Records": [{"body": json.dumps({"document_id": document_id}), "receiptHandle": "receipt-1"}]}
@@ -177,7 +168,7 @@ def test_embeddings_sent_in_batches(client, db_session, monkeypatch):
 
     def fake_embed(texts, **kwargs):
         calls.append(len(texts))
-        return [[0.1] * 1536 for _ in texts]
+        return fake_embed_texts(texts)
 
     monkeypatch.setattr(openai_client, "embed_texts", fake_embed)
     monkeypatch.setattr(document_service.chunker, "chunk_text", lambda text: [f"段落 {i}" for i in range(250)])
@@ -195,10 +186,10 @@ def test_embeddings_sent_in_batches(client, db_session, monkeypatch):
 
 # 測試：問答時 OpenAI 暫時連不上 → 503，請稍後再試
 def test_ask_returns_503_when_ai_unavailable(client, monkeypatch):
-    token, ws_id, _ = _upload(client, "grace@example.com")
-    monkeypatch.setattr(openai_client, "generate_answer", _raise(openai_client.OpenAITemporaryError()))
+    headers, ws_id, _ = _upload(client, "grace@example.com")
+    monkeypatch.setattr(openai_client, "generate_answer", always_raise(openai_client.OpenAITemporaryError()))
 
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "?"}, headers=_auth_headers(token))
+    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "?"}, headers=headers)
 
     assert response.status_code == 503
     assert response.json()["detail"] == "AI 服務暫時無法使用，請稍後再試"
@@ -206,10 +197,10 @@ def test_ask_returns_503_when_ai_unavailable(client, monkeypatch):
 
 # 測試：問答時遇到永久性錯誤 → 503，訊息不同
 def test_ask_returns_503_when_misconfigured(client, monkeypatch):
-    token, ws_id, _ = _upload(client, "henry@example.com")
-    monkeypatch.setattr(openai_client, "embed_query", _raise(openai_client.OpenAIPermanentError()))
+    headers, ws_id, _ = _upload(client, "henry@example.com")
+    monkeypatch.setattr(openai_client, "embed_query", always_raise(openai_client.OpenAIPermanentError()))
 
-    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "?"}, headers=_auth_headers(token))
+    response = client.post(f"/workspaces/{ws_id}/ask", json={"question": "?"}, headers=headers)
 
     assert response.status_code == 503
     assert response.json()["detail"] == "系統設定有誤，請聯絡管理員"

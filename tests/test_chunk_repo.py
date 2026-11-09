@@ -4,25 +4,7 @@
 from app.models.chunk import Chunk
 from app.models.document import Document
 from app.repositories import chunk_repo
-
-
-def _register_and_login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    response = client.post(
-        "/auth/login", json={"email": email, "password": "pw123456"}
-    )
-    return response.json()["access_token"]
-
-
-def _auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _create_workspace(client, token, name="研究"):
-    response = client.post(
-        "/workspaces", json={"name": name}, headers=_auth_headers(token)
-    )
-    return response.json()["id"]
+from tests.helpers import create_workspace, login_headers
 
 
 # status 預設 "processed"：search_similar 只搜處理成功的文件，其他測試要的是正常可搜的文件
@@ -54,9 +36,9 @@ FAR = [0.0, 1.0] + [0.0] * 1534
 
 # 測試：只搜得到指定 workspace 底下的 chunk，搜不到別的 workspace 的（即使都是同一個使用者的）
 def test_search_similar_scoped_to_workspace(client, db_session):
-    token = _register_and_login(client, "alice@example.com")
-    ws_a = _create_workspace(client, token, "workspace A")
-    ws_b = _create_workspace(client, token, "workspace B")
+    headers = login_headers(client, "alice@example.com")
+    ws_a = create_workspace(client, headers, "workspace A")
+    ws_b = create_workspace(client, headers, "workspace B")
 
     doc_a = _add_document(db_session, ws_a)
     doc_b = _add_document(db_session, ws_b)
@@ -71,8 +53,8 @@ def test_search_similar_scoped_to_workspace(client, db_session):
 
 # 測試：依相似度排序，越像 query 向量的排越前面
 def test_search_similar_orders_by_distance(client, db_session):
-    token = _register_and_login(client, "bob@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "bob@example.com")
+    ws_id = create_workspace(client, headers)
     doc = _add_document(db_session, ws_id)
 
     # 故意先存比較不像的，確認排序靠的是向量距離，不是存入順序
@@ -89,8 +71,8 @@ def test_search_similar_orders_by_distance(client, db_session):
 
 # 測試：limit 參數真的有限制筆數
 def test_search_similar_respects_limit(client, db_session):
-    token = _register_and_login(client, "erin@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "erin@example.com")
+    ws_id = create_workspace(client, headers)
     doc = _add_document(db_session, ws_id)
 
     for i in range(5):
@@ -103,8 +85,8 @@ def test_search_similar_respects_limit(client, db_session):
 
 # 測試：處理失敗或還在處理中的文件，它的 chunk 不能被搜到
 def test_search_similar_skips_unprocessed_documents(client, db_session):
-    token = _register_and_login(client, "frank@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "frank@example.com")
+    ws_id = create_workspace(client, headers)
     failed_doc = _add_document(db_session, ws_id, "failed.pdf", status="failed")
     pending_doc = _add_document(db_session, ws_id, "pending.pdf", status="uploaded")
     _add_chunk(db_session, failed_doc.id, "失敗文件的內容", CLOSE)

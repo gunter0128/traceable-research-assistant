@@ -13,13 +13,13 @@ from app.core.config import settings
 from app.models.chunk import Chunk
 from app.models.document import Document
 from app.services import document_service
+from tests.helpers import create_workspace, fake_embed_texts, login_headers, upload_pdf
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
 
 
 # 切換成雲端模式：設定一個假的 SQS 網址，送出去的工單全部記在 sent 這個 list 裡
@@ -38,27 +38,8 @@ def worker_db(monkeypatch, db_session):
     monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
 
 
-def _register_and_login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    response = client.post(
-        "/auth/login", json={"email": email, "password": "pw123456"}
-    )
-    return response.json()["access_token"]
-
-
-def _auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _create_workspace(client, token, name="研究"):
-    response = client.post(
-        "/workspaces", json={"name": name}, headers=_auth_headers(token)
-    )
-    return response.json()["id"]
-
-
-def _upload_pdf(client, token, workspace_id):
-    return upload_pdf(client, _auth_headers(token), workspace_id, valid_pdf_bytes())
+def _upload_pdf(client, headers, workspace_id):
+    return upload_pdf(client, headers, workspace_id, valid_pdf_bytes())
 
 
 # 假的送工單函式：一呼叫就丟例外，模擬 SQS 連不上
@@ -80,10 +61,10 @@ def _chunk_count(db_session, document_id):
 
 # 測試：雲端模式上傳 → 立刻回應、還沒處理（沒有 chunk），而且送出了一張工單
 def test_upload_sends_message_instead_of_processing(client, db_session, sent):
-    token = _register_and_login(client, "alice@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "alice@example.com")
+    ws_id = create_workspace(client, headers)
 
-    response = _upload_pdf(client, token, ws_id)
+    response = _upload_pdf(client, headers, ws_id)
 
     body = response.json()
     assert response.status_code == 201
@@ -95,10 +76,10 @@ def test_upload_sends_message_instead_of_processing(client, db_session, sent):
 # 測試：工單送不出去 → 文件直接標失敗，不會永遠卡在處理中
 def test_upload_marks_failed_when_send_fails(client, monkeypatch, sent):
     monkeypatch.setattr(sqs_client, "send_process_message", _broken_send)
-    token = _register_and_login(client, "bob@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "bob@example.com")
+    ws_id = create_workspace(client, headers)
 
-    response = _upload_pdf(client, token, ws_id)
+    response = _upload_pdf(client, headers, ws_id)
 
     assert response.json()["status"] == "failed"
     assert response.json()["error_message"] == "排入處理佇列失敗，可以重試"
@@ -106,9 +87,9 @@ def test_upload_marks_failed_when_send_fails(client, monkeypatch, sent):
 
 # 測試：Lambda 收到工單 → 文件被處理完成，chunk 存進去
 def test_worker_processes_document(client, db_session, sent, worker_db):
-    token = _register_and_login(client, "carol@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "carol@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
 
     worker.handle_process_message(_sqs_event(document_id), None)
 
@@ -120,26 +101,33 @@ def test_worker_processes_document(client, db_session, sent, worker_db):
 
 # 測試：工單送出後文件被刪掉了 → Lambda 不會出錯，直接跳過
 def test_worker_skips_deleted_document(client, sent, worker_db):
-    token = _register_and_login(client, "dave@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
-    client.delete(f"/documents/{document_id}", headers=_auth_headers(token))
+    headers = login_headers(client, "dave@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
+    client.delete(f"/documents/{document_id}", headers=headers)
 
     worker.handle_process_message(_sqs_event(document_id), None)  # 不丟例外就算通過
 
 
 # 測試：次數用完的文件，就算又收到工單，也不會再處理，直接標失敗
 def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
-    token = _register_and_login(client, "erin@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "erin@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     document = db_session.get(Document, document_id)
     document.status = "uploaded"
     document.attempts = document_service.MAX_ATTEMPTS
     db_session.commit()
 
+    # 從這裡開始記錄有沒有呼叫 OpenAI。不在假函式裡直接 raise：
+    # process_document 會接住所有錯誤、把文件標失敗，測試反而看不出「其實呼叫了」
     calls = []
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: calls.append(texts))
+
+    def record_embed(texts, **kwargs):
+        calls.append(texts)
+        return fake_embed_texts(texts)
+
+    monkeypatch.setattr(openai_client, "embed_texts", record_embed)
     document_service.process_document(db_session, document)
 
     assert document.status == "failed"
@@ -148,13 +136,13 @@ def test_process_stops_after_max_attempts(client, db_session, monkeypatch):
 
 # 測試：失敗的文件可以手動重試，次數歸零並重新送工單
 def test_retry_failed_document(client, db_session, monkeypatch, sent):
-    token = _register_and_login(client, "frank@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "frank@example.com")
+    ws_id = create_workspace(client, headers)
     monkeypatch.setattr(sqs_client, "send_process_message", _broken_send)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]  # 送不出去 → failed
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]  # 送不出去 → failed
     monkeypatch.setattr(sqs_client, "send_process_message", sent.append)
 
-    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(token))
+    response = client.post(f"/documents/{document_id}/retry", headers=headers)
 
     assert response.status_code == 200
     assert response.json()["status"] == "uploaded"
@@ -165,34 +153,34 @@ def test_retry_failed_document(client, db_session, monkeypatch, sent):
 
 # 測試：不是失敗狀態的文件不能重試（409）
 def test_cannot_retry_non_failed_document(client, sent):
-    token = _register_and_login(client, "grace@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]  # 處理中
+    headers = login_headers(client, "grace@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]  # 處理中
 
-    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(token))
+    response = client.post(f"/documents/{document_id}/retry", headers=headers)
 
     assert response.status_code == 409
 
 
 # 測試：不能重試別人的文件（403）
 def test_cannot_retry_others_document(client, sent, monkeypatch):
-    alice = _register_and_login(client, "henry@example.com")
-    ws_id = _create_workspace(client, alice)
+    owner_headers = login_headers(client, "henry@example.com")
+    ws_id = create_workspace(client, owner_headers)
     monkeypatch.setattr(sqs_client, "send_process_message", _broken_send)
-    document_id = _upload_pdf(client, alice, ws_id).json()["id"]
-    bob = _register_and_login(client, "ivy@example.com")
+    document_id = _upload_pdf(client, owner_headers, ws_id).json()["id"]
+    other_headers = login_headers(client, "ivy@example.com")
 
-    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(bob))
+    response = client.post(f"/documents/{document_id}/retry", headers=other_headers)
 
     assert response.status_code == 403
 
 
 # 測試：sweeper → 交出去超過 15 分鐘還在處理中的標「處理逾時」；剛送出的不動；不會再重送工單
 def test_sweep_expires_only_overdue_documents(client, db_session, sent, worker_db):
-    token = _register_and_login(client, "jack@example.com")
-    ws_id = _create_workspace(client, token)
-    overdue_id = _upload_pdf(client, token, ws_id).json()["id"]
-    fresh_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "jack@example.com")
+    ws_id = create_workspace(client, headers)
+    overdue_id = _upload_pdf(client, headers, ws_id).json()["id"]
+    fresh_id = _upload_pdf(client, headers, ws_id).json()["id"]
     db_session.get(Document, overdue_id).queued_at = datetime.now(timezone.utc) - timedelta(minutes=16)
     db_session.commit()
     sent.clear()  # 清掉上傳時送的工單，只看這次掃描有沒有送東西
@@ -212,9 +200,9 @@ def test_sweep_expires_only_overdue_documents(client, db_session, sent, worker_d
 
 # 測試：送工單前「記錄送出時間」那步就失敗了（queued_at 是空的）→ 改看上傳時間，一樣會被標逾時
 def test_sweep_expires_document_without_queued_at(client, db_session, sent, worker_db):
-    token = _register_and_login(client, "kate@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "kate@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     document = db_session.get(Document, document_id)
     document.queued_at = None
     document.uploaded_at = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -230,14 +218,14 @@ def test_sweep_expires_document_without_queued_at(client, db_session, sent, work
 
 # 測試：使用者查看文件列表時就檢查期限，不用等每小時的 sweeper
 def test_listing_expires_overdue_document(client, db_session, sent):
-    token = _register_and_login(client, "mia@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "mia@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     document = db_session.get(Document, document_id)
     document.queued_at = datetime.now(timezone.utc) - timedelta(minutes=16)
     db_session.commit()
 
-    documents = client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json()
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
     assert documents[0]["status"] == "failed"
     assert documents[0]["error_message"] == "處理逾時，請按重試"
@@ -245,30 +233,30 @@ def test_listing_expires_overdue_document(client, db_session, sent):
 
 # 測試：處理中但還沒超過期限 → 不動（不能把正常處理中的文件誤判成逾時）
 def test_listing_keeps_document_within_deadline(client, db_session, sent):
-    token = _register_and_login(client, "nina@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "nina@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     document = db_session.get(Document, document_id)
     document.queued_at = datetime.now(timezone.utc) - timedelta(minutes=14)
     db_session.commit()
 
-    documents = client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json()
+    documents = client.get(f"/workspaces/{ws_id}/documents", headers=headers).json()
 
     assert documents[0]["status"] == "uploaded"
 
 
 # 測試：逾時的文件可以按重試，重試後重新計算 15 分鐘（不會因為上傳時間很久以前就馬上又逾時）
 def test_overdue_document_can_be_retried(client, db_session, sent):
-    token = _register_and_login(client, "owen@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "owen@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     document = db_session.get(Document, document_id)
     document.uploaded_at = datetime.now(timezone.utc) - timedelta(hours=2)
     document.queued_at = datetime.now(timezone.utc) - timedelta(hours=2)
     db_session.commit()
 
-    response = client.post(f"/documents/{document_id}/retry", headers=_auth_headers(token))
-    after = client.get(f"/documents/{document_id}", headers=_auth_headers(token)).json()
+    response = client.post(f"/documents/{document_id}/retry", headers=headers)
+    after = client.get(f"/documents/{document_id}", headers=headers).json()
 
     assert response.status_code == 200
     assert after["status"] == "uploaded"
@@ -276,12 +264,19 @@ def test_overdue_document_can_be_retried(client, db_session, sent):
 
 # 測試：同一份文件的工單來了兩次（SQS 只保證「至少送一次」）→ 第二次直接跳過，不重複處理
 def test_worker_skips_duplicate_message(client, db_session, monkeypatch, sent, worker_db):
-    token = _register_and_login(client, "leo@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload_pdf(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "leo@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload_pdf(client, headers, ws_id).json()["id"]
     worker.handle_process_message(_sqs_event(document_id), None)
+
+    # 從這裡開始記錄有沒有呼叫 OpenAI（理由同 test_process_stops_after_max_attempts）
     calls = []
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: calls.append(texts))
+
+    def record_embed(texts, **kwargs):
+        calls.append(texts)
+        return fake_embed_texts(texts)
+
+    monkeypatch.setattr(openai_client, "embed_texts", record_embed)
 
     worker.handle_process_message(_sqs_event(document_id), None)
 
