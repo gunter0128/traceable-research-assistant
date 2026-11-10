@@ -132,5 +132,5 @@ docker compose up -d $BUILD
 wait_for "http://127.0.0.1:8080/auth/me" 401 180 "" "網頁和 API"
 
 echo ""
-echo "全部起來了。在筆電開 SSH 通道：ssh -N -L 18080:localhost:8080 <帳號@這台主機>"
-echo "再用瀏覽器打開 http://localhost:18080"
+echo "全部起來了。在筆電開 SSH 通道：ssh -N -L 8080:localhost:8080 <帳號@這台主機>"
+echo "再用瀏覽器打開 http://localhost:8080"
