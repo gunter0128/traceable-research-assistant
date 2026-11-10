@@ -15,6 +15,19 @@
 
 告警的設定見 [decisions/015](decisions/015-告警與運作紀錄.md)，查問題的方法見 CloudWatch Logs Insights（`filter level != "INFO"`）。
 
+## 回退用的版本紀錄
+
+上線過、確認能用的版本。要退回時，Lambda 用 digest 指定（標籤可以被改指到別的 image，digest 不會），指令見 [deployment-commands.md](deployment-commands.md) 的「退回上一版」。
+
+| 版本 | 上線 | Lambda image 標籤（commit） | Lambda image digest | 前端檔案 | 前端怎麼還原 |
+|---|---|---|---|---|---|
+| 重構前 | 2026-10-30（CI） | `49b6272c07dd7c7a131eae52feea4a0d30427ff6` | `sha256:69fe518589f99b4dc9d14c87b45f0412244285432ee4c638675209f059dc2115` | `index-D_9sjDA9.js`、`index-By4obAkl.css` | build commit `49b6272` 的 frontend（2026-11-10 驗過：build 出來的 JS 跟部署前的備份一模一樣，sha256 `bb619b47…`）；或用筆電上的備份 `後端練習/deploy-backups/2026-11-10-frontend-before-cloud-core/`（不進 git，裡面的 README.txt 有還原指令） |
+| Cloud Core 手動部署 | 2026-11-10（手動） | `091102649a0f472534e97771f2c3cbcd09e3ffc8` | `sha256:b352ceb4a3068ba40d5773f8a59e2f01266680acb17d196845fef4abc145719f` | `index-Dc37YbBl.js`、`index-By4obAkl.css` | build commit `0911026` 的 frontend |
+
+- ECR 沒有設 lifecycle policy：舊的 image 不會被自動刪掉，上面的 digest 都還在
+- 前端的 bucket 沒有開版本控制：被 `s3 sync --delete` 換掉的檔案在 S3 上找不回來，只能重新 build 那個 commit，或用備份
+- Vite 的檔名是照內容算的：同一個 commit、同一份 package-lock.json，在筆電、Docker、CI 上 build 出來的檔名都一樣，對得上檔名就是同一版
+
 ---
 
 ## 2026-11-10：Cloud Core（B1～B4）和可讀性整理（A2～A6）手動部署
@@ -30,7 +43,7 @@
   5. 前端：先備份 bucket，再 `s3 sync --delete`、清 CloudFront 快取，網站拿到的是新的 JS
   6. 比對部署前後：SQS 觸發、EventBridge 排程、Lambda 的 timeout 和記憶體都沒變；DLQ 0 張；告警都是 OK
 - 途中遇到的：這台電腦的網路斷斷續續（DNS 每二十多分鐘斷幾分鐘），在遠端 Neon 上跑的完整 pytest 兩次被打斷，改用本機 Docker 的 PostgreSQL（跟 CI 一樣）跑完 227 個；Docker build 下載套件逾時一次、推 image 時一層逾時一次，重試後成功
-- 回退：三個 Lambda 指回上一版 `49b6272c07dd7c7a131eae52feea4a0d30427ff6`（見 deployment-commands.md 的「退回上一版」）；前端的舊版備份在部署時的本機暫存資料夾
+- 回退：三個 Lambda 指回重構前的版本，前端重新 build `49b6272` 或用備份（版本、digest、備份位置見上面的「回退用的版本紀錄」）
 - 之後要注意：**正式環境現在跑的程式不在 main 上**。push 到 main 之前要先把 `refactor/cloud-core` 合併進去，不然 CI 會把舊版部署回來。前端還沒有人實際點擊驗證
 
 ## 2026-10-19：CI/CD 第一次部署被 AWS 拒絕

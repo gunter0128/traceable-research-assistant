@@ -244,11 +244,14 @@ aws iam put-role-policy --role-name trace-app-deploy-role --policy-name trace_ap
 
 ### 退回上一版
 
-image 的標籤是 commit 編號。把三個 Lambda 指回上一個能用的版本：
+image 的標籤是 commit 編號。把三個 Lambda 指回上一個能用的版本（上線過的版本和 digest 記在 [operations-log.md](operations-log.md) 的「回退用的版本紀錄」）：
 
 ```powershell
 foreach ($name in "api", "worker", "sweeper") { aws lambda update-function-code --function-name "trace-app-$name" --image-uri "${REPO}:<上一個 commit 編號>" --region $REGION --query "LastUpdateStatus" }
+# 或用 digest 指定（標籤可以被改指到別的 image，digest 不會）：--image-uri "${REPO}@sha256:<digest>"
 ```
+
+前端：在那個 commit 的 `frontend/` 跑 `npm ci`、`npm run build`，再照下面「手動部署」的前端指令上傳、清 CloudFront 的快取。
 
 ### 手動部署（GitHub Actions 出問題時）
 
