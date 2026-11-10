@@ -191,7 +191,7 @@ qa_service.ask
       └─ storage-init：只跑一次，建好放文件的 bucket
 ```
 
-跟公開展示版只差設定：檔案存 SeaweedFS 不是 S3（上傳許可的網址換成 `/storage`，由 nginx 轉過去）、沒有 SQS 和 sweeper。300 頁的 PDF 處理約 9 秒，所以上傳時直接處理就夠了。目前在實驗室的主機上跑，從筆電用 SSH 通道看。模型是主機上手動開的兩個 vLLM：讓 docker-compose 開模型要再多約 20GB 的硬碟，共用主機的空間不夠，先暫停（045）。
+跟公開展示版只差設定：檔案存 SeaweedFS 不是 S3（上傳許可的網址換成 `/storage`，由 nginx 轉過去）、沒有 SQS 和 sweeper。300 頁的 PDF 處理約 9 秒，所以上傳時直接處理就夠了。目前在實驗室的主機上跑，從筆電用 SSH 通道看。模型是主機上裝好的兩個 vLLM，用 `onprem/start.sh` 一個指令跟 docker-compose 一起開；讓 docker-compose 自己開模型要再多約 20GB 的硬碟，共用主機的空間不夠，先暫停（045）。
 
 ---
 

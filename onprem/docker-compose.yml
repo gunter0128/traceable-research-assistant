@@ -2,8 +2,9 @@
 #
 # 用法（在 onprem/ 資料夾）：
 #   1. 複製 .env.example 成 .env，填好密碼和模型的網址
-#   2. docker compose up -d --build                 模型已經在別的地方跑（例如筆電透過 SSH 通道連實驗室）
-#      docker compose --profile gpu up -d --build   有顯示卡的主機：連兩個模型一起開
+#   2. ./start.sh                                   模型用主機上裝好的 vLLM 跑：先開兩個模型、再開下面這些（實驗室用這個；git pull 之後加 --build）
+#      docker compose up -d --build                 模型已經在別的地方跑（例如筆電透過 SSH 通道連實驗室）
+#      docker compose --profile gpu up -d --build   有顯示卡的主機：連兩個模型一起開（要下載約 20GB 的 vLLM image）
 #   3. 瀏覽器打開 http://localhost:8080
 # 只開給這台主機自己（127.0.0.1）；從別台電腦看，用 SSH 通道把 8080 轉過去
 # restart: unless-stopped：主機重開機、Docker 重開之後自己起來；用 docker compose down 關掉的不會
