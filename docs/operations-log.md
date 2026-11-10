@@ -23,12 +23,24 @@
 |---|---|---|---|---|---|
 | 重構前 | 2026-10-30（CI） | `49b6272c07dd7c7a131eae52feea4a0d30427ff6` | `sha256:69fe518589f99b4dc9d14c87b45f0412244285432ee4c638675209f059dc2115` | `index-D_9sjDA9.js`、`index-By4obAkl.css` | build commit `49b6272` 的 frontend（2026-11-10 驗過：build 出來的 JS 跟部署前的備份一模一樣，sha256 `bb619b47…`）；或用筆電上的備份 `後端練習/deploy-backups/2026-11-10-frontend-before-cloud-core/`（不進 git，裡面的 README.txt 有還原指令） |
 | Cloud Core 手動部署 | 2026-11-10（手動） | `091102649a0f472534e97771f2c3cbcd09e3ffc8` | `sha256:b352ceb4a3068ba40d5773f8a59e2f01266680acb17d196845fef4abc145719f` | `index-Dc37YbBl.js`、`index-By4obAkl.css` | build commit `0911026` 的 frontend |
+| 合併到 main（CI 部署） | 2026-11-10（CI） | `e30cbb2a09d90c84b7476102c44b7c4780fd0b2b` | `sha256:54c12a94c9b1d16bb4ad48d47bf4dab6724baef630573d25c387c1eef2006d33` | `index-Dc37YbBl.js`、`index-By4obAkl.css` | build commit `e30cbb2` 的 frontend（檔案跟手動部署那版一模一樣） |
 
 - ECR 沒有設 lifecycle policy：舊的 image 不會被自動刪掉，上面的 digest 都還在
 - 前端的 bucket 沒有開版本控制：被 `s3 sync --delete` 換掉的檔案在 S3 上找不回來，只能重新 build 那個 commit，或用備份
 - Vite 的檔名是照內容算的：同一個 commit、同一份 package-lock.json，在筆電、Docker、CI 上 build 出來的檔名都一樣，對得上檔名就是同一版
 
 ---
+
+## 2026-11-10：合併到 main，CI/CD 把同一份程式再部署一次
+
+- 怎麼發現的：不是故障，是計畫內的版本同步。PR #1（`refactor/cloud-core` → main）用 merge commit 合併（保留文件裡引用的 commit 編號），push 到 main 觸發 CI/CD（run 42734293704）
+- 影響：三個 Lambda 換成 main 的 `e30cbb2`（digest `sha256:54c12a94…`）。程式跟手動部署的 `0911026` 相同（之後只改了文件）；image 是 CI 重新 build 的，所以 digest 不同。前端 CI build 出來的檔名跟手動部署的一樣（`index-Dc37YbBl.js`），sync 沒有刪掉任何檔案。從這裡開始，正式環境、GitHub main、本機的 main 是同一份程式
+- 原因：—
+- 處理：
+  1. 合併前：PR 沒有衝突（main 在開分支之後沒有變過）；分支上的 CI 通過（227 passed、Ruff、前端 build）；`alembic/` 從上一次 CI 部署（`49b6272`，那次的 migration 步驟成功）之後沒有改過，所以 CI 的 `alembic upgrade head` 不會改資料庫
+  2. CI/CD：測試 227 passed、Ruff 通過；migration 步驟只印出連線的訊息、沒有 `Running upgrade`（資料庫沒有變）；健康檢查回 `{"database": "ok"}`（GitHub Actions 第一次跑這一步）；`/auth/me` 第 1 次就回 401
+  3. 部署後另外確認：三個 Lambda 的 digest 跟 ECR 一致、`latest` 指向同一個；再叫一次健康檢查也回 `{"database": "ok"}`；CloudFront 給的是新的前端；部署後三個 Lambda 都沒有 ERROR；SQS 觸發、佇列設定、DLQ（0 張）、EventBridge 排程、Lambda 的 timeout／記憶體／權限、告警、11 條篩選條件跟部署前一模一樣；sweeper 在新版上第一次照排程執行（01:40 UTC）：`expired 0`、`orphans_deleted 0`、1.3 秒
+- 回退：見上面的「回退用的版本紀錄」（上一個能用的版本是手動部署的 `0911026`，再上一個是重構前的 `49b6272`）
 
 ## 2026-11-10：Cloud Core（B1～B4）和可讀性整理（A2～A6）手動部署
 
@@ -44,7 +56,7 @@
   6. 比對部署前後：SQS 觸發、EventBridge 排程、Lambda 的 timeout 和記憶體都沒變；DLQ 0 張；告警都是 OK
 - 途中遇到的：這台電腦的網路斷斷續續（DNS 每二十多分鐘斷幾分鐘），在遠端 Neon 上跑的完整 pytest 兩次被打斷，改用本機 Docker 的 PostgreSQL（跟 CI 一樣）跑完 227 個；Docker build 下載套件逾時一次、推 image 時一層逾時一次，重試後成功
 - 回退：三個 Lambda 指回重構前的版本，前端重新 build `49b6272` 或用備份（版本、digest、備份位置見上面的「回退用的版本紀錄」）
-- 之後要注意：**正式環境現在跑的程式不在 main 上**。push 到 main 之前要先把 `refactor/cloud-core` 合併進去，不然 CI 會把舊版部署回來。前端還沒有人實際點擊驗證
+- 之後要注意：**正式環境現在跑的程式不在 main 上**。push 到 main 之前要先把 `refactor/cloud-core` 合併進去，不然 CI 會把舊版部署回來。前端還沒有人實際點擊驗證（「不在 main 上」同一天合併之後已處理，見上一筆）
 
 ## 2026-10-19：CI/CD 第一次部署被 AWS 拒絕
 
