@@ -79,3 +79,21 @@
 - 沒有每小時的 sweeper：卡住的文件在使用者查看時當場判定（007、008）還是有效，但儲存服務上的孤兒檔案不會自動清
 - vLLM 的 image 很大，主機第一次啟動要下載很久
 - 實驗室能不能裝 NVIDIA Container Toolkit 還不知道；不能的話，實驗室上的就不是真正的「一個指令」
+
+## 第一階段怎麼啟動（2026-11-10 補）
+
+第二階段暫停之後，實驗室的主機重開機要先手動開兩個模型、再開 docker-compose，步驟和參數都要記得。改成 `onprem/start.sh` 一個指令：
+
+| 決定 | 做法 | 理由 |
+|---|---|---|
+| 模型怎麼跑 | 用主機上裝好的 vLLM（`.env` 的 `VLLM_BIN`），`nohup` 丟到背景，log 寫進 `onprem/logs/` | 不用下載 20GB 的 image、不用管理員權限，也不用另外裝 tmux |
+| 順序 | 轉向量 → 等 `/health` → 回答 → 等 `/health` → `docker compose up -d` → 經過 nginx 打 `/auth/me` 等到 401 | 兩個模型同時開會搶顯示卡記憶體（跟 `--profile gpu` 的 `depends_on` 一樣） |
+| 模型已經在跑 | 跳過，不重開 | 顯示卡是共用的 |
+| 參數 | 寫在 start.sh，`tests/test_onprem_start.py` 逐一跟 docker-compose.yml 的 `vllm-embed`、`vllm-answer` 比對（包括 `VLLM_USE_FLASHINFER_SAMPLER=0`，036） | 之後換成 `--profile gpu`，模型的行為不變 |
+| 避免下載 | `HF_HUB_OFFLINE=1` | 找不到模型檔就直接報錯，不會在共用主機上下載十幾 GB |
+| 關掉 | `stop.sh`：`docker compose stop`（資料留著）；模型只關 start.sh 開的（記了編號，關之前確認那個編號還是 vLLM），別人開的不碰；`--keep-models` 只關網頁那些 | 共用主機上不會關到別人的東西 |
+| 主機上的路徑 | `.env` 的 `VLLM_BIN`、`MODELS_DIR`、`ADAPTERS_DIR` | 換機器只改設定 |
+
+**試過**：在 Linux（WSL 的 Ubuntu 24.04，在只有自己 loopback 的網路裡）用假的 vllm、docker 跑 22 項情境，全部通過：沒有 `.env` 或缺設定會停下來、說是哪一個；先開轉向量再開回答；環境變數對（`HF_HOME`、`HF_HUB_OFFLINE`、FlashInfer 的設定只給回答模型、`.env` 的密碼不會傳給模型）；adapter 換成主機的路徑；再跑一次會跳過已經在跑的模型；回答模型開不起來會印出 log 的最後幾行、不往下開網頁；stop.sh 只關自己開的；編號被別的程式用了不會關錯。實驗室上還沒真的跑過。
+
+**代價**：還不是開機自動啟動，重開機後要打一次 `./start.sh`；主機上的 vLLM 要另外裝好（交給公司時要說明）。等 Docker 的資料能放到另一顆硬碟，就換成 `--profile gpu`，start.sh 可以拿掉。

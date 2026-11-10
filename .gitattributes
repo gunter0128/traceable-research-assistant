@@ -1,0 +1,2 @@
+# shell 腳本一律用 LF 換行：Windows 上 checkout 出來是 CRLF 的話，拿到 Linux 執行會壞掉
+*.sh text eol=lf
