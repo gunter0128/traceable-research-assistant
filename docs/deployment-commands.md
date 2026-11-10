@@ -214,12 +214,14 @@ aws s3api put-bucket-cors --bucket "traceable-research-assistant-$ACCOUNT-$REGIO
 ### 8. 驗證
 
 ```powershell
-'{"probe": true}' | Out-File -Encoding ascii probe.json
-aws lambda invoke --function-name trace-app-worker --payload fileb://probe.json --region $REGION out.json
+'{"health_check": true}' | Out-File -Encoding ascii health_check.json
+aws lambda invoke --function-name trace-app-worker --payload fileb://health_check.json --region $REGION out.json
 Get-Content out.json
 ```
 
-量 Lambda 到資料庫的速度，同區域的話 `tcp_connect_ms` 應該是個位數。再用瀏覽器打開 CloudFront 的網址，登入、上傳、問答各試一次。
+worker 真的對資料庫查一次 `SELECT 1`，`out.json` 是 `{"database": "ok"}` 才對；連不上資料庫的話會是 `errorMessage`（指令本身還是會成功結束，要看內容）。再用瀏覽器打開 CloudFront 的網址，登入、上傳、問答各試一次。
+
+（以前這一步用 `{"probe": true}` 量 Lambda 到資料庫的速度（[decisions/011](decisions/011-搬到新加坡.md)），量完就用不到了，[decisions/046](decisions/046-簡化上雲後的可靠性機制.md) B4 拿掉。）
 
 ---
 
@@ -242,11 +244,14 @@ aws iam put-role-policy --role-name trace-app-deploy-role --policy-name trace_ap
 
 ### 退回上一版
 
-image 的標籤是 commit 編號。把三個 Lambda 指回上一個能用的版本：
+image 的標籤是 commit 編號。把三個 Lambda 指回上一個能用的版本（上線過的版本和 digest 記在 [operations-log.md](operations-log.md) 的「回退用的版本紀錄」）：
 
 ```powershell
 foreach ($name in "api", "worker", "sweeper") { aws lambda update-function-code --function-name "trace-app-$name" --image-uri "${REPO}:<上一個 commit 編號>" --region $REGION --query "LastUpdateStatus" }
+# 或用 digest 指定（標籤可以被改指到別的 image，digest 不會）：--image-uri "${REPO}@sha256:<digest>"
 ```
+
+前端：在那個 commit 的 `frontend/` 跑 `npm ci`、`npm run build`，再照下面「手動部署」的前端指令上傳、清 CloudFront 的快取。
 
 ### 手動部署（GitHub Actions 出問題時）
 
@@ -294,12 +299,15 @@ dead-letter queue 裡有沒有工單。**有東西 = 有工單試了 3 次都失
 aws sqs get-queue-attributes --queue-url "https://sqs.$REGION.amazonaws.com/$ACCOUNT/trace-app-documents-dlq" --attribute-names ApproximateNumberOfMessages --region $REGION
 ```
 
-手動叫一次 worker、不處理任何文件：能正常啟動、讀到密碼、載入程式碼，就會回傳 `null`：
+手動叫一次 worker、不處理任何文件：能正常啟動、讀到密碼、連得到資料庫，`out.json` 就是 `{"database": "ok"}`：
 
 ```powershell
-'{"Records": []}' | Out-File -Encoding ascii probe.json
-aws lambda invoke --function-name trace-app-worker --payload fileb://probe.json --region $REGION out.json
+'{"health_check": true}' | Out-File -Encoding ascii health_check.json
+aws lambda invoke --function-name trace-app-worker --payload fileb://health_check.json --region $REGION out.json
+Get-Content out.json
 ```
+
+不要用 `{"Records": []}`：沒有工單時 worker 什麼都不做，連資料庫都沒碰，資料庫壞了也會回成功。
 
 換密碼用 `update-secret`，不要刪掉重建（刪除預設有 30 天緩衝期，同名的會建不起來）。密碼只在 Lambda 冷啟動時讀一次，熱的 Lambda 還在用舊的，要重新部署一次才會全部換掉：
 

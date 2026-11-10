@@ -8,38 +8,26 @@ import pytest
 
 from app.core import openai_client
 from app.services import qa_service
+from tests.helpers import (
+    create_workspace,
+    fake_answer,
+    fake_embed_query,
+    fake_embed_texts,
+    login_headers,
+    upload_pdf,
+)
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
     # 上傳時文件處理用 embed_texts（一次一批），問問題時用 embed_query，兩個都擋掉
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
-    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(openai_client, "embed_query", fake_embed_query)
 
 
-def _register_and_login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    response = client.post(
-        "/auth/login", json={"email": email, "password": "pw123456"}
-    )
-    return response.json()["access_token"]
-
-
-def _auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _create_workspace(client, token, name="研究"):
-    response = client.post(
-        "/workspaces", json={"name": name}, headers=_auth_headers(token)
-    )
-    return response.json()["id"]
-
-
-def _upload_pdf(client, token, workspace_id, text="Multi-hop retrieval is the core method"):
-    return upload_pdf(client, _auth_headers(token), workspace_id, valid_pdf_bytes(text), "thesis.pdf")
+def _upload_pdf(client, headers, workspace_id, text="Multi-hop retrieval is the core method"):
+    return upload_pdf(client, headers, workspace_id, valid_pdf_bytes(text), "thesis.pdf")
 
 
 # 測試：沒登入不能問
@@ -50,25 +38,25 @@ def test_ask_requires_auth(client):
 
 # 測試：workspace 不存在回 404
 def test_ask_nonexistent_workspace(client):
-    token = _register_and_login(client, "alice@example.com")
+    headers = login_headers(client, "alice@example.com")
     response = client.post(
         "/workspaces/999999/ask",
         json={"question": "?"},
-        headers=_auth_headers(token),
+        headers=headers,
     )
     assert response.status_code == 404
 
 
 # 測試：B 不能問 A 的 workspace
 def test_cannot_ask_others_workspace(client):
-    token_a = _register_and_login(client, "bob_a@example.com")
-    ws_id = _create_workspace(client, token_a)
+    headers_a = login_headers(client, "bob_a@example.com")
+    ws_id = create_workspace(client, headers_a)
 
-    token_b = _register_and_login(client, "bob_b@example.com")
+    headers_b = login_headers(client, "bob_b@example.com")
     response = client.post(
         f"/workspaces/{ws_id}/ask",
         json={"question": "?"},
-        headers=_auth_headers(token_b),
+        headers=headers_b,
     )
     assert response.status_code == 403
 
@@ -79,22 +67,22 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
     # 把丟給模型的資料記下來，最後檢查裡面有檔名和今天日期
     sent = {}
 
-    def fake_generate(system, user, **kwargs):
+    def fake_generate(system, user, timeout):
         sent["user"] = user
-        return "這是生成的答案[1]"
+        return fake_answer("這是生成的答案[1]")
 
     monkeypatch.setattr(openai_client, "generate_answer", fake_generate)
 
-    # valid_pdf_bytes() 手刻的內容流只支援 latin-1，塞中文會編碼失敗，這裡故意用英文內容
-    token = _register_and_login(client, "carol@example.com")
-    ws_id = _create_workspace(client, token)
-    upload = _upload_pdf(client, token, ws_id, text="Multi-hop retrieval is the core method")
+    # valid_pdf_bytes() 用的內建字型（Helvetica）不支援中文（見 pdf_fixtures.py），這裡故意用英文內容
+    headers = login_headers(client, "carol@example.com")
+    ws_id = create_workspace(client, headers)
+    upload = _upload_pdf(client, headers, ws_id, text="Multi-hop retrieval is the core method")
     assert upload.json()["status"] == "processed"
 
     response = client.post(
         f"/workspaces/{ws_id}/ask",
         json={"question": "這篇論文的方法是什麼？"},
-        headers=_auth_headers(token),
+        headers=headers,
     )
 
     assert response.status_code == 200
@@ -112,16 +100,16 @@ def test_ask_returns_answer_with_citations(client, monkeypatch):
 # 以前會把搜到的段落全部當引用，變成「答案說找不到，下面卻附了一份文件」
 def test_answer_without_markers_has_no_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda system, user, **kwargs: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda system, user, timeout: fake_answer("文件中找不到相關資訊")
     )
-    token = _register_and_login(client, "erin@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id, text="Multi-hop retrieval is the core method")
+    headers = login_headers(client, "erin@example.com")
+    ws_id = create_workspace(client, headers)
+    _upload_pdf(client, headers, ws_id, text="Multi-hop retrieval is the core method")
 
     response = client.post(
         f"/workspaces/{ws_id}/ask",
         json={"question": "法國的首都是哪裡？"},
-        headers=_auth_headers(token),
+        headers=headers,
     )
 
     assert response.status_code == 200
@@ -130,15 +118,15 @@ def test_answer_without_markers_has_no_citations(client, monkeypatch):
 
 # 測試：模型有回答、卻忘了標編號時，退回列出搜到的段落（安全網，docs/decisions/021）
 def test_answer_without_markers_falls_back_to_retrieved_passages(client, monkeypatch):
-    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, **kwargs: "核心方法是多跳檢索")
-    token = _register_and_login(client, "frank@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload_pdf(client, token, ws_id, text="Multi-hop retrieval is the core method")
+    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, timeout: fake_answer("核心方法是多跳檢索"))
+    headers = login_headers(client, "frank@example.com")
+    ws_id = create_workspace(client, headers)
+    _upload_pdf(client, headers, ws_id, text="Multi-hop retrieval is the core method")
 
     response = client.post(
         f"/workspaces/{ws_id}/ask",
         json={"question": "這篇論文的方法是什麼？"},
-        headers=_auth_headers(token),
+        headers=headers,
     )
 
     assert [c["number"] for c in response.json()["citations"]] == [1]
@@ -153,12 +141,13 @@ def test_answer_without_markers_falls_back_to_retrieved_passages(client, monkeyp
         ("可以[1][3]，也可以［2］", "可以[1][3]，也可以[2]", {1, 2, 3}),
         ("見[1, 2]、[2，3]", "見[1][2]、[2][3]", {1, 2, 3}),
         ("見[1, 9]", "見[1]", {1}),
+        ("見[2, 1, 2]。", "見[2][1]。", {1, 2}),
         ("民國[2025]年", "民國[2025]年", set()),
         ("文件中找不到相關資訊", "文件中找不到相關資訊", set()),
     ],
 )
 def test_extract_citations(answer, expected_answer, expected_cited):
-    assert qa_service._extract_citations(answer, 3) == (expected_answer, expected_cited)
+    assert qa_service.extract_citations(answer, 3) == (expected_answer, expected_cited)
 
 
 # 測試：給模型的資料（docs/decisions/018）
@@ -186,6 +175,24 @@ def test_context_groups_chunks_by_document_with_header_and_date():
         "【文件】手冊_2025.pdf\n文件開頭：員工手冊（2025 年版）\n\n"
         "[3] 舊版第 1 段"
     )
+
+
+# 測試：回傳給前端的段落，編號跟給模型看的一樣：跨文件連續編 1、2、3，順序跟 build_context 一樣
+def test_numbered_passages_follow_context_order():
+    new = SimpleNamespace(id=1, filename="手冊_2026.pdf")
+    old = SimpleNamespace(id=2, filename="手冊_2025.pdf")
+    groups = [
+        (new, [SimpleNamespace(document_id=1, content="新版第 1 段"), SimpleNamespace(document_id=1, content="新版第 3 段")]),
+        (old, [SimpleNamespace(document_id=2, content="舊版第 1 段")]),
+    ]
+
+    passages = qa_service.numbered_passages(groups)
+
+    assert [(p.number, p.filename, p.content) for p in passages] == [
+        (1, "手冊_2026.pdf", "新版第 1 段"),
+        (2, "手冊_2026.pdf", "新版第 3 段"),
+        (3, "手冊_2025.pdf", "舊版第 1 段"),
+    ]
 
 
 # 測試：文件開頭只取前 200 個字，很長的第一段不會整段塞進去
@@ -232,16 +239,16 @@ def test_join_overlap_without_overlap():
 # 測試：workspace 裡還沒有任何文件時問問題，不會噴錯，只是 citations 是空的
 def test_ask_with_no_documents_returns_empty_citations(client, monkeypatch):
     monkeypatch.setattr(
-        openai_client, "generate_answer", lambda system, user, **kwargs: "文件中找不到相關資訊"
+        openai_client, "generate_answer", lambda system, user, timeout: fake_answer("文件中找不到相關資訊")
     )
 
-    token = _register_and_login(client, "dave@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "dave@example.com")
+    ws_id = create_workspace(client, headers)
 
     response = client.post(
         f"/workspaces/{ws_id}/ask",
         json={"question": "這篇論文的方法是什麼？"},
-        headers=_auth_headers(token),
+        headers=headers,
     )
 
     assert response.status_code == 200

@@ -1,4 +1,5 @@
-# core/ 的純函式測試：chunker、pdf_parser。不碰資料庫、不碰 HTTP，不需要 client/db_session
+# core/ 的測試：chunker、pdf_parser、lambda_secrets（讀密碼）、aws_clients（建 boto3 client）
+# 不碰資料庫、不碰 HTTP，不需要 client/db_session；要連 AWS 的地方都換成假的
 
 import io
 import os
@@ -67,7 +68,6 @@ class _FakeSecretsManager:
         return {"SecretString": f"value-of-{SecretId}"}
 
 
-# 測試：在 Lambda 上（有 AWS_LAMBDA_FUNCTION_NAME）→ 從 Secrets Manager 把三個密碼讀進環境變數
 # 測試：某些中文 PDF 會把常用字解析成「康熙部首」字元（日 → U+2F47），要換回一般漢字，搜尋和轉向量才不會出錯
 # 全形標點不能被一起改掉（不能變成半形的逗號、冒號）
 def test_kangxi_radicals_become_normal_characters():
@@ -76,6 +76,7 @@ def test_kangxi_radicals_become_normal_characters():
     assert pdf_parser._fix_radicals(radicals) == "搭乘高鐵車廂，特休 14 日：用途，財務長，西屯區"
 
 
+# 測試：在 Lambda 上（有 AWS_LAMBDA_FUNCTION_NAME）→ 從 Secrets Manager 把三個密碼讀進環境變數
 def test_lambda_secrets_loaded_in_lambda(monkeypatch):
     monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "trace-worker")
     monkeypatch.setenv("AWS_REGION", "ap-southeast-2")

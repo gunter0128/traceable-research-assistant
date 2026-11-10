@@ -14,6 +14,8 @@ export type Workspace = {
   updated_at: string
 }
 
+// status：uploaded 排隊中、processing 處理中、processed 完成、failed 失敗、
+// cancelled 已取消（以前的取消功能留下的，docs/decisions/046 拿掉了取消，舊文件還是可以重試、刪除）
 export type Document = {
   id: number
   workspace_id: number
@@ -22,8 +24,6 @@ export type Document = {
   uploaded_at: string
   processed_at: string | null
   error_message: string | null
-  progress_done: number | null
-  progress_total: number | null
 }
 
 // 上傳許可（docs/decisions/013）：url + fields 給瀏覽器直接傳到 S3，key 是傳好之後通知 API 時要帶回去的
@@ -158,10 +158,6 @@ export const api = {
 
   retryDocument: (documentId: number) =>
     request<Document>(`/documents/${documentId}/retry`, { method: "POST" }),
-
-  // 取消處理（docs/decisions/009）：只有排隊中、處理中的文件可以
-  cancelDocument: (documentId: number) =>
-    request<Document>(`/documents/${documentId}/cancel`, { method: "POST" }),
 
   deleteDocument: (documentId: number) =>
     request<void>(`/documents/${documentId}`, { method: "DELETE" }),

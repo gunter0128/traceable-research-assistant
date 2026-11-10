@@ -25,20 +25,20 @@ export function WorkspaceList({
   const [name, setName] = useState("")
   const [creating, setCreating] = useState(false)
 
+  // 進入畫面時讀一次工作區列表
   useEffect(() => {
-    void load()
-  }, [])
-
-  async function load() {
-    setLoading(true)
-    try {
-      setWorkspaces(await api.listWorkspaces())
-    } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "讀取工作區失敗")
-    } finally {
-      setLoading(false)
+    async function loadWorkspaces() {
+      setLoading(true)
+      try {
+        setWorkspaces(await api.listWorkspaces())
+      } catch (err) {
+        toast.error(err instanceof ApiError ? err.message : "讀取工作區失敗")
+      } finally {
+        setLoading(false)
+      }
     }
-  }
+    void loadWorkspaces()
+  }, [])
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault()

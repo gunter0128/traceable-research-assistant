@@ -12,8 +12,14 @@ from app.core.config import settings
 from app.models.document import Document
 from app.repositories import document_repo
 from app.services import document_service
+from tests.helpers import (
+    always_raise,
+    create_workspace,
+    fake_embed_texts,
+    login_headers,
+    upload_pdf,
+)
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
 
 # 對帳要靠「最後修改時間」判斷檔案放多久了：conftest.py 的 fake_s3 把每個檔案都當成剛放進去，
@@ -31,35 +37,17 @@ def modified(monkeypatch, fake_s3):
 
 @pytest.fixture(autouse=True)
 def _fake_embeddings(monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_texts", lambda texts, **kwargs: [[0.1] * 1536 for _ in texts])
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
 
 
-def _register_and_login(client, email):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    response = client.post("/auth/login", json={"email": email, "password": "pw123456"})
-    return response.json()["access_token"]
-
-
-def _auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-
-def _create_workspace(client, token):
-    return client.post("/workspaces", json={"name": "研究"}, headers=_auth_headers(token)).json()["id"]
-
-
-def _upload(client, token, ws_id):
-    return upload_pdf(client, _auth_headers(token), ws_id, valid_pdf_bytes())
-
-
-def _s3_error(*args, **kwargs):
-    raise s3_client.StorageTemporaryError("模擬 S3 出錯")
+def _upload(client, headers, ws_id):
+    return upload_pdf(client, headers, ws_id, valid_pdf_bytes())
 
 
 # 測試：檔案存進 S3 了，建紀錄卻失敗 → 把剛存的檔案刪掉，不留孤兒檔案
 def test_upload_removes_file_when_record_fails(client, monkeypatch, fake_s3):
-    token = _register_and_login(client, "alice@example.com")
-    ws_id = _create_workspace(client, token)
+    headers = login_headers(client, "alice@example.com")
+    ws_id = create_workspace(client, headers)
 
     def broken_create(*args, **kwargs):
         raise RuntimeError("模擬資料庫寫入失敗")
@@ -68,43 +56,43 @@ def test_upload_removes_file_when_record_fails(client, monkeypatch, fake_s3):
 
     # TestClient 遇到 API 沒接住的錯誤，會直接在測試裡丟出來（真的部署時是回 500）
     with pytest.raises(RuntimeError):
-        _upload(client, token, ws_id)
+        _upload(client, headers, ws_id)
 
     assert fake_s3 == {}
 
 
 # 測試：刪文件時 S3 出錯 → 紀錄還是要刪掉（先刪紀錄），只留下孤兒檔案，不會留下「看得到卻壞掉」的文件
 def test_delete_document_succeeds_even_if_s3_fails(client, monkeypatch, fake_s3):
-    token = _register_and_login(client, "bob@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload(client, token, ws_id).json()["id"]
-    monkeypatch.setattr(s3_client, "delete_file", _s3_error)
+    headers = login_headers(client, "bob@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload(client, headers, ws_id).json()["id"]
+    monkeypatch.setattr(s3_client, "delete_file", always_raise(s3_client.StorageTemporaryError("模擬 S3 出錯")))
 
-    response = client.delete(f"/documents/{document_id}", headers=_auth_headers(token))
+    response = client.delete(f"/documents/{document_id}", headers=headers)
 
     assert response.status_code == 204
-    assert client.get(f"/documents/{document_id}", headers=_auth_headers(token)).status_code == 404
+    assert client.get(f"/documents/{document_id}", headers=headers).status_code == 404
     assert len(fake_s3) == 1  # 孤兒檔案，等對帳清
 
 
 # 測試：刪 workspace → 底下文件的 S3 檔案也一起刪（以前只刪資料庫紀錄，檔案會一直留著）
 def test_delete_workspace_removes_files(client, fake_s3):
-    token = _register_and_login(client, "carol@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload(client, token, ws_id)
-    _upload(client, token, ws_id)
+    headers = login_headers(client, "carol@example.com")
+    ws_id = create_workspace(client, headers)
+    _upload(client, headers, ws_id)
+    _upload(client, headers, ws_id)
     assert len(fake_s3) == 2
 
-    client.delete(f"/workspaces/{ws_id}", headers=_auth_headers(token))
+    client.delete(f"/workspaces/{ws_id}", headers=headers)
 
     assert fake_s3 == {}
 
 
 # 測試：對帳 → 只刪「沒有紀錄、而且放超過 1 天」的檔案；有紀錄的、剛放進去的都不動
 def test_orphan_cleanup_only_deletes_old_unreferenced_files(client, db_session, fake_s3, modified):
-    token = _register_and_login(client, "dave@example.com")
-    ws_id = _create_workspace(client, token)
-    _upload(client, token, ws_id)
+    headers = login_headers(client, "dave@example.com")
+    ws_id = create_workspace(client, headers)
+    _upload(client, headers, ws_id)
     referenced_key = next(iter(fake_s3))
     two_days_ago = datetime.now(timezone.utc) - timedelta(days=2)
     modified[referenced_key] = two_days_ago  # 有紀錄的檔案，就算很舊也不能刪
@@ -163,53 +151,73 @@ def test_s3_errors_are_classified(monkeypatch, exc, expected):
         REAL_DOWNLOAD_FILE("documents/x.pdf")
 
 
+REAL_FILE_SIZE = s3_client.file_size
+REAL_DELETE_FILE = s3_client.delete_file
+
+
+# 測試：確認上傳的檔案時（head_object），檔案不存在的錯誤代碼只有 "404"（沒有回應內容）→ 一樣認成檔案不存在
+# 沒權限還是永久性錯誤（docs/decisions/046 B3-3：這個例外以前寫在 file_size 裡，現在跟其他錯誤一起在 _classify 判斷）
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (_client_error("404", 404), s3_client.FileMissing),
+        (_client_error("403", 403), s3_client.StoragePermanentError),
+    ],
+)
+def test_file_size_errors_are_classified(monkeypatch, exc, expected):
+    monkeypatch.setattr(s3_client.client, "head_object", always_raise(exc))
+
+    with pytest.raises(expected):
+        REAL_FILE_SIZE("documents/x.pdf")
+
+
+# 測試：刪檔案時連不上 S3 → 暫時性錯誤（每個 S3 函式都用同一個 _classify）
+def test_delete_errors_are_classified(monkeypatch):
+    monkeypatch.setattr(s3_client.client, "delete_object", always_raise(EndpointConnectionError(endpoint_url="https://s3")))
+
+    with pytest.raises(s3_client.StorageTemporaryError):
+        REAL_DELETE_FILE("documents/x.pdf")
+
+
 # 測試：處理時檔案不見了 → 標失敗，訊息叫使用者重新上傳（不能叫他「稍後重試」，重試永遠不會成功）
 def test_missing_file_fails_with_clear_reason(client, db_session, monkeypatch):
-    token = _register_and_login(client, "erin@example.com")
-    ws_id = _create_workspace(client, token)
-    monkeypatch.setattr(s3_client, "download_file", _raise(s3_client.FileMissing("NoSuchKey")))
+    headers = login_headers(client, "erin@example.com")
+    ws_id = create_workspace(client, headers)
+    monkeypatch.setattr(s3_client, "download_file", always_raise(s3_client.FileMissing("NoSuchKey")))
     # 上傳完成時檔案還在（確認得到大小），處理時才不見
     monkeypatch.setattr(s3_client, "file_size", lambda key: 100)
 
-    body = _upload(client, token, ws_id).json()
+    body = _upload(client, headers, ws_id).json()
 
     assert body["status"] == "failed"
     assert body["error_message"] == "找不到上傳的檔案，請刪除後重新上傳"
 
 
-# 測試：雲端、處理時 S3 暫時連不上 → 跟 OpenAI 一樣，留在處理中等下一回合
-def test_storage_temporary_error_defers_in_cloud(client, db_session, monkeypatch):
+# 測試：雲端、處理時 S3 暫時連不上 → 跟 OpenAI 一樣直接標失敗，請使用者稍後按重試（不延後，docs/decisions/046）
+def test_storage_temporary_error_fails_in_cloud(client, db_session, monkeypatch):
     monkeypatch.setattr(settings, "sqs_queue_url", "https://fake-queue")
     monkeypatch.setattr(document_service.sqs_client, "send_process_message", lambda document_id: None)
-    token = _register_and_login(client, "frank@example.com")
-    ws_id = _create_workspace(client, token)
-    document_id = _upload(client, token, ws_id).json()["id"]
+    headers = login_headers(client, "frank@example.com")
+    ws_id = create_workspace(client, headers)
+    document_id = _upload(client, headers, ws_id).json()["id"]
     document = db_session.get(Document, document_id)
-    monkeypatch.setattr(s3_client, "download_file", _raise(s3_client.StorageTemporaryError("模擬")))
+    monkeypatch.setattr(s3_client, "download_file", always_raise(s3_client.StorageTemporaryError("模擬")))
 
-    with pytest.raises(document_service.RetryLater):
-        document_service.process_document(db_session, document)
+    document_service.process_document(db_session, document)
 
     db_session.refresh(document)
-    assert document.status == "uploaded"
-    assert document.error_message == "儲存服務暫時無法使用，稍後會自動重試"
+    assert document.status == "failed"
+    assert document.error_message == "儲存服務暫時無法使用，請稍後按重試"
 
 
 # 測試：上傳完成、API 去 S3 確認檔案時 S3 暫時連不上 → 回 503 和看得懂的訊息（不是 500），不建紀錄
 def test_upload_returns_503_when_storage_unavailable(client, monkeypatch):
-    token = _register_and_login(client, "grace@example.com")
-    ws_id = _create_workspace(client, token)
-    monkeypatch.setattr(s3_client, "file_size", _raise(s3_client.StorageTemporaryError("模擬")))
+    headers = login_headers(client, "grace@example.com")
+    ws_id = create_workspace(client, headers)
+    monkeypatch.setattr(s3_client, "file_size", always_raise(s3_client.StorageTemporaryError("模擬")))
 
-    response = _upload(client, token, ws_id)
+    response = _upload(client, headers, ws_id)
 
     assert response.status_code == 503
     assert response.json()["detail"] == "儲存服務暫時無法使用，請稍後再試"
-    assert client.get(f"/workspaces/{ws_id}/documents", headers=_auth_headers(token)).json() == []
-
-
-def _raise(exc):
-    def fake(*args, **kwargs):
-        raise exc
-
-    return fake
+    assert client.get(f"/workspaces/{ws_id}/documents", headers=headers).json() == []

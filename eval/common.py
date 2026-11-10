@@ -74,10 +74,17 @@ def cn_number(text: str) -> int:
     return total + current
 
 
-def normalize(text: str) -> str:
-    text = re.sub(r"\s", "", text)
+# 文字裡的中文數字換成阿拉伯數字：「百分之五十」→「50%」、「三十日」→「30日」
+# pad：換出來的數字前後加的字，用來跟旁邊的數字隔開（見 _numbers_in）；不加就是空字串
+# re.sub 的第二個參數給函式：每找到一個符合的地方就呼叫一次，回傳要換成的文字
+def chinese_to_digits(text: str, pad: str = "") -> str:
     text = re.sub(r"百分之([零〇一二兩三四五六七八九十百]+)", lambda m: f"{cn_number(m.group(1))}%", text)
-    return re.sub(r"[零〇一二兩三四五六七八九十百千]+", lambda m: str(cn_number(m.group())), text)
+    return re.sub(r"[零〇一二兩三四五六七八九十百千]+", lambda m: f"{pad}{cn_number(m.group())}{pad}", text)
+
+
+# 比對用：拿掉所有空白、中文數字換成阿拉伯數字
+def normalize(text: str) -> str:
+    return chinese_to_digits(re.sub(r"\s", "", text))
 
 
 def numbers(text: str) -> set[str]:
@@ -117,8 +124,7 @@ CITATION_MARKER = re.compile(r"[\[［]\s*(\d+(?:\s*[,，、]\s*\d+)*)\s*[\]］]"
 # 文字裡的數字：中文數字先轉成阿拉伯數字，千分位的逗號拿掉
 # 不能用上面的 normalize：它會拿掉所有空白，表格裡「P4–P5 3,600 元」會黏成 P4–P53600，數字就錯了
 def _numbers_in(text: str) -> set[str]:
-    text = re.sub(r"百分之([零〇一二兩三四五六七八九十百]+)", lambda m: f"{cn_number(m.group(1))}%", text)
-    text = re.sub(r"[零〇一二兩三四五六七八九十百千]+", lambda m: f" {cn_number(m.group())} ", text)
+    text = chinese_to_digits(text, pad=" ")
     text = re.sub(r"(?<=\d),(?=\d{3})", "", text)  # 千分位：12,000 → 12000
     return numbers(text)
 
@@ -138,16 +144,28 @@ def _claim_numbers(text: str) -> set[str]:
 def citation_checks(answer: str, passages: list[str], given: str) -> list[dict]:
     given = _claim_numbers(given)
     checks = []
+    # 照句號、驚嘆號、問號、換行切成句子（切的符號留在前一句的結尾）
     for sentence in re.split(r"(?<=[。！？\n])", answer):
-        cited = {int(n) for group in CITATION_MARKER.findall(sentence) for n in re.findall(r"\d+", group)}
-        cited = {n for n in cited if 1 <= n <= len(passages)}
+        cited = _cited_numbers(sentence, len(passages))
         claimed = _claim_numbers(CITATION_MARKER.sub("", sentence)) - given
         if not cited or not claimed:
             continue
-        # 原文不拿掉條列編號：法條的「一、」「1.」後面常常就是要找的數字
-        found = set().union(*(_numbers_in(passages[n - 1]) for n in cited))
+        # 標的那幾段原文裡出現過的數字（原文不拿掉條列編號：法條的「一、」「1.」後面常常就是要找的數字）
+        found = set()
+        for n in cited:
+            found |= _numbers_in(passages[n - 1])
         checks.append({"sentence": sentence.strip(), "cited": sorted(cited), "missing": sorted(claimed - found)})
     return checks
+
+
+# 這一句標了哪幾段：[1][3]、[1, 3] 都算，超出範圍（給模型看的段數以外）的編號不算
+def _cited_numbers(sentence: str, count: int) -> set[int]:
+    cited = set()
+    for marker in CITATION_MARKER.findall(sentence):
+        for n in re.findall(r"\d+", marker):
+            if 1 <= int(n) <= count:
+                cited.add(int(n))
+    return cited
 
 
 TEST_RATIO = 0.3
@@ -158,9 +176,12 @@ def assign_splits(questions: list[Question], previous: Path | None = None) -> No
     # 固定隨機種子：重跑時分法一樣，考試題不會因為重跑而換掉
     # previous：之前產生的 questions.jsonl。已經分好的題目維持原本的分法，只有新題目抽籤（docs/decisions/031）
     #   不然加題、刪題之後重抽，看過、分析過的練習題可能變成考試題，考試題就不再是「沒看過的」
-    kept = {}
+    kept = {}  # {題號: "dev" 或 "test"}，之前已經分好的
     if previous is not None and previous.exists():
-        kept = {item["id"]: item["split"] for item in map(json.loads, previous.read_text(encoding="utf-8").splitlines()) if item}
+        for line in previous.read_text(encoding="utf-8").splitlines():
+            item = json.loads(line)
+            if item:
+                kept[item["id"]] = item["split"]
     rng = random.Random(2026)
     for qtype in sorted({q.type for q in questions}):
         group = [q for q in questions if q.type == qtype]

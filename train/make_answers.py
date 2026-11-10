@@ -27,7 +27,7 @@ import os
 os.environ["EVAL_DATABASE_URL"] = os.environ.get("TRAIN_DATABASE_URL", "postgresql+psycopg://postgres:test@localhost:55433/train")
 
 # isort: off
-from eval.run import CONSISTENCY_PROMPT, JUDGE_PROMPT, QWEN_SAMPLING, _align, build_knowledge_base, seen_passage
+from eval.run import CONSISTENCY_PROMPT, JUDGE_PROMPT, QWEN_SAMPLING, align_verdict, build_knowledge_base, seen_passage
 # isort: on
 
 import argparse
@@ -107,13 +107,17 @@ def retrieve(db, workspace_id: int, question: str) -> tuple[str, list[str], list
 # 這裡用四分之一，寧可多寫幾次：一半的話，答案那段其實有搜到、只是跟原文差幾個字的 t0043、t0061 也會被當成沒搜到
 def evidence_retrieved(item: dict) -> bool:
     context = re.sub(r"\s+", "", item["context"])
+    evidence = item["q"].get("evidence")
+    if not evidence:
+        return True  # 出題時沒記原文的，不檢查
+    return any(_evidence_found(e, context) for e in evidence)
 
-    def found(evidence: str) -> bool:
-        text = re.sub(r"\s+", "", evidence)
-        grams = [text[i:i + 8] for i in range(max(1, len(text) - 7))]
-        return sum(gram in context for gram in grams) / len(grams) >= 0.25
 
-    return not item["q"].get("evidence") or any(found(e) for e in item["q"]["evidence"])
+# 一段原文有沒有在 context（已經拿掉空白）裡：每 8 個字一組，四分之一以上的組找得到就算有
+def _evidence_found(evidence: str, context: str) -> bool:
+    text = re.sub(r"\s+", "", evidence)
+    grams = [text[i:i + 8] for i in range(max(1, len(text) - 7))]
+    return sum(gram in context for gram in grams) / len(grams) >= 0.25
 
 
 # 理想回答的寫法（docs/decisions/038），接在回答原則第 7 條後面，只給老師看：學生（上線的模型）從示範答案學這些習慣
@@ -163,8 +167,8 @@ NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0
 
 # 照評分程式的算法，從評審的判斷算出「全對」（跟 eval/run.py 的 score 一樣）
 def correct_from(verdict: dict, q: dict) -> bool:
-    included = _align(q["must_include"], verdict.get("must_include", []))
-    violated = _align(q["must_not"], verdict.get("must_not", []))
+    included = align_verdict(q["must_include"], verdict.get("must_include", []))
+    violated = align_verdict(q["must_not"], verdict.get("must_not", []))
     refusal_ok = bool(verdict.get("refused")) == q["should_refuse"]
     return refusal_ok and not any(violated) and (not included or all(included))
 
@@ -231,7 +235,7 @@ def check(client: OpenAI, item: dict) -> tuple[bool, list[str], dict]:
             reasons.append("沒有答案的題目卻標了出處")
     elif not set(item["cited"]) & set(q["sources"]):
         reasons.append("沒有標到出題時設定的文件")
-    checks = citation_checks(answer, item["seen"], f"{q['question']}\n今天日期：{qa_service._date_text(TODAY)}")
+    checks = citation_checks(answer, item["seen"], f"{q['question']}\n今天日期：{qa_service.date_text(TODAY)}")
     detail["citation_checks"] = checks
     if any(c["missing"] for c in checks):
         reasons.append("引用對不上")
@@ -267,26 +271,31 @@ def contradicts(client: OpenAI, question: str, answer: str, extra: dict, detail:
     return verdict is None or bool(verdict.get("contradiction"))
 
 
+# 思考模式的評審判一次不矛盾：判成矛盾就在 reasons 加一條（reasons、detail 是 check 回傳的那兩個 list / dict，直接改它們）
+def _think_check(client: OpenAI, item: dict, reasons: list[str], detail: dict) -> None:
+    if contradicts(client, item["q"]["question"], item["answer"], QWEN_SAMPLING["think"], detail, "consistency_think"):
+        reasons.append("前後矛盾（思考的評審）")
+
+
 # 寫一次、篩一次：結果記在每個 item 上（passed、reasons、detail、answer、cited、attempts）
+# 同時跑 4 題：每題交給 pool 一個工作（submit），再照原本的順序一題一題拿回結果（result 會等那題做完）
 def run_attempt(client: OpenAI, todo: list[dict], attempt: int) -> None:
     with ThreadPoolExecutor(max_workers=4) as pool:
-        answers = list(pool.map(lambda item: teach(client, item, attempt), todo))
+        jobs = [pool.submit(teach, client, item, attempt) for item in todo]
+        answers = [job.result() for job in jobs]
     for item, answer in zip(todo, answers, strict=True):
         answer = answer and answer.translate(STRAY_SIMPLIFIED)
-        _, marked = qa_service._extract_citations(answer, len(item["seen"]))
+        _, marked = qa_service.extract_citations(answer, len(item["seen"]))
         item.update(answer=answer, cited=sorted({item["codes"][n - 1] for n in marked}), attempts=attempt + 1)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda item: check(client, item), todo))
-    # 其他檢查都通過的，再請思考模式判一次不矛盾
+        jobs = [pool.submit(check, client, item) for item in todo]
+        results = [job.result() for job in jobs]
+    # 其他檢查都通過的，再請思考模式判一次不矛盾（判成矛盾的，原因直接加進那題的 reasons）
     survivors = [(item, result) for item, result in zip(todo, results, strict=True) if result[0]]
-
-    def think_check(pair):
-        item, (_, reasons, detail) = pair
-        if contradicts(client, item["q"]["question"], item["answer"], QWEN_SAMPLING["think"], detail, "consistency_think"):
-            reasons.append("前後矛盾（思考的評審）")
-
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(think_check, survivors))
+        jobs = [pool.submit(_think_check, client, item, reasons, detail) for item, (_, reasons, detail) in survivors]
+        for job in jobs:
+            job.result()  # 等每一題判完；判的時候出錯會在這裡丟出來
     for item, (_, reasons, detail) in zip(todo, results, strict=True):
         item.update(passed=not reasons, reasons=reasons, detail=detail)
 

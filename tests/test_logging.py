@@ -2,58 +2,32 @@
 # 測的是：每一筆都是 JSON、自動帶上請求編號和文件編號、上傳和背景處理串得起來、不記使用者的內容
 
 import json
-import logging
 
 import pytest
 
 from app.core import log, openai_client, sqs_client
 from app.core.config import settings
+from tests.helpers import (
+    create_workspace,
+    fake_answer,
+    fake_embed_query,
+    fake_embed_texts,
+    login_headers,
+    upload_pdf,
+)
 from tests.pdf_fixtures import valid_pdf_bytes
-from tests.upload_helpers import upload_pdf
 
-
-# 把 "app" 這個 logger 寫出的每一筆，用正式的 JSON 格式轉好、收集到一個 list 裡給測試檢查
-class _Collector(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.setFormatter(log.JsonFormatter())
-        self.entries = []
-
-    def emit(self, record):
-        self.entries.append(json.loads(self.format(record)))
-
-    def named(self, event):
-        return [entry for entry in self.entries if entry["event"] == event]
-
-
-@pytest.fixture
-def logs():
-    collector = _Collector()
-    logger = logging.getLogger("app")
-    logger.addHandler(collector)
-    yield collector
-    logger.removeHandler(collector)
+# logs fixture（收集 log 給測試檢查）在 conftest.py
 
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    # 跟真的 embed_texts 一樣，呼叫 OpenAI 之前先呼叫 on_attempt（試一次就成功）
-    def fake_embed(texts, on_attempt=None, **kwargs):
-        if on_attempt is not None:
-            on_attempt()
-        return [[0.1] * 1536 for _ in texts]
-
-    monkeypatch.setattr(openai_client, "embed_texts", fake_embed)
+    monkeypatch.setattr(openai_client, "embed_texts", fake_embed_texts)
 
 
-def _login(client, email="alice@example.com"):
-    client.post("/auth/register", json={"email": email, "password": "pw123456"})
-    token = client.post("/auth/login", json={"email": email, "password": "pw123456"}).json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
-
-
+# 建 workspace + 上傳一份。檔名預設是 secret-findings.pdf：test_no_user_content_in_logs 檢查它不會出現在 log 裡
 def _upload(client, headers, filename="secret-findings.pdf"):
-    ws_id = client.post("/workspaces", json={"name": "研究"}, headers=headers).json()["id"]
+    ws_id = create_workspace(client, headers)
     return upload_pdf(client, headers, ws_id, valid_pdf_bytes("retrieval " * 50), filename)
 
 
@@ -86,7 +60,7 @@ def test_bind_clears_previous_ids(logs):
 
 # 測試：每個請求有一筆 request log，帶狀態碼、花多久、是誰；回應的 header 有同一個請求編號
 def test_request_is_logged_with_id(client, logs):
-    headers = _login(client)
+    headers = login_headers(client, "alice@example.com")
 
     response = client.get("/workspaces", headers=headers)
 
@@ -99,18 +73,20 @@ def test_request_is_logged_with_id(client, logs):
 
 
 # 測試：上傳 → 處理的每一筆 log 都帶著同一個請求編號和文件編號，串得起來
+# openai_usage 是記用量時寫的：用量在另一個 session 寫，log 一樣串得起來
 def test_upload_and_processing_share_ids(client, logs):
-    headers = _login(client)
+    headers = login_headers(client, "alice@example.com")
 
     response = _upload(client, headers)  # 本機模式：上傳時直接處理完
 
     request_id = response.headers["X-Request-ID"]
     document_id = response.json()["id"]
-    for event in ("uploaded", "claimed", "downloaded", "parsed", "chunked", "embed_batch", "processed"):
+    for event in ("uploaded", "claimed", "downloaded", "chunked", "openai_usage", "processed"):
         entry = logs.named(event)[-1]
         assert entry["request_id"] == request_id, event
         assert entry["document_id"] == document_id, event
-    assert logs.named("embed_batch")[-1]["openai_attempts"] == 1
+    assert logs.named("downloaded")[-1]["size_bytes"] > 0
+    assert logs.named("chunked")[-1]["chunks"] >= 1
     assert "total_ms" in logs.named("processed")[-1]
 
 
@@ -119,7 +95,7 @@ def test_queue_message_carries_request_id(client, logs, monkeypatch):
     sent = []
     monkeypatch.setattr(settings, "sqs_queue_url", "https://example.com/queue")
     monkeypatch.setattr(sqs_client.client, "send_message", lambda **kwargs: sent.append(kwargs))
-    headers = _login(client)
+    headers = login_headers(client, "alice@example.com")
 
     response = _upload(client, headers)
 
@@ -130,9 +106,9 @@ def test_queue_message_carries_request_id(client, logs, monkeypatch):
 
 # 測試：log 裡沒有使用者的檔名和問題內容
 def test_no_user_content_in_logs(client, logs, monkeypatch):
-    monkeypatch.setattr(openai_client, "embed_query", lambda text, **kwargs: [0.1] * 1536)
-    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, **kwargs: "答案")
-    headers = _login(client)
+    monkeypatch.setattr(openai_client, "embed_query", fake_embed_query)
+    monkeypatch.setattr(openai_client, "generate_answer", lambda system, user, timeout: fake_answer("答案"))
+    headers = login_headers(client, "alice@example.com")
     ws_id = _upload(client, headers).json()["workspace_id"]
 
     client.post(f"/workspaces/{ws_id}/ask", json={"question": "未發表的機密問題"}, headers=headers)
@@ -149,7 +125,7 @@ def test_unexpected_error_logs_traceback(client, logs, monkeypatch):
         raise RuntimeError("something odd")
 
     monkeypatch.setattr(openai_client, "embed_texts", broken)
-    headers = _login(client)
+    headers = login_headers(client, "alice@example.com")
 
     _upload(client, headers)
 

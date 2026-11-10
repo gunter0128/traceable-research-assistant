@@ -53,6 +53,14 @@ def setup() -> None:
     _logger.addHandler(handler)
     _logger.setLevel(logging.INFO)
     _logger.propagate = False
+    # OpenAI SDK 自己的 logger 也印成同樣的 JSON（docs/decisions/046 B3-1）
+    # 文件處理的轉向量改用 SDK 內建的重試之後，每次重試只有 SDK 會寫一筆 INFO，event 是一句英文，
+    # 例如 "Retrying request in 0.500000 seconds (retry 1 of 2)"
+    # 不接過來的話這筆會被丟掉（Python 預設只印 WARNING 以上），CloudWatch 就看不出 OpenAI 多常出問題
+    openai_logger = logging.getLogger("openai")
+    openai_logger.addHandler(handler)
+    openai_logger.setLevel(logging.INFO)
+    openai_logger.propagate = False
 
 
 # 寫一筆 log：event("embed_batch", batch=1, chunks=100)

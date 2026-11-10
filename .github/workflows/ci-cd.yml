@@ -176,10 +176,15 @@ jobs:
       # 熱身：新 image 第一次啟動要先下載，會超過 10 秒。自己先叫醒一次，使用者就不會是第一個
       - name: 熱身 + 確認能用
         run: |
-          # worker：用測量模式叫醒（不處理任何文件），順便確認連得到資料庫
-          echo '{"probe": true}' > probe.json
-          aws lambda invoke --function-name trace-app-worker --payload fileb://probe.json --cli-read-timeout 120 out.json
+          # worker：用健康檢查叫醒（不處理任何文件），真的對資料庫查一次 SELECT 1（app/worker.py 的 _check_database）
+          # 注意：Lambda 裡面出錯時 aws lambda invoke 還是會成功結束，錯誤只寫在 out.json 裡，所以要自己檢查內容
+          echo '{"health_check": true}' > health_check.json
+          aws lambda invoke --function-name trace-app-worker --payload fileb://health_check.json --cli-read-timeout 120 out.json
           cat out.json
+          if ! grep -q '"database": *"ok"' out.json; then
+            echo "worker 連不上資料庫"
+            exit 1
+          fi
           # API：經過 CloudFront 打一次，沒登入應該回 401。最多試 5 次（第一次可能剛好在冷啟動）
           for i in 1 2 3 4 5; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$SITE_URL/auth/me" || true)

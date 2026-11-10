@@ -1,0 +1,8 @@
+{
+  "filterPattern": "{ $.event = \"qa_failed\" && ($.error_type = \"OpenAIPermanentError\" || $.error_type = \"permanent\") }",
+  "logEventMessages": [
+    "{\"event\": \"qa_failed\", \"error_type\": \"OpenAIPermanentError\", \"level\": \"ERROR\"}",
+    "{\"event\": \"qa_failed\", \"error_type\": \"permanent\", \"level\": \"ERROR\"}",
+    "{\"event\": \"qa_failed\", \"error_type\": \"OpenAITemporaryError\", \"level\": \"WARNING\"}"
+  ]
+}

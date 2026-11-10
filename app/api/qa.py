@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
 from app.api.errors import WORKSPACE_ERRORS, quota_error, workspace_error
+from app.core import openai_client
 from app.core.db import get_db
 from app.models.user import User
 from app.schemas.qa import AskRequest, AskResponse
@@ -27,12 +28,14 @@ def ask(
         workspace_error(exc)
     except usage_service.QuotaExceeded as exc:
         quota_error(exc)
-    # 503 Service Unavailable：「服務暫時無法提供」，表示問題不在使用者的請求本身
-    except qa_service.AIServiceUnavailable:
+    # OpenAI 出問題（qa_service 已經記好 log）：503 Service Unavailable，「服務暫時無法提供」，問題不在使用者的請求本身
+    # 跟上傳時 S3 出問題一樣（app/api/documents.py），直接接 client 的錯誤，暫時性、永久性給不同的訊息
+    # from None：不把 OpenAI 原本的錯誤接在後面，回應裡只有給使用者看的訊息
+    except openai_client.OpenAITemporaryError:
         raise HTTPException(
             status_code=503, detail="AI 服務暫時無法使用，請稍後再試"
         ) from None
-    except qa_service.AIServiceMisconfigured:
+    except openai_client.OpenAIPermanentError:
         raise HTTPException(
             status_code=503, detail="系統設定有誤，請聯絡管理員"
         ) from None

@@ -1,4 +1,5 @@
-# document 的 endpoint：上傳 / 列 / 查 / 重試 / 取消 / 刪，全部要登入，全部檢查 ownership（透過 workspace）
+# document 的 endpoint：上傳 / 列 / 查 / 重試 / 刪，全部要登入，全部檢查 ownership（透過 workspace）
+# 以前還有「取消處理」，docs/decisions/046 拿掉了：不想等的文件可以直接刪掉
 # 這層只做 HTTP：呼叫 service、把結果 / 錯誤翻成 HTTP 回應
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -64,6 +65,9 @@ def finish_upload(
         )
     except WORKSPACE_ERRORS as exc:
         workspace_error(exc)
+    # 本機模式上傳完直接處理，處理到一半文件被刪掉了（例如在別的分頁按了刪除）→ 404
+    except DOCUMENT_ERRORS as exc:
+        document_error(exc)
     except document_service.InvalidFileType:
         raise HTTPException(
             status_code=400, detail="only PDF files are allowed"
@@ -109,7 +113,8 @@ def get_document(
         document_error(exc)
 
 
-# 手動重試處理失敗的文件。不是失敗狀態（處理中 / 已完成）的回 409：這個請求本身沒錯，是跟文件目前的狀態衝突
+# 手動重試處理失敗的文件（舊版取消功能留下的「已取消」文件也可以）
+# 其他狀態（排隊中 / 處理中 / 已完成）的回 409：這個請求本身沒錯，是跟文件目前的狀態衝突
 @router.post("/documents/{document_id}/retry", response_model=DocumentOut)
 def retry_document(
     document_id: int,
@@ -125,23 +130,6 @@ def retry_document(
     except document_service.DocumentNotRetryable:
         raise HTTPException(
             status_code=409, detail="only failed or cancelled documents can be retried"
-        ) from None
-
-
-# 取消處理（docs/decisions/009）。不是排隊中 / 處理中的回 409：已經處理完或失敗了，沒有東西可以停
-@router.post("/documents/{document_id}/cancel", response_model=DocumentOut)
-def cancel_document(
-    document_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    try:
-        return document_service.cancel_document(db, document_id, current_user.id)
-    except DOCUMENT_ERRORS as exc:
-        document_error(exc)
-    except document_service.DocumentNotCancellable:
-        raise HTTPException(
-            status_code=409, detail="only queued or processing documents can be cancelled"
         ) from None
 
 

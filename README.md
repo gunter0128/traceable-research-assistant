@@ -9,7 +9,7 @@ A question-answering service over your own PDFs. Every sentence in an answer cit
 - **Upload PDFs** into a private workspace. Files are parsed, chunked, embedded and indexed in the background.
 - **Ask questions** about those documents. Answers mark each sentence with `[1]`, `[2]`… and return only the passages that were actually cited.
 - **Say "not found"** instead of guessing when the documents do not contain the answer.
-- **Reject duplicate uploads** by content hash, and let users **retry or cancel** anything they are waiting on.
+- **Reject duplicate uploads** by content hash, and let users **retry** any document that failed.
 
 ## Why this project
 
@@ -61,9 +61,10 @@ The backend uses four layers, `api → services → repositories → models`, so
 
 ### Background processing that recovers on its own
 - Uploads return immediately. Processing happens in a worker fed by SQS.
-- OpenAI errors are classified as temporary or permanent. Temporary failures are retried in seconds, then deferred for 2 minutes, for up to 3 rounds.
-- A worker holds a **lease with heartbeats**. If it dies mid-document, the document is marked *interrupted* within 5 minutes and can be retried, instead of staying "processing" forever.
-- Each document is processed in one transaction, so a failure never leaves half its chunks behind.
+- Calls to OpenAI and S3 use the SDKs' built-in retries with explicit timeouts. If a document still fails, it is marked *failed* with a clear reason (temporary outage or configuration problem) and the user can retry it.
+- A worker **claims** a document with a lease: a claim token checked by conditional updates. A duplicate SQS message or a double-clicked retry can never process the same document twice, and a worker that lost its claim cannot save its results.
+- The worker reports in after each embedding batch. If it goes silent for 10 minutes, the document is marked *interrupted* and can be retried, instead of staying "processing" forever.
+- Chunks and the "processed" status are saved in one transaction at the end, so a failure never leaves half its chunks behind. No database transaction is held open while calling S3 or OpenAI.
 
 ### Failures tested on purpose
 About 30 failure modes are listed in [`docs/failure-modes.md`](docs/failure-modes.md), each with its evidence. Several were reproduced in the cloud. For example, pointing the worker at an unreachable OpenAI endpoint, or killing it mid-run. One drill showed that a worker crashing at the wrong moment left a document stuck forever, which led to the lease and heartbeat design above.
@@ -128,6 +129,7 @@ Every non-trivial choice has a short decision record in [`docs/decisions/`](docs
 | 034 | On-premises version: keep documents inside the company, train our own answer model |
 | 039 | How training data is generated and filtered |
 | 042 | Temperature 0, and the release bar: no worse than gpt-4o on any metric |
+| 046 | Cloud Core: keep the cloud architecture, simplify the reliability mechanisms (SDK retries, no automatic re-queueing, no worker takeover) |
 | 043 | Merge adjacent passages of the same document |
 | 044 | Final evaluation on the held-out test set |
 
@@ -170,7 +172,7 @@ npm run dev                       # http://localhost:5173, proxies API calls to 
 pytest
 ```
 
-156 tests cover ownership checks across users, the processing pipeline, retries, leases, cancellation, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
+227 tests cover ownership checks across users, the processing pipeline, retries, leases, concurrent workers, usage limits and Q&A. OpenAI, S3 and SQS are replaced with fakes, so the suite costs nothing and needs no API key. Locally it uses a separate database configured in `.env.test` (see `.env.test.example`). In CI it uses a throwaway PostgreSQL container.
 
 ## API
 
@@ -183,7 +185,7 @@ pytest
 | POST | `/workspaces/{id}/uploads` | Get a presigned S3 upload ticket |
 | POST / GET | `/workspaces/{id}/documents` | Register an uploaded file / list documents |
 | GET / DELETE | `/documents/{id}` | Read / delete a document |
-| POST | `/documents/{id}/retry` · `/documents/{id}/cancel` | Retry a failed document / cancel one in progress |
+| POST | `/documents/{id}/retry` | Retry a failed document |
 | POST | `/workspaces/{id}/ask` | Ask a question, get an answer with citations |
 | GET | `/usage/today` | Today's usage against the daily limit |
 
@@ -198,4 +200,4 @@ pytest
 
 ## What's next
 
-- Start the two models from docker-compose as well. The package (`onprem/`) already runs on the lab GPU machine, with the models started by hand; this needs the NVIDIA Container Toolkit on the host.
+- Start the two models from docker-compose as well. The package (`onprem/`) already runs on the lab GPU machine with the models started by hand; the NVIDIA Container Toolkit is installed, but the shared machine needs about 20 GB more disk space for the vLLM image.

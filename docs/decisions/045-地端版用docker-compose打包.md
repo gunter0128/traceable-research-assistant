@@ -64,7 +64,14 @@
 
 兩邊都從網頁的網址（nginx）走完整條流程：註冊 → 上傳 → 處理 → 問答，答案跟驗收時一樣。
 
-實驗室沒有 NVIDIA Container Toolkit，所以目前是第一階段：docker-compose 開資料庫、儲存、API、網頁，模型是主機上手動開的兩個 vLLM（API 透過 `host.docker.internal` 連過去）。裝好 Toolkit 之後加 `--profile gpu`，模型也由 docker-compose 開，才是真正的一個指令。
+目前是第一階段：docker-compose 開資料庫、儲存、API、網頁，模型是主機上手動開的兩個 vLLM（API 透過 `host.docker.internal` 連過去）。
+
+**第二階段（模型也由 docker-compose 開）先暫停**：
+
+- NVIDIA Container Toolkit 已經裝好（1.20.1），測試容器看得到 RTX 3090
+- 但下載 vLLM 的 image（解壓後約 20GB）把主機的硬碟用完了：這台共用主機的系統硬碟 1TB 本來就用了九成多，資料庫寫不進檔案、一直重開，網站停了幾分鐘。刪掉 image 之後恢復（剩約 22GB），資料都在
+- 要做第二階段，得先跟管理的人確認能不能把 Docker 的資料放到另一顆硬碟。在那之前，主機重開機後要手動開兩個模型
+- 教訓：下載大的 image 之前，先確認剩餘空間；共用主機上也不要清整個 Docker 的快取（`docker builder prune` 會清到別人的）
 
 ## 代價
 
